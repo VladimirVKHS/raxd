@@ -55,6 +55,10 @@ type Config struct {
 	// MaxHeaderBytes is the maximum size of request headers.
 	// SR-25: protection against header-flooding.
 	MaxHeaderBytes int
+
+	// MaxBodyBytes is the maximum size of the request body.
+	// SR-25: protection against large-body flooding; enforced via http.MaxBytesReader.
+	MaxBodyBytes int64
 }
 
 // LimiterTTL returns the idle TTL for rate-limiter GC entries.
@@ -84,6 +88,7 @@ func Load(p PathSet) (*Config, error) {
 	v.SetDefault("write_timeout", "30s")
 	v.SetDefault("idle_timeout", "120s")
 	v.SetDefault("max_header_bytes", 1<<20) // 1 MiB
+	v.SetDefault("max_body_bytes", int64(1<<20)) // 1 MiB
 
 	if err := v.ReadInConfig(); err != nil {
 		// File not found → use defaults, no error.
@@ -136,6 +141,7 @@ func buildConfig(v *viper.Viper) (*Config, error) {
 		WriteTimeout:      writeTimeout,
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    v.GetInt("max_header_bytes"),
+		MaxBodyBytes:      v.GetInt64("max_body_bytes"),
 	}, nil
 }
 

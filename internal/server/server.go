@@ -78,7 +78,12 @@ func New(cfg *config.Config, paths config.PathSet, store *keystore.Store, logger
 
 	var handler http.Handler = mux
 
-	// Layer 5 (innermost after mux): rate-limit
+	// Layer 6 (innermost, wraps mux): AUTH success audit (ISSUE-3/SR-19).
+	// Writes exactly ONE "success" audit record per request that passed all gates.
+	// Must be innermost so it runs only when rate-limit (Layer 5) allows through.
+	handler = authSuccessAuditMiddleware(auditFn)(handler)
+
+	// Layer 5: rate-limit (per-key + per-IP token bucket, SR-17).
 	handler = rateLimitMiddleware(limiters, auditFn)(handler)
 
 	// Layer 4: auth (Bearer → keystore.Verify)
@@ -89,6 +94,11 @@ func New(cfg *config.Config, paths config.PathSet, store *keystore.Store, logger
 
 	// Layer 2: recover (panic protection, SR-25)
 	handler = recoverMiddleware(handler)
+
+	// Layer 1 (outermost): body size limit (SR-25 — large-body flooding protection).
+	// Applied before recover so that body-limit errors are caught by recoverMiddleware
+	// if a handler panics on oversized body, and every handler inherits the limit.
+	handler = bodyLimitMiddleware(cfg.MaxBodyBytes)(handler)
 
 	addr := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.Port)
 	httpSrv := &http.Server{
