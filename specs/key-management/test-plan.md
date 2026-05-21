@@ -1,6 +1,6 @@
 # Test Plan: key-management — управление API-ключами raxd
 
-> Автор: qa. Дата: 2026-05-21. Статус: FINAL — 116 тестов, 0 провалов, 0 skip.
+> Автор: qa. Дата: 2026-05-21. Статус: FINAL — 117 top-level тестов + 3 sub-теста = 120 PASS, 0 провалов, 0 skip.
 > Проверяет: qa-guardian. Читает: reviewer (доказательство покрытия AC+SR).
 > Запуск **только в Docker** (SECURITY-BASELINE §6).
 
@@ -47,17 +47,19 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 
 ## Критерий прохождения
 
-**116 тестов, 0 провалов, 0 skip** в Docker (факт подтверждён 2026-05-21).
+**117 top-level тестов + 3 sub-теста = 120 PASS, 0 провалов, 0 skip** в Docker (факт подтверждён 2026-05-21).
 
-Разбивка по пакетам:
-- `github.com/vladimirvkhs/raxd` — 5 тестов (статический анализ)
-- `github.com/vladimirvkhs/raxd/internal/banner` — 5 тестов
-- `github.com/vladimirvkhs/raxd/internal/cli` — 55 тестов (cli_test + cli_gaps_test + security_test + **cli_key_qa_test**)
-- `github.com/vladimirvkhs/raxd/internal/config` — 9 тестов
-- `github.com/vladimirvkhs/raxd/internal/keystore` — 37 тестов (keystore_test + **keystore_qa_test**)
-- `github.com/vladimirvkhs/raxd/internal/version` — 5 тестов
+Подсчёт: `go test -v -count=1 ./... | grep 'PASS:' | wc -l` → 120.
 
-**До QA:** 83 теста. **После QA:** 116 тестов (+33 новых).
+Разбивка по пакетам (top-level / sub-тесты):
+- `github.com/vladimirvkhs/raxd` — **6** top-level (статический анализ, +1 `TestStaticNoMathRand` SR-2)
+- `github.com/vladimirvkhs/raxd/internal/banner` — **5** top-level
+- `github.com/vladimirvkhs/raxd/internal/cli` — **45** top-level + **3** sub-теста = 48 (cli_test + cli_gaps_test + security_test + **cli_key_qa_test**; sub-тесты: `TestErrorMessagesLowercase/{missing_arg,not_found,long_label}`)
+- `github.com/vladimirvkhs/raxd/internal/config` — **9** top-level
+- `github.com/vladimirvkhs/raxd/internal/keystore` — **47** top-level (keystore_test + **keystore_qa_test**)
+- `github.com/vladimirvkhs/raxd/internal/version` — **5** top-level
+
+**До QA:** 83 теста. **После QA:** 117 top-level (+34 новых, включая `TestStaticNoMathRand`).
 
 ---
 
@@ -69,7 +71,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 | AC-2: Формат `rax_live_<base64url>` без padding, один раз на stdout | unit+integration | `keystore_test.go::TestKeyFormat`, `cli_test.go::TestKeyCreateKeyOnStdout`, `cli_key_qa_test.go::TestKeyCreateBodyOnlyOnStdout` | PASS |
 | AC-3: В хранилище НЕ тело ключа, только sha256(тело+salt)+salt | unit | `keystore_test.go::TestNoPlaintextInDB`, `keystore_qa_test.go::TestHashSchemeDirectVerification`, `TestSaltLengthAndUniqueness`, `TestHashSizeInDB` | PASS |
 | AC-4: Отдельный короткий id из crypto/rand, не из тела/хэша | unit | `keystore_test.go::TestIDIsRandom`, `TestIDNotDerivedFromBody`, `keystore_qa_test.go::TestIDFormat` | PASS |
-| AC-5: `key list` — таблица id/label/created/last-used; revoked скрыты; пустой list → сообщение, exit 0 | integration | `cli_test.go::TestKeyListOutputOnStdout`, `cli_key_qa_test.go::TestKeyListEmptyShowsMessageOnStdout`, `TestKeyListNoSecretsOnStdout`, `TestKeyCreateListDeleteIntegration`, `keystore_test.go::TestListHidesRevoked`, `keystore_qa_test.go::TestListWithMultipleActiveKeys` | PASS |
+| AC-5: `key list` — таблица id/label/created/last-used; revoked скрыты; пустой list → сообщение, exit 0 | unit+integration | `cli_test.go::TestKeyListOutputOnStdout`, `cli_key_qa_test.go::TestKeyListEmptyShowsMessageOnStdout`, `TestKeyListNoSecretsOnStdout`, `TestKeyCreateListDeleteIntegration`, `keystore_test.go::TestListHidesRevoked`, `TestEmptyListReturnsNil`, `keystore_qa_test.go::TestListWithMultipleActiveKeys` | PASS |
 | AC-6: `key delete <id>` — мягкий отзыв; Verify немедленно неуспешна; повторный/несущ. id → ошибка exit≠0 | unit+integration | `keystore_test.go::TestVerifyBeforeAfterRevoke`, `TestRevokeNotFound`, `TestRevokeAlreadyRevoked`, `cli_key_qa_test.go::TestKeyDeleteNotFoundCLI`, `TestKeyDeleteAlreadyRevokedCLI`, `keystore_qa_test.go::TestVerifyCorrectWrongRevoked`, `TestRevokePreservesRecordForAudit` | PASS |
 | AC-7: Аудит create/delete — timestamp+id+fingerprint, НЕ тело | integration | `cli_key_qa_test.go::TestKeyCreateAuditContainsFingerprintNotBody`, `TestKeyDeleteAuditContainsFingerprintNotBody`, `keystore_test.go::TestFingerprintPersistedInRecord` | PASS |
 | AC-8: Constant-time Verify (`subtle.ConstantTimeCompare`); нет `==` по секретам | unit | `keystore_test.go::TestVerifyBeforeAfterRevoke`, `TestHashScheme`, `keystore_qa_test.go::TestVerifyCorrectWrongRevoked` | PASS |
@@ -85,7 +87,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 | SR | Описание | Уровень | Тест (файл::имя) | Статус |
 |---|---|---|---|---|
 | SR-1 | crypto/rand ≥128 бит | unit | `TestKeyFormat`, `TestKeyBodyEntropy`, `TestKeyBodyUniquenessMultiple` | PASS |
-| SR-2 | Нет math/rand | static | `TestStaticNoHardcodedSecrets` (grep) | PASS |
+| SR-2 | Нет math/rand | static | `TestStaticNoMathRand` (grep по `internal/keystore` + `internal/cli/key.go`) | PASS |
 | SR-3 | Сбой rand = краш, нет fallback | инспекция | `crypto.go`: `rand.Read` без err-check, нет fallback | PASS (инспекция) |
 | SR-4 | per-key-salt ≥16 байт, уникален | unit | `TestSaltLengthAndUniqueness`, `TestSaltUniqueness` | PASS |
 | SR-5 | id из crypto/rand, не из тела/хэша | unit | `TestIDIsRandom`, `TestIDNotDerivedFromBody`, `TestIDFormat` | PASS |
@@ -103,8 +105,8 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 | SR-17 | FlushUsage не воскрешает revoked; LastUsed обновляется | unit | `TestFlushUsageDoesNotResurrect`, `TestFlushUsageMergeDoesNotOverwriteRevoke`, `TestFlushUsagePersistsLastUsed`, `TestFlushUsagePersistsLastUsedOnReopen` | PASS |
 | SR-18 | Повторный/несущ. delete → ошибка, exit≠0 | unit+integration | `TestRevokeNotFound`, `TestRevokeAlreadyRevoked`, `TestKeyDeleteNotFoundCLI`, `TestKeyDeleteAlreadyRevokedCLI` | PASS |
 | SR-19 | `keys.db` 0600 по пути KeysDB | unit | `TestFilePermissions`, `TestAtomicWriteTempFilePermissions` | PASS |
-| SR-20 | Атомарная запись; temp 0600 ДО содержимого; нет temp-файлов | unit | `TestAtomicWritePermissions`, `TestAtomicWriteTempFilePermissions`, `TestNoTempFileAfterError` | PASS |
-| SR-21 | temp не утекает при ошибке | unit | `TestNoTempFileAfterError`, `TestAtomicWritePermissions` | PASS |
+| SR-20 | Атомарная запись; temp 0600 ДО содержимого; нет temp-файлов | unit | `TestAtomicWritePermissions`, `TestAtomicWriteTempFilePermissions` | PASS |
+| SR-21 | temp не утекает при ошибке записи | unit | `TestNoTempFileAfterError` (parent=файл → CreateTemp fails, root-устойчиво), `TestAtomicWritePermissions`, `TestAtomicWriteTempFilePermissions` | PASS |
 | SR-22 | Corrupt → ErrCorrupt без перезаписи байт-в-байт | unit+integration | `TestCorruptFileReturnsErrCorrupt`, `TestCorruptFileByteForByteUnchanged`, `TestWrappedErrCorruptFromOpen`, `TestWrappedErrCorruptFromReadDB`, `TestKeyListExitNonZeroOnCorrupt` | PASS |
 | SR-23 | flock корректен, параллельные операции не повреждают файл | unit | `TestConcurrentCreateAndList` | PASS |
 | SR-24 | Аудит create/delete с fingerprint, без тела | integration | `TestKeyCreateAuditContainsFingerprintNotBody`, `TestKeyDeleteAuditContainsFingerprintNotBody`, `TestFingerprintPersistedInRecord` | PASS |
@@ -120,7 +122,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 | label = 64 символа → ОК | `TestLabelMaxLength` | keystore |
 | label пустой → stored as "", CLI показывает "-" | `TestEmptyLabel`, `TestEmptyLabelShownAsDash`, `TestKeyCreateNoLabelShowsDash` | keystore, cli |
 | Дублирующийся label → разные id | `TestDuplicateLabels` | keystore |
-| Пустое хранилище (нет файла) → пустой List, false Verify, exit 0 | `TestMissingFileIsEmptyStore`, `TestVerifyEmptyStoreReturnsNoMatch`, `TestKeyListEmptyShowsMessageOnStdout` | keystore, cli |
+| Пустое хранилище (нет файла) → пустой List, false Verify, exit 0 | `TestMissingFileIsEmptyStore`, `TestEmptyListReturnsNil`, `TestVerifyEmptyStoreReturnsNoMatch`, `TestKeyListEmptyShowsMessageOnStdout` | keystore, cli |
 | Несуществующий id → ErrNotFound | `TestRevokeNotFound`, `TestKeyDeleteNotFoundCLI` | keystore, cli |
 | Уже revoked id → ErrAlreadyRevoked | `TestRevokeAlreadyRevoked`, `TestKeyDeleteAlreadyRevokedCLI` | keystore, cli |
 | Повреждённый keys.db → ErrCorrupt без паники и без перезаписи | `TestCorruptFileReturnsErrCorrupt`, `TestCorruptFileByteForByteUnchanged`, `TestWrappedErrCorruptFromOpen/ReadDB` | keystore |
@@ -137,7 +139,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 
 | Инвариант безопасности | Тест | Пакет |
 |---|---|---|
-| Нет math/rand в key-логике | `TestStaticNoHardcodedSecrets` (grep) | root |
+| Нет math/rand в key-логике | `TestStaticNoMathRand` (grep по `internal/keystore` + `cli/key.go`) | root |
 | Нет exec.Command в bootstrap-коде | `TestStaticNoExecCommand` | root |
 | Нет net.Listen в коде | `TestStaticNoNetListen` | root |
 | Нет создания файлов с широкими правами | `TestStaticNoFileCreationWithWideModes` | root |
@@ -149,7 +151,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 | Revoke → Verify немедленно false | `TestVerifyBeforeAfterRevoke`, `TestVerifyCorrectWrongRevoked` | keystore |
 | FlushUsage не воскрешает revoked | `TestFlushUsageMergeDoesNotOverwriteRevoke`, `TestFlushUsageDoesNotResurrect` | keystore |
 | keys.db 0600 | `TestFilePermissions`, `TestAtomicWriteTempFilePermissions` | keystore |
-| Нет .tmp после записи | `TestAtomicWritePermissions`, `TestNoTempFileAfterError` | keystore |
+| Нет .tmp после записи/ошибки | `TestAtomicWritePermissions`, `TestAtomicWriteTempFilePermissions`, `TestNoTempFileAfterError` | keystore |
 | Corrupt байт-в-байт не изменён | `TestCorruptFileByteForByteUnchanged`, `TestCorruptFileReturnsErrCorrupt` | keystore |
 | Ключ только на stdout при create | `TestKeyCreateBodyOnlyOnStdout`, `TestKeyCreateKeyOnStdout` | cli |
 | Ключ не на stderr (SR-11) | `TestKeyCreateBodyOnlyOnStdout`, `TestKeyCreateKeyOnStdout` | cli |
@@ -171,7 +173,13 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 
 ---
 
-## Новые тесты, добавленные QA (+33)
+## Новые тесты, добавленные QA (+34)
+
+### `security_static_test.go` (+1 тест)
+
+| Имя теста | Закрытый пробел | SR/AC |
+|---|---|---|
+| `TestStaticNoMathRand` | grep `math/rand`/`math/rand/v2` по `internal/keystore` + `cli/key.go` | SR-2 |
 
 ### `internal/keystore/keystore_qa_test.go` (+19 тестов)
 
@@ -181,7 +189,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 | `TestHashSchemeDirectVerification` | Прямое воспроизведение sha256(key‖salt) из raw JSON | SR-8 |
 | `TestKeyBodyUniquenessMultiple` | Уникальность и формат при 10 последовательных creates | SR-1, AC-1 |
 | `TestAtomicWriteTempFilePermissions` | Нет .tmp после записи; итоговый файл 0600 | SR-20, SR-21 |
-| `TestNoTempFileAfterError` | Нет .tmp после успешной записи | SR-21 |
+| `TestNoTempFileAfterError` | Нет .tmp после ошибки записи (parent = обычный файл, root-устойчиво) | SR-21 |
 | `TestCorruptFileByteForByteUnchanged` | Байт-в-байт проверка неизменности после ErrCorrupt | SR-22, AC-12 |
 | `TestFlushUsageMergeDoesNotOverwriteRevoke` | FlushUsage не воскрешает revoked (явный сценарий) | SR-17 |
 | `TestConcurrentCreateAndList` | Параллельные Create+List: файл не повреждён | SR-23 |
