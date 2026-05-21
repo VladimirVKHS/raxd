@@ -1,12 +1,13 @@
 module github.com/vladimirvkhs/raxd
 
-go 1.25
+go 1.25.0
 
 require (
 	github.com/charmbracelet/log v1.0.0
 	github.com/olekukonko/tablewriter v1.1.4
 	github.com/spf13/cobra v1.10.2
 	github.com/spf13/viper v1.21.0
+	golang.org/x/time v0.15.0
 )
 
 require (
