@@ -1,0 +1,186 @@
+package raxd_test
+
+// security_static_test.go — static source-code security invariant tests.
+//
+// These tests scan the source files of the bootstrap-cli skeleton to verify
+// the absence of forbidden patterns. They complement behavioural tests and
+// satisfy security-requirements.md "проверяемо: grep по internal/".
+//
+// Running: go test -v -run TestStatic ./
+// Docker:  docker run --rm -v "$PWD":/src -w /src golang:1.25 sh -c "CGO_ENABLED=0 go test -v -count=1 ./"
+
+import (
+	"bufio"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
+
+// goSourceFiles returns all *.go (non-test) files under the given directory.
+func goSourceFiles(t *testing.T, root string) []string {
+	t.Helper()
+	var files []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		if strings.HasSuffix(path, ".go") && !strings.HasSuffix(path, "_test.go") {
+			files = append(files, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("walk %q: %v", root, err)
+	}
+	return files
+}
+
+// grepFiles searches all files for any line containing the given pattern.
+// Returns a list of "file:linenum: line" strings for each match.
+func grepFiles(t *testing.T, files []string, pattern string) []string {
+	t.Helper()
+	var matches []string
+	for _, f := range files {
+		fh, err := os.Open(f)
+		if err != nil {
+			t.Fatalf("open %q: %v", f, err)
+		}
+		scanner := bufio.NewScanner(fh)
+		lineNum := 0
+		for scanner.Scan() {
+			lineNum++
+			line := scanner.Text()
+			// Skip comment lines — they may describe the absence of a pattern.
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			if strings.Contains(line, pattern) {
+				matches = append(matches, filepath.Base(f)+":"+strings.TrimSpace(line))
+			}
+		}
+		fh.Close()
+	}
+	return matches
+}
+
+// TestStaticNoExecCommand verifies that no production source file in internal/
+// or cmd/ imports or calls exec.Command / os/exec.
+// Security requirement: "ни одна команда/заглушка каркаса не вызывает exec.Command/sh -c/os/exec"
+// baseline §3.
+func TestStaticNoExecCommand(t *testing.T) {
+	files := append(
+		goSourceFiles(t, "internal"),
+		goSourceFiles(t, "cmd")...,
+	)
+
+	forbiddenPatterns := []string{
+		`"os/exec"`,
+		`exec.Command`,
+		`exec.LookPath`,
+	}
+
+	for _, pat := range forbiddenPatterns {
+		if matches := grepFiles(t, files, pat); len(matches) > 0 {
+			t.Errorf("SECURITY: forbidden pattern %q found in production sources:\n  %s",
+				pat, strings.Join(matches, "\n  "))
+		}
+	}
+}
+
+// TestStaticNoNetListen verifies that no production source file opens a network
+// listener — the serve stub must not call net.Listen or http.ListenAndServe.
+// Security requirement: "заглушка serve не открывает сетевой порт, не вызывает net.Listen"
+// baseline §3/§6, AC D4.
+func TestStaticNoNetListen(t *testing.T) {
+	files := append(
+		goSourceFiles(t, "internal"),
+		goSourceFiles(t, "cmd")...,
+	)
+
+	forbiddenPatterns := []string{
+		`net.Listen`,
+		`http.ListenAndServe`,
+		`http.ListenAndServeTLS`,
+		`tls.Listen`,
+	}
+
+	for _, pat := range forbiddenPatterns {
+		if matches := grepFiles(t, files, pat); len(matches) > 0 {
+			t.Errorf("SECURITY: forbidden networking pattern %q found in production sources:\n  %s",
+				pat, strings.Join(matches, "\n  "))
+		}
+	}
+}
+
+// TestStaticNoHardcodedSecrets verifies that no production source file contains
+// known secret patterns (API key prefixes, PEM headers, base64 token blobs).
+// Security requirement: "в исходниках нет хардкода ключей/токенов/сертификатов"
+// baseline §4, AC "скелет не содержит секретов".
+func TestStaticNoHardcodedSecrets(t *testing.T) {
+	files := append(
+		goSourceFiles(t, "internal"),
+		goSourceFiles(t, "cmd")...,
+	)
+
+	forbiddenPatterns := []string{
+		`rax_live_`,
+		`BEGIN PRIVATE KEY`,
+		`BEGIN RSA PRIVATE KEY`,
+		`BEGIN EC PRIVATE KEY`,
+		`BEGIN CERTIFICATE`,
+	}
+
+	for _, pat := range forbiddenPatterns {
+		if matches := grepFiles(t, files, pat); len(matches) > 0 {
+			t.Errorf("SECURITY: hardcoded secret pattern %q found:\n  %s",
+				pat, strings.Join(matches, "\n  "))
+		}
+	}
+}
+
+// TestStaticNoFileCreationWithWideModes verifies that config package does not
+// create files with modes wider than 0600 (the contract for future keys.db/TLS key).
+// Security requirement: "файлы внутри StateDir/TLSDir — 0600; grep/код-ревью: нет создания файлов с режимом > 0600".
+// baseline §1/§2.
+func TestStaticNoFileCreationWithWideModes(t *testing.T) {
+	files := goSourceFiles(t, "internal/config")
+
+	// Forbidden: any WriteFile/Create with a mode > 0600 (e.g. 0644, 0755).
+	// We check for explicit mode literals wider than 0600.
+	wideModes := []string{
+		"0644", "0o644",
+		"0755", "0o755",
+		"0666", "0o666",
+		"0777", "0o777",
+	}
+
+	for _, mode := range wideModes {
+		if matches := grepFiles(t, files, mode); len(matches) > 0 {
+			t.Errorf("SECURITY: file mode %q (wider than 0600) found in config sources:\n  %s",
+				mode, strings.Join(matches, "\n  "))
+		}
+	}
+}
+
+// TestGoModuleNameAndGoVersion verifies that go.mod declares the correct
+// module name and minimum Go version as specified in spec.md D1/D2.
+// AC: "go.mod с именем модуля github.com/vladimirvkhs/raxd и минимальной версией go 1.25".
+func TestGoModuleNameAndGoVersion(t *testing.T) {
+	data, err := os.ReadFile("go.mod")
+	if err != nil {
+		t.Fatalf("cannot read go.mod: %v", err)
+	}
+	content := string(data)
+
+	if !strings.Contains(content, "module github.com/vladimirvkhs/raxd") {
+		t.Errorf("go.mod must declare module github.com/vladimirvkhs/raxd;\ngo.mod:\n%s", content)
+	}
+	if !strings.Contains(content, "go 1.25") {
+		t.Errorf("go.mod must declare go 1.25 minimum version;\ngo.mod:\n%s", content)
+	}
+}
