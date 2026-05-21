@@ -59,11 +59,17 @@
 - **[ISSUE-2 new]** Поле `MaxBodyBytes int64` (дефолт 1 MiB = 1 048 576, viper-ключ `max_body_bytes`); используется `bodyLimitMiddleware` в server.go.
 - Валидация `BindAddr` как IP через `net.ParseIP` при загрузке (ux-spec §5.6).
 
+### `internal/server/server.go` — `SetOnListen` seam (D-1 fix)
+- Добавлено поле `onListen func(addr string)` и метод `Server.SetOnListen(fn)`.
+- Хук вызывается в `Run()` ПОСЛЕ успешного `net.Listen`, ДО `Serve`; при ошибке bind не вызывается.
+- Это seam для serve.go: стартовый блок печатается только когда порт реально занят.
+
 ### `internal/cli/serve.go`
 Замена честной заглушки на рабочий foreground-запуск (AC11):
 - `signal.NotifyContext(SIGINT, SIGTERM)` → `srv.Run(ctx)` → вывод shutdown-блока (AC12, SR-24).
-- Startup-блок по ux-spec: cert generated/loaded, key, tls, listening, warning на пустой keystore.
-- Ошибки old error:/hint: по ux-spec §5.
+- **D-1 fix (ux-spec §5):** стартовый блок (cert/key/tls/listening/press Ctrl+C) перенесён в `SetOnListen` хук — печатается ТОЛЬКО после успешного bind; переменная `started` гейтит shutdown-блок.
+- При ошибке bind: только `error:`+`hint:`, без стартового и shutdown-блоков.
+- Ошибки error:/hint: по ux-spec §5.
 - Ключ не передаётся через argv/env (SR-12).
 
 ## Отклонения/эскалации
@@ -102,6 +108,28 @@ AUTH-аудит убран из `authMiddleware`. Добавлен `authSuccessA
 
 ### Решение OQ-1 (маршрут в аудит): поле `path` не добавлено
 По ux-spec OQ-1 решено не добавлять — аудит уровня security, не application-лога.
+
+### Правка D-1 (tech-writer: ложный стартовый блок при ошибке bind, ux-spec §5)
+
+**Дефект:** `serve.go` печатал стартовый блок (listening/cert/tls/press Ctrl+C) ДО вызова
+`srv.Run()`, поэтому при занятом порте пользователь видел ложный «listening on https://...»,
+за которым следовал shutdown-блок и только потом сообщение об ошибке.
+
+**Исправление:**
+- `internal/server/server.go`: добавлено поле `onListen func(addr string)` и метод
+  `Server.SetOnListen(fn)`. Хук вызывается в `Run()` ПОСЛЕ `net.Listen`, ДО `Serve`;
+  при ошибке bind не вызывается — Run возвращает ошибку до хука.
+- `internal/cli/serve.go`: стартовый блок перенесён в `SetOnListen` хук; переменная
+  `started bool` (устанавливается внутри хука) гейтит вывод shutdown-блока; при ошибке
+  Run — только `error:` + `hint:` на stderr, exit 1.
+- `internal/server/server_test.go`: `TestOnListenHookCalledOnSuccessfulBind` — хук вызван
+  при успешном bind (sync/atomic для race-safety); `TestOnListenHookNotCalledOnPortInUse` —
+  хук НЕ вызывается при занятом порте.
+- `internal/cli/cli_gaps_test.go`: `TestServePortInUseNoStartupBlock` — проверяет отсутствие
+  «listening»/«press Ctrl+C» при bind-ошибке; `TestServePortInUseNoShutdownBlock` —
+  проверяет отсутствие shutdown-фраз при bind-ошибке.
+
+Совместимость с `afterShutdownHook` сохранена (порядок Shutdown→FlushUsage не изменён).
 
 ## Тесты
 
@@ -189,8 +217,17 @@ ok  github.com/vladimirvkhs/raxd/internal/server  2.237s (go test -v)
 ok  github.com/vladimirvkhs/raxd/internal/server  3.948s (CGO_ENABLED=1 -race)
 ```
 
-Все 37 тестов server (добавлены по reviewer needs-changes: TestOriginBypassAttemptRejected, TestInvalidOriginUnparseable, TestMaxBodyBytesRejected, TestMaxBodyBytesDefault, TestSingleAuditRecordOnSuccess, TestSingleAuditRecordOnRateLimit + исходные 28 + QA) + 50+ cli/config/keystore/banner/version тестов PASS.
+Все 41 тест server (добавлены D-1: TestOnListenHookCalledOnSuccessfulBind, TestOnListenHookNotCalledOnPortInUse + ранее добавленные по reviewer: TestOriginBypassAttemptRejected, TestInvalidOriginUnparseable, TestMaxBodyBytesRejected, TestMaxBodyBytesDefault, TestSingleAuditRecordOnSuccess, TestSingleAuditRecordOnRateLimit + исходные 28 + QA) + 54 cli/config/keystore/banner/version тестов PASS.
 Нет `t.Skip`, нет закомментированных проверок.
+
+### Результаты Docker (D-1 fix, финальный прогон)
+
+```
+go vet -mod=vendor ./...                            → OK (no output)
+go test -mod=vendor -count=1 ./...                  → all packages OK
+CGO_ENABLED=1 go test -mod=vendor -race -count=1
+  ./internal/server/...                             → ok 3.978s (no races)
+```
 
 ## Безопасность
 
