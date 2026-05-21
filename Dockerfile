@@ -30,5 +30,8 @@ RUN go vet ./... && go build -o /bin/raxd ./cmd/raxd
 
 # ── test stage ───────────────────────────────────────────────────────────────
 FROM base AS test
-# Run go vet + go test. Exit code is propagated to the caller.
-CMD ["sh", "-c", "go vet ./... && go test -v -count=1 ./..."]
+# Run go vet + go test (all packages) + go test -race (keystore, where concurrent
+# Verify/FlushUsage races on usageBuf are the primary risk).
+# Race detector requires CGO; keystore race step overrides CGO_ENABLED=0.
+# Exit code of the last failing command propagates to the caller.
+CMD ["sh", "-c", "go vet ./... && go test -v -count=1 ./... && CGO_ENABLED=1 go test -race -count=1 ./internal/keystore/..."]

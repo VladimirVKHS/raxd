@@ -351,6 +351,115 @@ func TestFlushUsageMergeDoesNotOverwriteRevoke(t *testing.T) {
 	}
 }
 
+// --- Concurrent Verify mix: valid + invalid keys + FlushUsage (race-detector target) ---
+
+// TestConcurrentVerifyMixWithFlush exercises the critical concurrency path:
+// multiple goroutines simultaneously calling Verify with a mix of valid and
+// invalid keys, while other goroutines call FlushUsage in parallel.
+//
+// This test is specifically designed to provoke data races on usageBuf if the
+// mutex is absent or incorrect. It must be run with -race to detect races;
+// it also verifies correctness (no panics, valid keys verify correctly).
+//
+// Run: CGO_ENABLED=1 go test -race ./internal/keystore/...
+//
+// SR-23/потокобезопасность: "Verify и FlushUsage не конфликтуют на usageBuf".
+func TestConcurrentVerifyMixWithFlush(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	// Create one valid key. Invalid keys are synthesised below.
+	plain, _, err := store.Create("race-mix-valid")
+	if err != nil {
+		t.Fatalf("Create valid key: %v", err)
+	}
+	invalidKeys := []string{
+		"rax_live_" + strings.Repeat("A", 43),
+		"rax_live_" + strings.Repeat("B", 43),
+		"rax_live_notakey",
+	}
+
+	const (
+		verifyGoroutines = 16 // 8 valid + 8 invalid
+		flushGoroutines  = 4
+		iters            = 10
+	)
+
+	var wg sync.WaitGroup
+	panicCh := make(chan interface{}, verifyGoroutines+flushGoroutines)
+
+	// Half goroutines: Verify with VALID key — write to usageBuf on each hit.
+	for i := 0; i < verifyGoroutines/2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					panicCh <- r
+				}
+			}()
+			for j := 0; j < iters; j++ {
+				_, ok, verifyErr := store.Verify(string(plain))
+				if verifyErr != nil {
+					panicCh <- verifyErr
+					return
+				}
+				if !ok {
+					panicCh <- "valid key Verify returned false"
+					return
+				}
+			}
+		}()
+	}
+
+	// Half goroutines: Verify with INVALID keys — no usageBuf write,
+	// but exercise the read path concurrently with map writers.
+	for i := 0; i < verifyGoroutines/2; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					panicCh <- r
+				}
+			}()
+			key := invalidKeys[n%len(invalidKeys)]
+			for j := 0; j < iters; j++ {
+				_, ok, _ := store.Verify(key)
+				if ok {
+					panicCh <- "invalid key Verify returned true"
+					return
+				}
+			}
+		}(i)
+	}
+
+	// FlushUsage goroutines: drain usageBuf while Verify goroutines write to it.
+	for i := 0; i < flushGoroutines; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					panicCh <- r
+				}
+			}()
+			for j := 0; j < iters; j++ {
+				if flushErr := store.FlushUsage(); flushErr != nil {
+					panicCh <- flushErr
+					return
+				}
+			}
+		}()
+	}
+
+	wg.Wait()
+	close(panicCh)
+
+	for item := range panicCh {
+		t.Errorf("concurrent Verify/FlushUsage produced error or panic: %v", item)
+	}
+}
+
 // --- SR-23: concurrent Create + List do not corrupt the file ---
 
 // TestConcurrentCreateAndList verifies that parallel Create and List operations
