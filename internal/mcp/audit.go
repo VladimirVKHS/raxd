@@ -6,15 +6,13 @@ package mcp
 //   - Fingerprint: from server.FingerprintFromContext(ctx) — NOT the key body
 //   - Tool: MCP tool name (not a secret)
 //   - Result: "success" or "fail"
-//   - RemoteAddr: from http.Request (via context)
+//   - RemoteAddr: from server.RemoteAddrFromContext(ctx) — stored by authMiddleware
 //
 // SR-34: key body, hash, salt, and private TLS key MUST NOT appear in audit records.
 // SR-28: this package does not call keystore.Verify.
 
 import (
 	"context"
-	"net"
-	"net/http"
 	"time"
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
@@ -23,11 +21,10 @@ import (
 
 // withAudit wraps a ToolHandlerFor with pre/post audit logging.
 //
-// It uses server.FingerprintFromContext to retrieve the fingerprint set by
-// authMiddleware — the key body is NEVER accessible here (SR-35/SR-34).
-//
-// The RemoteAddr is extracted from the http.Request via the SDK's context;
-// if not available, "-" is used as a safe fallback.
+// It uses server.FingerprintFromContext and server.RemoteAddrFromContext to
+// retrieve values stored in the request context by authMiddleware. The SDK
+// forwards req.Context() into every tool handler, so both values are available.
+// The key body is NEVER accessible here (SR-35/SR-34).
 //
 // Parameters:
 //   - name: MCP tool name (logged as Tool in AuditRecord; not a secret).
@@ -35,9 +32,11 @@ import (
 //   - audit: the AuditFn injected from the transport layer.
 func withAudit[In, Out any](name string, h sdkmcp.ToolHandlerFor[In, Out], audit server.AuditFn) sdkmcp.ToolHandlerFor[In, Out] {
 	return func(ctx context.Context, req *sdkmcp.CallToolRequest, input In) (*sdkmcp.CallToolResult, Out, error) {
-		// SR-35: fingerprint from context (not key body).
+		// SR-35/AC9: fingerprint and remote address from context — both stored by
+		// authMiddleware before the request reaches the MCP SDK handler. The SDK
+		// forwards req.Context() into tool handlers, so both values are available here.
 		fp := server.FingerprintFromContext(ctx)
-		remote := remoteAddrFromCtx(ctx)
+		remote := server.RemoteAddrFromContext(ctx)
 
 		result, out, err := h(ctx, req, input)
 
@@ -65,23 +64,3 @@ func withAudit[In, Out any](name string, h sdkmcp.ToolHandlerFor[In, Out], audit
 	}
 }
 
-// remoteAddrFromCtx extracts the remote address from the request context.
-// The MCP SDK stores the *http.Request in context via a known key.
-// If unavailable, returns "-" as a safe fallback.
-func remoteAddrFromCtx(ctx context.Context) string {
-	// The SDK does not expose a public API to retrieve the http.Request from ctx,
-	// but the ClientAddress is available via mcp.ClientAddressFromContext.
-	// As a fallback, we check for the request directly.
-	if req, ok := ctx.Value(httpRequestCtxKey{}).(*http.Request); ok && req != nil {
-		host, _, err := net.SplitHostPort(req.RemoteAddr)
-		if err != nil {
-			return req.RemoteAddr
-		}
-		return host + ":?"
-	}
-	return "-"
-}
-
-// httpRequestCtxKey is not used (the SDK does not expose a public key for the request).
-// remoteAddrFromCtx always returns "-" or the SDK-provided address below.
-type httpRequestCtxKey struct{}

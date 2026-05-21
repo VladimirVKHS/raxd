@@ -15,6 +15,7 @@ type ctxKey int
 const (
 	ctxKeyFingerprint ctxKey = iota
 	ctxKeyKeyID
+	ctxKeyRemoteAddr
 )
 
 // fingerprintFromCtx returns the fingerprint stored in ctx by authMiddleware.
@@ -34,6 +35,35 @@ func fingerprintFromCtx(ctx context.Context) string {
 // exposed — the key body is never put into context and cannot be extracted here.
 func FingerprintFromContext(ctx context.Context) string {
 	return fingerprintFromCtx(ctx)
+}
+
+// remoteAddrFromCtx returns the remote address stored in ctx by authMiddleware.
+// Returns "-" if not set.
+func remoteAddrFromCtx(ctx context.Context) string {
+	if addr, ok := ctx.Value(ctxKeyRemoteAddr).(string); ok && addr != "" {
+		return addr
+	}
+	return "-"
+}
+
+// RemoteAddrFromContext is the exported version of remoteAddrFromCtx for use
+// by the internal/mcp package (withAudit decorator). Returns the remote address
+// (r.RemoteAddr format: IP:port) stored in ctx by authMiddleware ("-" if not set).
+//
+// AC9/SR-35: remote address must appear in MCP audit records. Symmetric to
+// FingerprintFromContext — both are stored by authMiddleware in the request context
+// before passing to the next handler, so both reach the MCP tool handler via ctx.
+func RemoteAddrFromContext(ctx context.Context) string {
+	return remoteAddrFromCtx(ctx)
+}
+
+// AuthMiddlewareForTest is a test-only export of authMiddleware for use in
+// server_test (external package) to drive the middleware directly without a
+// full TLS server. Allows tests to verify that authMiddleware stores the remote
+// address in context (AC9/SR-35) without spinning up a full TLS server.
+// NOT for production use — use authMiddleware via New() instead.
+func AuthMiddlewareForTest(store *keystore.Store, auditFn AuditFn) func(http.Handler) http.Handler {
+	return authMiddleware(store, auditFn)
 }
 
 // authMiddleware extracts the Bearer token from the Authorization header,
@@ -101,7 +131,7 @@ func authMiddleware(store *keystore.Store, auditFn AuditFn) func(http.Handler) h
 				return
 			}
 
-			// Success: store fingerprint and key ID in context (AC8, SR-9).
+			// Success: store fingerprint, key ID, and remote address in context (AC8, AC9, SR-9, SR-35).
 			// SECURITY: only fingerprint (non-reversible) goes into context, NOT the token.
 			fp := rec.Fingerprint
 			if fp == "" {
@@ -109,6 +139,10 @@ func authMiddleware(store *keystore.Store, auditFn AuditFn) func(http.Handler) h
 			}
 			ctx := context.WithValue(r.Context(), ctxKeyFingerprint, fp)
 			ctx = context.WithValue(ctx, ctxKeyKeyID, rec.ID)
+			// AC9/SR-35: store remote address so MCP audit layer (withAudit) can include
+			// it in audit records via RemoteAddrFromContext. Same format as remoteIP(r)
+			// (r.RemoteAddr, IP:port). Symmetric to fingerprint propagation.
+			ctx = context.WithValue(ctx, ctxKeyRemoteAddr, remote)
 
 			// SR-19/SR-20 (ISSUE-3): AUTH audit record is NOT written here.
 			// It is written by authSuccessAuditMiddleware AFTER rate-limit passes,

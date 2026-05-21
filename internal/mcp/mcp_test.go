@@ -666,6 +666,134 @@ func TestMCPAuditHasFingerprintAndTool(t *testing.T) {
 	}
 }
 
+// TestMCPAuditHasRealRemoteAddr verifies AC9/SR-35 (LOW-1):
+// the MCP audit record for a tools/call must contain a REAL remote address
+// (not "remote=-"). The remote address is stored in context by authMiddleware
+// via server.RemoteAddrFromContext and retrieved by withAudit.
+//
+// The remote address in the MCP audit record must match the format used by the
+// transport AUTH audit record for the same request (IP:port or IP).
+// A failure here means remote=- was written, violating AC9/SR-35.
+// Do NOT weaken this assertion — escalate to developer if it fails.
+func TestMCPAuditHasRealRemoteAddr(t *testing.T) {
+	baseURL, keyStr, client, auditBuf := startMCPServer(t)
+
+	// initialize — discard audit
+	initResp := postMCP(t, client, baseURL, keyStr, jsonrpcBody(1, "initialize", map[string]interface{}{
+		"protocolVersion": "2025-11-25",
+		"capabilities":    map[string]interface{}{},
+		"clientInfo":      map[string]interface{}{"name": "test", "version": "1"},
+	}), nil)
+	readBody(t, initResp)
+	auditBuf.Reset()
+
+	// tools/call ping
+	callBody := jsonrpcBody(3, "tools/call", map[string]interface{}{
+		"name":      "ping",
+		"arguments": map[string]interface{}{},
+	})
+	resp := postMCP(t, client, baseURL, keyStr, callBody, map[string]string{
+		"MCP-Protocol-Version": "2025-11-25",
+	})
+	readBody(t, resp)
+
+	logOutput := auditBuf.String()
+
+	// Find the MCP audit line (contains "tool=ping").
+	var mcpLine string
+	for _, line := range strings.Split(logOutput, "\n") {
+		if strings.Contains(line, "tool=ping") {
+			mcpLine = line
+			break
+		}
+	}
+	if mcpLine == "" {
+		t.Fatalf("AC9/SR-35 LOW-1: no MCP audit line with tool=ping found; log=%s", logOutput)
+	}
+
+	// Extract remote= value from the MCP audit line.
+	idx := strings.Index(mcpLine, "remote=")
+	if idx < 0 {
+		t.Errorf("AC9/SR-35 LOW-1: MCP audit line has no remote= field; line=%q", mcpLine)
+		return
+	}
+	rest := mcpLine[idx+7:] // after "remote="
+	rest = strings.TrimPrefix(rest, `"`)
+	end := strings.IndexAny(rest, " \t\n\r\"")
+	var remoteVal string
+	if end >= 0 {
+		remoteVal = rest[:end]
+	} else {
+		remoteVal = rest
+	}
+	remoteVal = strings.TrimSuffix(remoteVal, `"`)
+
+	if remoteVal == "-" || remoteVal == "" {
+		t.Errorf(
+			"AC9/SR-35 LOW-1 PRODUCT BUG: MCP audit record has remote=%q — "+
+				"remote address was not propagated from auth context to withAudit.\n"+
+				"Escalate to developer — do NOT weaken this assertion.\n"+
+				"MCP audit line: %q\nFull log: %s",
+			remoteVal, mcpLine, logOutput,
+		)
+		return
+	}
+
+	// Must contain a digit (valid IP) — not a sentinel string.
+	hasDigit := false
+	for _, c := range remoteVal {
+		if c >= '0' && c <= '9' {
+			hasDigit = true
+			break
+		}
+	}
+	if !hasDigit {
+		t.Errorf(
+			"AC9/SR-35 LOW-1: MCP audit remote=%q has no digit — expected IP:port format; "+
+				"line=%q",
+			remoteVal, mcpLine,
+		)
+	}
+
+	// Verify the remote= format matches the transport AUTH record for the same request.
+	// Both should contain the same client IP (127.0.0.1 in tests).
+	var authLine string
+	for _, line := range strings.Split(logOutput, "\n") {
+		if strings.Contains(line, "AUTH") {
+			authLine = line
+			break
+		}
+	}
+	if authLine != "" {
+		// Extract remote= from AUTH line.
+		aidx := strings.Index(authLine, "remote=")
+		if aidx >= 0 {
+			authRest := authLine[aidx+7:]
+			authRest = strings.TrimPrefix(authRest, `"`)
+			authEnd := strings.IndexAny(authRest, " \t\n\r\"")
+			var authRemote string
+			if authEnd >= 0 {
+				authRemote = authRest[:authEnd]
+			} else {
+				authRemote = authRest
+			}
+			authRemote = strings.TrimSuffix(authRemote, `"`)
+
+			// IP parts (before ':') must match — same request, same client.
+			mcpIP := strings.Split(remoteVal, ":")[0]
+			authIP := strings.Split(authRemote, ":")[0]
+			if mcpIP != authIP {
+				t.Errorf(
+					"AC9/SR-35 LOW-1: MCP remote IP %q != AUTH remote IP %q — "+
+						"format mismatch between transport and MCP audit records.\n"+
+						"MCP line: %q\nAUTH line: %q",
+					mcpIP, authIP, mcpLine, authLine,
+				)
+			}
+		}
+	}
+}
+
 // assertMCPRealFingerprint verifies that every "fp=" occurrence in logOutput
 // is followed by a non-empty hex value (not "-"). Mirrors assertRealFingerprint
 // in mcp_security_test.go (different package file, same package mcp_test).

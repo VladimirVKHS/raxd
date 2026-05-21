@@ -9,9 +9,13 @@ package server_test
 import (
 	"bytes"
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
+	"github.com/vladimirvkhs/raxd/internal/config"
+	"github.com/vladimirvkhs/raxd/internal/keystore"
 	"github.com/vladimirvkhs/raxd/internal/server"
 )
 
@@ -89,5 +93,82 @@ func TestFingerprintFromContext(t *testing.T) {
 	fp := server.FingerprintFromContext(ctx)
 	if fp != "-" {
 		t.Errorf("FingerprintFromContext on empty ctx: want \"-\", got %q", fp)
+	}
+}
+
+// TestRemoteAddrFromContextEmpty verifies that RemoteAddrFromContext returns "-"
+// when no remote address has been stored in context.
+// Symmetric to FingerprintFromContext (AC9/SR-35: remote must be in MCP audit records).
+func TestRemoteAddrFromContextEmpty(t *testing.T) {
+	ctx := context.Background()
+	remote := server.RemoteAddrFromContext(ctx)
+	if remote != "-" {
+		t.Errorf("RemoteAddrFromContext on empty ctx: want \"-\", got %q", remote)
+	}
+}
+
+// TestRemoteAddrFromContextSet verifies that RemoteAddrFromContext returns the real
+// remote address when authMiddleware has stored it in context.
+// This is the symmetric mechanism to FingerprintFromContext (AC9/SR-35).
+//
+// Strategy: drive authMiddleware directly via httptest with a real key,
+// then verify RemoteAddrFromContext returns the client address from the request,
+// not "-". The address must contain a colon (IP:port format).
+func TestRemoteAddrFromContextSet(t *testing.T) {
+	dir := t.TempDir()
+	tlsDir := t.TempDir()
+	paths := config.PathSet{
+		ConfigDir:  dir,
+		ConfigFile: dir + "/config.yaml",
+		StateDir:   dir,
+		KeysDB:     dir + "/keys.db",
+		TLSDir:     tlsDir,
+	}
+	store, err := keystore.Open(paths.KeysDB)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	plain, _, err := store.Create("remote-ctx-test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+
+	// Build an inner handler that captures RemoteAddrFromContext.
+	var capturedRemote string
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		capturedRemote = server.RemoteAddrFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	})
+
+	// Wrap with authMiddleware.
+	var auditBuf bytes.Buffer
+	logger := newTestLogger(&auditBuf)
+	auditFn := server.NewAuditFnForTest(logger)
+	handler := server.AuthMiddlewareForTest(store, auditFn)(inner)
+
+	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	req.Header.Set("Authorization", "Bearer "+string(plain))
+	// httptest.NewRequest sets RemoteAddr to "192.0.2.1:1234" by default.
+
+	rr := httptest.NewRecorder()
+	handler.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("TestRemoteAddrFromContextSet: want 200, got %d", rr.Code)
+	}
+	if capturedRemote == "-" || capturedRemote == "" {
+		t.Errorf(
+			"AC9/SR-35: RemoteAddrFromContext returned %q after authMiddleware — "+
+				"remote address was not stored in context. "+
+				"MCP audit records would show remote=- for all authenticated requests.",
+			capturedRemote,
+		)
+	}
+	// Must contain a colon (IP:port format, same as r.RemoteAddr).
+	if !strings.Contains(capturedRemote, ":") {
+		t.Errorf(
+			"AC9/SR-35: RemoteAddrFromContext returned %q — expected IP:port format (contains ':')",
+			capturedRemote,
+		)
 	}
 }
