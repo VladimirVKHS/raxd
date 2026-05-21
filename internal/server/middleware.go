@@ -14,7 +14,8 @@ import (
 //   - Origin ABSENT → pass through (non-browser raxd agents: curl/SDK don't send Origin)
 //
 // SR-14: this middleware is placed BEFORE auth in the chain.
-func hostOriginMiddleware(hostAllow, originAllow []string) func(http.Handler) http.Handler {
+// SR-19/SR-20: every 403 denial is written to the audit log via auditFn.
+func hostOriginMiddleware(hostAllow, originAllow []string, auditFn AuditFn) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			remote := remoteIP(r)
@@ -30,7 +31,14 @@ func hostOriginMiddleware(hostAllow, originAllow []string) func(http.Handler) ht
 				hostOnly = host
 			}
 			if !contains(hostAllow, hostOnly) {
-				auditPlaceholder(w, r, remote, "deny", "invalid host header")
+				// SR-19/SR-20: audit every Host denial. Reason is NOT sent in response body
+				// (anti-enumeration per ux-spec §3.5).
+				auditFn(AuditRecord{
+					Fingerprint: "-",
+					RemoteAddr:  remote,
+					Result:      "deny",
+					Reason:      "invalid host header",
+				})
 				http.Error(w, "", http.StatusForbidden)
 				return
 			}
@@ -38,7 +46,14 @@ func hostOriginMiddleware(hostAllow, originAllow []string) func(http.Handler) ht
 			// Validate Origin header only if it is present (SR-16).
 			origin := r.Header.Get("Origin")
 			if origin != "" && !originAllowed(origin, originAllow) {
-				auditPlaceholder(w, r, remote, "deny", "invalid origin header")
+				// SR-19/SR-20: audit every Origin denial. Reason is NOT sent in response body
+				// (anti-enumeration per ux-spec §3.6).
+				auditFn(AuditRecord{
+					Fingerprint: "-",
+					RemoteAddr:  remote,
+					Result:      "deny",
+					Reason:      "invalid origin header",
+				})
 				http.Error(w, "", http.StatusForbidden)
 				return
 			}
@@ -46,18 +61,6 @@ func hostOriginMiddleware(hostAllow, originAllow []string) func(http.Handler) ht
 			next.ServeHTTP(w, r)
 		})
 	}
-}
-
-// auditPlaceholder is called by middleware layers that run before auth (so no AuditFn
-// is available yet). It stores the deny result in a context value so the deferred
-// audit in auditMiddleware can pick it up.
-// For simplicity in Host/Origin middleware (which runs before audit middleware wraps),
-// we write a plain response; the server-level audit middleware records the result.
-func auditPlaceholder(_ http.ResponseWriter, r *http.Request, _, _, _ string) {
-	// The audit middleware (outermost wrapper) uses a deferred write pattern;
-	// Host/Origin denials are captured there via the response recorder.
-	// This function is intentionally empty — it's called for documentation clarity.
-	_ = r
 }
 
 // recoverMiddleware catches panics and returns 500 without crashing the server.

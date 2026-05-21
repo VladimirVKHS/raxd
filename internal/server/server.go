@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	clog "github.com/charmbracelet/log"
@@ -32,6 +33,10 @@ type Server struct {
 	store      *keystore.Store
 	logger     *clog.Logger
 	certInfo   CertInfo
+
+	// afterShutdownHook is called immediately after http.Server.Shutdown returns,
+	// before store.FlushUsage(). Nil in production; set by tests to verify SR-24 order.
+	afterShutdownHook func()
 }
 
 // New creates a fully configured *Server.
@@ -79,15 +84,11 @@ func New(cfg *config.Config, paths config.PathSet, store *keystore.Store, logger
 	// Layer 4: auth (Bearer → keystore.Verify)
 	handler = authMiddleware(store, auditFn)(handler)
 
-	// Layer 3: Host/Origin validation (SR-14: before auth)
-	handler = hostOriginMiddleware(cfg.HostAllow, cfg.OriginAllow)(handler)
+	// Layer 3: Host/Origin validation (SR-14: before auth; SR-19/SR-20: denials audited)
+	handler = hostOriginMiddleware(cfg.HostAllow, cfg.OriginAllow, auditFn)(handler)
 
 	// Layer 2: recover (panic protection, SR-25)
 	handler = recoverMiddleware(handler)
-
-	// Layer 1 (outermost): passthrough wrapper for consistency with plan
-	// Each inner middleware writes its own audit record at decision time.
-	_ = handler // handler is assigned below
 
 	addr := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.Port)
 	httpSrv := &http.Server{
@@ -120,6 +121,13 @@ func New(cfg *config.Config, paths config.PathSet, store *keystore.Store, logger
 // GetCertInfo returns information about the TLS certificate (generated or loaded).
 func (s *Server) GetCertInfo() CertInfo {
 	return s.certInfo
+}
+
+// SetAfterShutdownHook registers a function to be called immediately after
+// http.Server.Shutdown returns and before store.FlushUsage().
+// This is a test seam for verifying SR-24 ordering; must not be called in production code.
+func (s *Server) SetAfterShutdownHook(fn func()) {
+	s.afterShutdownHook = fn
 }
 
 // Addr returns the configured listen address.
@@ -174,6 +182,12 @@ func (s *Server) Run(ctx context.Context) error {
 			s.logger.Warn("shutdown error", "err", err)
 		}
 
+		// afterShutdownHook is invoked immediately after Shutdown and before FlushUsage.
+		// Used by tests to verify SR-24 ordering; nil in production.
+		if s.afterShutdownHook != nil {
+			s.afterShutdownHook()
+		}
+
 		// SR-24: FlushUsage AFTER Shutdown completes.
 		if err := s.store.FlushUsage(); err != nil {
 			s.logger.Warn("flush usage error", "err", err)
@@ -200,21 +214,5 @@ func isAddrInUse(err error) bool {
 		return false
 	}
 	msg := err.Error()
-	return stringContains(msg, "address already in use") || stringContains(msg, "bind: address already in use")
-}
-
-// stringContains reports whether s contains substr.
-func stringContains(s, substr string) bool {
-	if len(substr) == 0 {
-		return true
-	}
-	if len(s) < len(substr) {
-		return false
-	}
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
+	return strings.Contains(msg, "address already in use") || strings.Contains(msg, "bind: address already in use")
 }
