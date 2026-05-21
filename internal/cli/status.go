@@ -18,7 +18,7 @@ func newStatusCmd() *cobra.Command {
 		Long: `Display the current state of the raxd daemon and the filesystem paths
 used for configuration, key storage, and TLS certificates.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			paths, err := config.GetPaths()
+			paths, err := config.Paths()
 			if err != nil {
 				fmt.Fprintf(cmd.ErrOrStderr(), "error: %v\n", err)
 				fmt.Fprintf(cmd.ErrOrStderr(),

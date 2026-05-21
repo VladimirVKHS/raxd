@@ -30,7 +30,7 @@ Use "raxd [command] --help" for more information about a command.`,
 
 			// Ensure XDG directories exist on every invocation.
 			// Failure is non-fatal for banner/version — only status/serve care.
-			paths, err := config.GetPaths()
+			paths, err := config.Paths()
 			if err == nil {
 				_ = config.EnsureDirs(paths)
 			}

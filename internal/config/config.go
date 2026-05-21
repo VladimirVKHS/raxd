@@ -19,7 +19,7 @@ type Config struct {
 // Load reads config.yaml from p.ConfigFile using viper.
 // Absence of the file is NOT an error — defaults are applied instead.
 // A malformed YAML file returns an explicit error.
-func Load(p Paths) (*Config, error) {
+func Load(p PathSet) (*Config, error) {
 	v := viper.New()
 	v.SetConfigFile(p.ConfigFile)
 	v.SetConfigType("yaml")

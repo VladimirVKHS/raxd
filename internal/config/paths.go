@@ -2,17 +2,19 @@
 package config
 
 import (
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 )
 
-// Paths holds the filesystem locations used by raxd.
+// PathSet holds the filesystem locations used by raxd.
 // All directories follow XDG conventions with D3 override: ConfigDir is always
 // $XDG_CONFIG_HOME/raxd when XDG_CONFIG_HOME is set, otherwise $HOME/.config/raxd.
 // This matches both Linux and macOS (D3 decision from spec).
-type Paths struct {
+//
+// Previously named Paths (struct). Renamed to PathSet so that the constructor
+// function can be named Paths() per plan.md contract.
+type PathSet struct {
 	ConfigDir  string // $XDG_CONFIG_HOME/raxd  or  $HOME/.config/raxd
 	ConfigFile string // ConfigDir/config.yaml
 	StateDir   string // $XDG_STATE_HOME/raxd   or  $HOME/.local/state/raxd
@@ -24,10 +26,10 @@ type Paths struct {
 // Specification and D3 (canonical $HOME/.config/raxd on both Linux and macOS).
 //
 // Returns an error only when $HOME is unavailable.
-func GetPaths() (Paths, error) {
+func Paths() (PathSet, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return Paths{}, fmt.Errorf("cannot determine config directory: $HOME is not set")
+		return PathSet{}, fmt.Errorf("cannot determine config directory: $HOME is not set")
 	}
 
 	// ConfigDir: respect XDG_CONFIG_HOME if set; otherwise $HOME/.config (D3).
@@ -44,7 +46,7 @@ func GetPaths() (Paths, error) {
 	}
 	stateDir := filepath.Join(stateBase, "raxd")
 
-	return Paths{
+	return PathSet{
 		ConfigDir:  configDir,
 		ConfigFile: filepath.Join(configDir, "config.yaml"),
 		StateDir:   stateDir,
@@ -58,11 +60,11 @@ func GetPaths() (Paths, error) {
 // and does not widen permissions.
 //
 // SECURITY: permissions are set explicitly (not delegated to umask).
-func EnsureDirs(p Paths) error {
+func EnsureDirs(p PathSet) error {
 	dirs := []string{p.ConfigDir, p.StateDir, p.TLSDir}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o700); err != nil {
-			return fmt.Errorf("cannot create config directory: %w", errors.Unwrap(err))
+			return fmt.Errorf("cannot create config directory: %w", err)
 		}
 	}
 	return nil

@@ -9,29 +9,27 @@ import (
 	"github.com/vladimirvkhs/raxd/internal/config"
 )
 
-// TestGetPathsDefault verifies that without XDG variables the canonical path
-// ~/.config/raxd is used (D3 decision: same on Linux and macOS).
-func TestGetPathsDefault(t *testing.T) {
-	// Clear XDG variables so default resolution is exercised.
+// TestPathsDefault verifies that without XDG variables the canonical path
+// $HOME/.config/raxd is used (D3 decision: same on Linux and macOS).
+// The test is deterministic: HOME is overridden with a temp dir so the test
+// always runs regardless of the host environment.
+func TestPathsDefault(t *testing.T) {
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
 	t.Setenv("XDG_CONFIG_HOME", "")
 	t.Setenv("XDG_STATE_HOME", "")
 
-	home, err := os.UserHomeDir()
+	paths, err := config.Paths()
 	if err != nil {
-		t.Skip("no $HOME, cannot run XDG path test")
+		t.Fatalf("Paths() error = %v", err)
 	}
 
-	paths, err := config.GetPaths()
-	if err != nil {
-		t.Fatalf("GetPaths() error = %v", err)
-	}
-
-	wantConfigDir := filepath.Join(home, ".config", "raxd")
+	wantConfigDir := filepath.Join(fakeHome, ".config", "raxd")
 	if paths.ConfigDir != wantConfigDir {
 		t.Errorf("ConfigDir = %q, want %q", paths.ConfigDir, wantConfigDir)
 	}
 
-	wantStateDir := filepath.Join(home, ".local", "state", "raxd")
+	wantStateDir := filepath.Join(fakeHome, ".local", "state", "raxd")
 	if paths.StateDir != wantStateDir {
 		t.Errorf("StateDir = %q, want %q", paths.StateDir, wantStateDir)
 	}
@@ -47,18 +45,18 @@ func TestGetPathsDefault(t *testing.T) {
 	}
 }
 
-// TestGetPathsXDGOverride verifies that XDG_CONFIG_HOME and XDG_STATE_HOME
+// TestPathsXDGOverride verifies that XDG_CONFIG_HOME and XDG_STATE_HOME
 // take precedence over $HOME defaults.
-func TestGetPathsXDGOverride(t *testing.T) {
+func TestPathsXDGOverride(t *testing.T) {
 	customConfig := t.TempDir()
 	customState := t.TempDir()
 
 	t.Setenv("XDG_CONFIG_HOME", customConfig)
 	t.Setenv("XDG_STATE_HOME", customState)
 
-	paths, err := config.GetPaths()
+	paths, err := config.Paths()
 	if err != nil {
-		t.Fatalf("GetPaths() error = %v", err)
+		t.Fatalf("Paths() error = %v", err)
 	}
 
 	want := filepath.Join(customConfig, "raxd")
@@ -77,7 +75,7 @@ func TestGetPathsXDGOverride(t *testing.T) {
 func TestEnsureDirsCreatesWithMode0700(t *testing.T) {
 	base := t.TempDir()
 
-	p := config.Paths{
+	p := config.PathSet{
 		ConfigDir: filepath.Join(base, "config", "raxd"),
 		StateDir:  filepath.Join(base, "state", "raxd"),
 		TLSDir:    filepath.Join(base, "state", "raxd", "tls"),
@@ -104,7 +102,7 @@ func TestEnsureDirsCreatesWithMode0700(t *testing.T) {
 func TestEnsureDirsIdempotent(t *testing.T) {
 	base := t.TempDir()
 
-	p := config.Paths{
+	p := config.PathSet{
 		ConfigDir: filepath.Join(base, "config", "raxd"),
 		StateDir:  filepath.Join(base, "state", "raxd"),
 		TLSDir:    filepath.Join(base, "state", "raxd", "tls"),
@@ -129,7 +127,7 @@ func TestEnsureDirsIdempotent(t *testing.T) {
 // not an error — defaults are applied (AC "отсутствие config.yaml не ошибка").
 func TestLoadMissingFileReturnsDefaults(t *testing.T) {
 	base := t.TempDir()
-	p := config.Paths{
+	p := config.PathSet{
 		ConfigDir:  filepath.Join(base, "raxd"),
 		ConfigFile: filepath.Join(base, "raxd", "config.yaml"), // does not exist
 	}
@@ -155,7 +153,7 @@ func TestLoadBrokenYAMLReturnsError(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	p := config.Paths{
+	p := config.PathSet{
 		ConfigDir:  base,
 		ConfigFile: cfgFile,
 	}
