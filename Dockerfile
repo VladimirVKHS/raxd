@@ -17,9 +17,10 @@ FROM golang:1.25 AS base
 ENV CGO_ENABLED=0
 WORKDIR /src
 
-# Cache module downloads separately from source — rebuild only when go.mod/go.sum change.
+# Copy module metadata and vendor directory first — rebuilds only when these change.
+# Vendor mode (-mod=vendor) avoids network access: all dependencies are in ./vendor.
 COPY go.mod go.sum ./
-RUN go mod download
+COPY vendor/ vendor/
 
 # Copy source.
 COPY . .
