@@ -6,9 +6,9 @@
 
 - **`internal/version/version.go`** — контракты `version.Set(v, commit, date string)` и `version.Info() string`. Дефолты: `version=dev`, `commit=none`, `date=unknown`. Формат вывода `raxd <version> (commit <commit>, built <date>)` соответствует ux-spec и план.md.
 
-- **`internal/config/paths.go`** — `config.GetPaths() (Paths, error)`: XDG-резолв по D3 (единый `$HOME/.config/raxd` на Linux и macOS, уважение `XDG_CONFIG_HOME`/`XDG_STATE_HOME`). `config.EnsureDirs(p Paths) error`: создаёт ConfigDir/StateDir/TLSDir с правами `0700`, идемпотентно через `MkdirAll`, права задаются явно (не через umask).
+- **`internal/config/paths.go`** — `config.Paths() (PathSet, error)`: XDG-резолв по D3 (единый `$HOME/.config/raxd` на Linux и macOS, уважение `XDG_CONFIG_HOME`/`XDG_STATE_HOME`). `config.EnsureDirs(p PathSet) error`: создаёт ConfigDir/StateDir/TLSDir с правами `0700`, идемпотентно через `MkdirAll`, права задаются явно (не через umask). Тип структуры — `PathSet` (функция `Paths()` и тип в одном пакете конфликтовали бы — Go не допускает одинаковых имён функции и типа в пакете).
 
-- **`internal/config/config.go`** — `config.Load(p Paths) (*Config, error)`: viper читает `config.yaml`; отсутствие файла → дефолты (порт 7822), не ошибка; сломанный YAML → явная ошибка с сообщением `config file is not valid YAML`. Структура `Config` несёт поле `Port` как точку расширения.
+- **`internal/config/config.go`** — `config.Load(p PathSet) (*Config, error)`: viper читает `config.yaml`; отсутствие файла → дефолты (порт 7822), не ошибка; сломанный YAML → явная ошибка с сообщением `config file is not valid YAML`. Структура `Config` несёт поле `Port` как точку расширения.
 
 - **`internal/banner/banner.go`** — `banner.Render() string`: plain-текст с Unicode-рамкой (┌/┐/└/┘), три строки: имя продукта + описание, build-метаданные, строка автора `Vladimir Kovalev, OEM TECH`. Без lipgloss (отложено до cli-ux). API стабилен.
 
@@ -35,6 +35,16 @@
 - **Замечание (не блокер)**: в banner.go паддинг строки автора (`Vladimir Kovalev, OEM TECH`) на 1 пробел длиннее ожидаемого при коротких строках кода из-за расчёта ширины рамки. Это визуальный артефакт plain-текстового режима, не влияет на корректность содержания. Исправление — в задаче cli-ux при подключении lipgloss.
 
 - Нет других отклонений от `plan.md`. Все модули, сигнатуры и контракты реализованы точно.
+
+## Исправления по developer-guardian (rev.1)
+
+Внесены по результатам needs-changes:
+
+- **Issue 1 (контракт plan)**: `config.GetPaths()` переименована в `config.Paths()` по контракту plan.md. Тип `Paths` (struct) переименован в `PathSet` во избежание конфликта имён функции и типа в одном пакете Go. Обновлены: `internal/config/paths.go`, `internal/config/config.go`, `internal/cli/root.go`, `internal/cli/status.go`, `internal/config/paths_test.go`.
+
+- **Issue 2 (баг обработки ошибок)**: в `EnsureDirs` заменено `fmt.Errorf("...: %w", errors.Unwrap(err))` на корректное `fmt.Errorf("...: %w", err)` — `errors.Unwrap` разрушал цепочку оборачивания, возвращая `nil` для ошибок без метода `Unwrap`. Импорт `"errors"` удалён из `paths.go` (был нужен только для `errors.Unwrap`).
+
+- **Issue 5 (t.Skip)**: `TestGetPathsDefault` → `TestPathsDefault` переписан детерминированно: `t.Setenv("HOME", t.TempDir())` задаёт контролируемый HOME, `t.Skip` удалён. Тест всегда выполняется независимо от хост-окружения.
 
 ## Тесты
 
@@ -73,7 +83,7 @@ ok  github.com/vladimirvkhs/raxd/internal/version 0.001s  (3 теста)
 | Заглушки → ненулевой код + `not implemented yet` на stderr | `TestStubKeyCreate/List/Delete`, `TestStubConfigPort`, `TestStubServe` |
 | `version` → version.Info() на stdout, exit 0 | `TestVersionExitZero`, `TestVersionFormat` |
 | `status` → state/config/keys/tls на stdout, exit 0 | `TestStatusExitZero`, `TestStatusOutputFields` |
-| XDG-пути: ConfigDir=`$HOME/.config/raxd`, XDG_CONFIG_HOME уважается | `TestGetPathsDefault`, `TestGetPathsXDGOverride` |
+| XDG-пути: ConfigDir=`$HOME/.config/raxd`, XDG_CONFIG_HOME уважается | `TestPathsDefault`, `TestPathsXDGOverride` |
 | Директории создаются с правами 0700, идемпотентно | `TestEnsureDirsCreatesWithMode0700`, `TestEnsureDirsIdempotent` |
 | Баннер содержит автора `Vladimir Kovalev, OEM TECH` | `TestRenderContainsAuthor`, `TestRenderContainsProductName`, `TestRenderHasBoxDrawing` |
 | Нет секретов в выводе | `TestRenderNoSecrets`, `TestStatusNoSecrets` |

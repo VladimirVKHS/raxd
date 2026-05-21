@@ -22,11 +22,11 @@
 |---|---|---|---|
 | CLI + подкоманды | `spf13/cobra` | v1.10.x, активно | https://github.com/spf13/cobra |
 | Кроссплатформенный сервис | `kardianos/service` (+ генерация unit/plist) | maintained | https://github.com/kardianos/service |
-| Стилизация вывода | `charmbracelet/lipgloss` (v2) | v2.x, активно | https://github.com/charmbracelet/lipgloss |
+| Стилизация вывода | `charmbracelet/lipgloss` (v2) | стабильный v2.0.x — импорт `charm.land/lipgloss/v2`; путь `github.com/charmbracelet/lipgloss/v2` — beta | https://github.com/charmbracelet/lipgloss |
 | Логи (цветные, человекочитаемые) | `charmbracelet/log` | активно | https://github.com/charmbracelet/log |
 | Таблицы (список ключей и т.п.) | `olekukonko/tablewriter` | maintained | https://github.com/olekukonko/tablewriter |
 | Сборка/релизы (build-матрица) | `goreleaser` v2 | v2.x, активно | https://goreleaser.com |
-| Пути конфигов (XDG, macOS) | `adrg/xdg` | maintained | https://github.com/adrg/xdg |
+| Пути конфигов (XDG) | ручной резолвинг через `os.Getenv` (stdlib) | `adrg/xdg` НЕ используется: его macOS-дефолт `~/Library/Application Support` конфликтует с единым `~/.config/raxd` (D3) | — |
 | Конфигурация | `spf13/viper` | maintained | https://github.com/spf13/viper |
 | TLS / сертификаты | `crypto/tls`, `crypto/x509` (stdlib) | Go 1.22+ | https://pkg.go.dev/crypto/tls |
 | Rate limiting | `golang.org/x/time/rate` | stdlib-ext | https://pkg.go.dev/golang.org/x/time/rate |
@@ -34,7 +34,7 @@
 
 ## Раскладка на диске
 
-- **Конфиг**: `$XDG_CONFIG_HOME/raxd/config.yaml` (Linux), `~/.config/raxd/config.yaml` или `~/Library/Application Support/raxd/` (macOS).
+- **Конфиг**: `$XDG_CONFIG_HOME/raxd/config.yaml`, иначе `~/.config/raxd/config.yaml` — единый путь на Linux и macOS (решение D3; macOS Application Support не используется).
 - **Состояние/ключи**: `$XDG_STATE_HOME/raxd/keys.db` (или эквивалент), права **`0600`**.
 - **TLS**: серт `0644`, приватный ключ `0600`.
 - **Логи**: системный журнал (journald/syslog) + ротация при файловом выводе.

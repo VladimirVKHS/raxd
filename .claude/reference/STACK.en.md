@@ -22,11 +22,11 @@ Author: **Vladimir Kovalev, OEM TECH**.
 |---|---|---|---|
 | CLI + subcommands | `spf13/cobra` | v1.10.x, active | https://github.com/spf13/cobra |
 | Cross-platform service | `kardianos/service` (+ unit/plist generation) | maintained | https://github.com/kardianos/service |
-| Output styling | `charmbracelet/lipgloss` (v2) | v2.x, active | https://github.com/charmbracelet/lipgloss |
+| Output styling | `charmbracelet/lipgloss` (v2) | stable v2.0.x — import `charm.land/lipgloss/v2`; path `github.com/charmbracelet/lipgloss/v2` is beta | https://github.com/charmbracelet/lipgloss |
 | Logging (color, human) | `charmbracelet/log` | active | https://github.com/charmbracelet/log |
 | Tables (key list, etc.) | `olekukonko/tablewriter` | maintained | https://github.com/olekukonko/tablewriter |
 | Build/release (matrix) | `goreleaser` v2 | v2.x, active | https://goreleaser.com |
-| Config paths (XDG, macOS) | `adrg/xdg` | maintained | https://github.com/adrg/xdg |
+| Config paths (XDG) | manual resolution via `os.Getenv` (stdlib) | `adrg/xdg` NOT used: its macOS default `~/Library/Application Support` conflicts with the single `~/.config/raxd` (D3) | — |
 | Configuration | `spf13/viper` | maintained | https://github.com/spf13/viper |
 | TLS / certificates | `crypto/tls`, `crypto/x509` (stdlib) | Go 1.22+ | https://pkg.go.dev/crypto/tls |
 | Rate limiting | `golang.org/x/time/rate` | stdlib-ext | https://pkg.go.dev/golang.org/x/time/rate |
@@ -34,7 +34,7 @@ Author: **Vladimir Kovalev, OEM TECH**.
 
 ## On-disk layout
 
-- **Config**: `$XDG_CONFIG_HOME/raxd/config.yaml` (Linux), `~/.config/raxd/config.yaml` or `~/Library/Application Support/raxd/` (macOS).
+- **Config**: `$XDG_CONFIG_HOME/raxd/config.yaml`, else `~/.config/raxd/config.yaml` — single path on Linux and macOS (decision D3; macOS Application Support not used).
 - **State/keys**: `$XDG_STATE_HOME/raxd/keys.db` (or equivalent), perms **`0600`**.
 - **TLS**: cert `0644`, private key `0600`.
 - **Logs**: system journal (journald/syslog) + rotation for file output.

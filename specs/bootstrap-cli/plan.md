@@ -20,7 +20,7 @@ TLS/ключи/exec/MCP присутствуют только как TODO-гра
 - `internal/cli/status.go` — `status`: печать состояния «не запущен» + путей, exit 0.
 - `internal/cli/stub.go` — общий `errNotImplemented` и фабрика `newStub(name)` для заглушек.
 - `internal/version/version.go` — хранение/выдача build-метаданных.
-- `internal/config/paths.go` — резолв XDG-путей (config/state/tls) по D3.
+- `internal/config/paths.go` — резолв XDG-путей (config/state/tls) по D3, вручную через `os.Getenv` (без `adrg/xdg`).
 - `internal/config/config.go` — `Config`-структура, загрузка через viper, дефолты, создание директорий с правами.
 - `internal/banner/banner.go` — текст баннера (имя продукта + автор).
 - `Dockerfile` — single-stage `golang:1.25`, прогон `go build ./...` и `go test ./...`.
@@ -46,10 +46,18 @@ TLS/ключи/exec/MCP присутствуют только как TODO-гра
 - Когда lipgloss понадобится — брать **`charm.land/lipgloss/v2`** (стабильный v2.0.x), НЕ
   `github.com/charmbracelet/lipgloss/v2` (там только beta). **STACK требует синхронизации**: путь
   в STACK устарел — эскалация STACK-owner (research, открытый вопрос). Не блокер bootstrap-cli.
+- **Отклонение от STACK ПРИНЯТО (developer-guardian Issue 3):** `adrg/xdg` НЕ подключается; XDG-пути
+  резолвятся вручную через `os.Getenv` (`XDG_CONFIG_HOME` → иначе `$HOME/.config/raxd`; state —
+  аналогично). Причина: macOS-дефолт `adrg/xdg` (`~/Library/Application Support`) конфликтует с D3
+  (единый `~/.config/raxd` на обеих ОС). Согласуется с research Q4 и формулировкой Chosen Approach
+  («явное построение `$HOME/.config/raxd`, не полагаясь на macOS-дефолт adrg/xdg»). Поведенческий AC
+  (единый путь + приоритет `XDG_CONFIG_HOME`) не меняется и покрыт тестами. Параграф spec.md про
+  «(adrg/xdg + viper)» — иллюстративен и заменён этим решением. Цена: ручной резолв вместо библиотеки
+  (несколько строк `os.Getenv`/`filepath.Join`) — закрыт юнит-тестами `config.Paths()`.
 - Раскладка `cmd/raxd` + `internal/` вместо плоского `main.go` (ADR-001): цена — чуть больше
   «церемонии» на минимальном каркасе; выигрыш — компиляторная изоляция `internal/` (AC) и рост.
 - Версия через ldflags вместо `debug.ReadBuildInfo` (ADR-002): цена — молчаливый дефолт при неверном
   import-path → закрывается юнит-тестом `version.Info()` и осмысленными дефолтами.
 - Dockerfile **single-stage `golang:1.25`** вместо multi-stage: цена — большой образ (для dev/test
   норма); рантайм-multi-stage отложен в `distribution`. С кэшем модулей и `CGO_ENABLED=0` (STACK).
-- Зависимости каркаса: `cobra v1.10.2` (+ `pflag ≥ v1.0.9`), `viper v1.21.0`, `adrg/xdg v0.5.3` — все из STACK, новых нет.
+- Зависимости каркаса: `cobra v1.10.2` (+ `pflag ≥ v1.0.9`), `viper v1.21.0` — все из STACK, новых нет.
