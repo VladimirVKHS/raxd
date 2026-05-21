@@ -3,23 +3,26 @@
 # SECURITY-BASELINE §6: All builds, tests, and raxd execution must happen
 # inside this container — never on the host machine.
 #
+# Offline/hermetic build via vendor/ (ADR-002): no network access required.
+# Update vendor: run "go mod vendor" on the host, then commit vendor/.
+#
 # Run tests:
 #   docker build --target test -t raxd-test . && docker run --rm raxd-test
 #
 # Run build only:
 #   docker build --target build -t raxd-build .
-#
-# One-liner (build + test without keeping an image):
-#   docker run --rm -v "$PWD":/src -w /src golang:1.25 sh -c "CGO_ENABLED=0 go build ./... && CGO_ENABLED=0 go test ./..."
 
 FROM golang:1.25 AS base
 
 ENV CGO_ENABLED=0
+# Use vendored dependencies — no network required (ADR-002).
+ENV GOFLAGS="-mod=vendor"
 WORKDIR /src
 
-# Cache module downloads separately from source — rebuild only when go.mod/go.sum change.
+# Copy module metadata and vendor tree.
+# Vendor layer is cached separately: rebuilds only when go.mod/go.sum/vendor change.
 COPY go.mod go.sum ./
-RUN go mod download
+COPY vendor/ vendor/
 
 # Copy source.
 COPY . .
@@ -30,5 +33,7 @@ RUN go vet ./... && go build -o /bin/raxd ./cmd/raxd
 
 # ── test stage ───────────────────────────────────────────────────────────────
 FROM base AS test
-# Run go vet + go test. Exit code is propagated to the caller.
-CMD ["sh", "-c", "go vet ./... && go test -v -count=1 ./..."]
+# Run go vet + go test (all packages) + go test -race (keystore).
+# -race requires CGO; the keystore step overrides CGO_ENABLED=0.
+# All module resolution is from vendor/ — no outbound network calls.
+CMD ["sh", "-c", "go vet ./... && go test -v -count=1 ./... && CGO_ENABLED=1 go test -race -count=1 ./internal/keystore/..."]

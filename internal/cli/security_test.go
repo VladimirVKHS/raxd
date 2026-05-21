@@ -13,14 +13,11 @@ import (
 	"testing"
 )
 
-// TestStubsErrorPrefix verifies all stubs use the canonical "error:" prefix.
-// Security requirement: "заглушки key/config/serve возвращают ошибку not implemented yet".
-// This complements TestStubErrorMessageContainsCommandName with explicit prefix check.
-func TestStubsErrorPrefix(t *testing.T) {
+// TestRemainingStubsErrorPrefix verifies remaining stubs (config port, serve) use the
+// canonical "error:" prefix. Key commands are now implemented; they have their own error format.
+// Security requirement: "заглушки config/serve возвращают ошибку not implemented yet".
+func TestRemainingStubsErrorPrefix(t *testing.T) {
 	cases := [][]string{
-		{"key", "create"},
-		{"key", "list"},
-		{"key", "delete", "id"},
 		{"config", "port", "9999"},
 		{"serve"},
 	}
@@ -34,6 +31,21 @@ func TestStubsErrorPrefix(t *testing.T) {
 			!strings.Contains(stderr, "error:") {
 			t.Errorf("%v stderr must contain 'error:' prefix; got: %q", args, stderr)
 		}
+	}
+}
+
+// TestKeyCommandsErrorPrefix verifies that key commands use "error:" prefix on errors.
+// After key-management implementation, key commands have real error handling.
+func TestKeyCommandsErrorPrefix(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	// key delete without args — known error case.
+	_, stderr, err := executeCmd("key", "delete")
+	if err == nil {
+		t.Error("key delete without args must return non-zero exit")
+		return
+	}
+	if !strings.Contains(stderr, "error:") {
+		t.Errorf("key delete stderr must contain 'error:' prefix; got: %q", stderr)
 	}
 }
 

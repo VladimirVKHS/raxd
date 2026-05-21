@@ -45,6 +45,8 @@
 `raxd_{linux,darwin}_{amd64,arm64}` + архивы (`.tar.gz`) + `SHA256SUMS`.
 `CGO_ENABLED=0` (статическая сборка, простая дистрибуция).
 
+**Зависимости вендорятся** (`go mod vendor` → каталог `vendor/` коммитится в git): окружение Docker не имеет доступа к `proxy.golang.org`, а baseline §6 требует воспроизводимых hermetic-сборок в контейнере. Сборки/тесты идут с `-mod=vendor`, без сетевого `go mod download`; целостность — через `go.sum`/`go mod verify`. При изменении зависимостей обязателен `go mod vendor` + коммит `vendor/`. Подробности и альтернативы — `specs/key-management/decisions/ADR-002-vendoring-offline-builds.md`. goreleaser/CI (задача distribution) собирают из `vendor/`.
+
 ## Установка (`curl | sh`)
 
 Скрипт: детект `uname -s`→{linux,darwin}, `uname -m`→{amd64,arm64}; скачивание нужного
