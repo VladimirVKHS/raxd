@@ -82,13 +82,17 @@ func (s *Store) Create(label string) (PlainKey, Record, error) {
 	salt := generateSalt()
 	hash := hashKey(body, salt)
 	id := generateID(existing)
+	// Fingerprint is persisted so that audit logs for delete (where plaintext is unavailable)
+	// can still include fingerprint. SR-15: 12-hex-char prefix of sha256(body), non-reversible.
+	fp := Fingerprint(body)
 
 	rec := Record{
-		ID:      id,
-		Label:   label,
-		Created: time.Now().UTC(),
-		hash:    hash,
-		salt:    salt,
+		ID:          id,
+		Label:       label,
+		Created:     time.Now().UTC(),
+		Fingerprint: fp,
+		hash:        hash,
+		salt:        salt,
 	}
 
 	db.Keys = append(db.Keys, toDBRecord(rec))
