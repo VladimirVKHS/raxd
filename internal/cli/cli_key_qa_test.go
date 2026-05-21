@@ -86,6 +86,52 @@ func TestKeyCreateListDeleteIntegration(t *testing.T) {
 	}
 }
 
+// --- Q5 fix: id shown in key list must be usable with key delete ---
+
+// TestKeyListIDUsableWithDelete verifies that the ID shown in "key list" stdout
+// can be passed directly to "key delete" and succeeds.
+// Q5 bug: key list truncated ID to 12 chars, but delete requires the full 16-char ID.
+func TestKeyListIDUsableWithDelete(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	// Create a key.
+	_, createStderr, err := executeCmd("key", "create", "--name", "q5-test")
+	if err != nil {
+		t.Fatalf("key create must succeed; err=%v", err)
+	}
+
+	// Extract full ID from create metadata on stderr.
+	var fullID string
+	for _, line := range strings.Split(createStderr, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "id") {
+			fullID = strings.TrimSpace(strings.TrimPrefix(line, "id"))
+			break
+		}
+	}
+	if fullID == "" {
+		t.Fatalf("could not extract ID from create stderr: %q", createStderr)
+	}
+
+	// key list must show the full ID in stdout.
+	listStdout, _, err := executeCmd("key", "list")
+	if err != nil {
+		t.Fatalf("key list must succeed; err=%v", err)
+	}
+	if !strings.Contains(listStdout, fullID) {
+		t.Errorf("key list stdout must contain the full ID %q; got=%q", fullID, listStdout)
+	}
+
+	// The key list shows the full ID in each data row. Since we already confirmed
+	// that fullID appears in listStdout, use fullID directly for delete.
+	// This is the Q5 scenario: ID from list is the full ID, usable as-is.
+	_, deleteStderr, err := executeCmd("key", "delete", fullID)
+	if err != nil {
+		t.Errorf("key delete with ID from key list must succeed; id=%q err=%v stderr=%q",
+			fullID, err, deleteStderr)
+	}
+}
+
 // --- SR-18/CLI: delete non-existent id gives error: + hint: and exit ≠0 ---
 
 // TestKeyDeleteNotFoundCLI verifies that "key delete <nonexistent>" gives exit≠0,

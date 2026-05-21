@@ -218,7 +218,9 @@ func runKeyList(cmd *cobra.Command, _ []string) error {
 	)
 
 	for _, r := range records {
-		idDisplay := "  " + truncate(r.ID, 12)
+		// Q5 fix: show the full ID so it can be passed directly to "key delete".
+		// Truncating to 12 chars broke the create→list→delete workflow.
+		idDisplay := "  " + r.ID
 		labelDisplay := r.Label
 		if labelDisplay == "" {
 			labelDisplay = "-"
@@ -299,16 +301,6 @@ func runKeyDelete(cmd *cobra.Command, args []string) error {
 	)
 
 	return nil
-}
-
-// truncate returns the first n runes of s (no ellipsis).
-// ux-spec: ID column trimmed to 12 chars without "…".
-func truncate(s string, n int) string {
-	runes := []rune(s)
-	if len(runes) <= n {
-		return s
-	}
-	return string(runes[:n])
 }
 
 // truncateEllipsis returns s truncated to n runes with "…" suffix if needed.
