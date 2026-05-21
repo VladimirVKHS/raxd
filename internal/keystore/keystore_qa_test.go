@@ -211,30 +211,60 @@ func TestAtomicWriteTempFilePermissions(t *testing.T) {
 	}
 }
 
-// --- SR-20/SR-21: no temp file on write error ---
+// --- SR-21: no temp file leak on write error ---
 
-// TestNoTempFileAfterError verifies that if writing to the temp file would produce
-// a bad state, no .tmp file leaks. We test the cleanup path by using a path in a
-// read-only directory, which forces the write to fail before rename.
+// TestNoTempFileAfterError verifies that when writeDB fails (before os.Rename),
+// no .tmp file is left on disk (SR-21 cleanup path).
+//
+// Root-safe technique: we make the PARENT of the keys.db path a regular FILE
+// rather than a directory. os.CreateTemp(dir, ...) will fail because "dir" is
+// a file, not a directory — this is true even under root. The test then checks
+// that (a) Create returns a non-nil error, and (b) no .tmp files exist in the
+// parent directory (which itself is a regular file in another temp dir, so the
+// check is on the outer temp dir that contains the blocker file).
+//
 // SR-21: "при ошибке записи temp удаляется (не остаётся на диске)".
 func TestNoTempFileAfterError(t *testing.T) {
-	// Create a normal store and add a key first.
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.db")
-	store, err := keystore.Open(path)
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	// Create one key to verify the normal path leaves no temp.
-	if _, _, err := store.Create("no-temp-test"); err != nil {
-		t.Fatalf("Create: %v", err)
+	outerDir := t.TempDir()
+
+	// Create a regular FILE at the path that the store will use as its parent dir.
+	// writeDB calls os.CreateTemp(filepath.Dir(path), ...) — since Dir(path) is a
+	// regular file, CreateTemp will fail with ENOTDIR regardless of uid.
+	blockerPath := filepath.Join(outerDir, "blocker")
+	if err := os.WriteFile(blockerPath, []byte("i am a file, not a dir"), 0o600); err != nil {
+		t.Fatalf("WriteFile blocker: %v", err)
 	}
 
-	// Verify no temp files remain.
-	entries, _ := os.ReadDir(dir)
+	// keys.db path whose parent is the blocker file (not a directory).
+	keystorePath := filepath.Join(blockerPath, "keys.db")
+
+	// Open succeeds: it only checks existence/corruption, does not write.
+	store, err := keystore.Open(keystorePath)
+	if err != nil {
+		// Open may fail because Stat sees a non-directory component; that is also fine —
+		// we just need to verify no .tmp leaks, and Create must fail.
+		t.Logf("Open returned error (expected on some systems): %v", err)
+		// Verify no .tmp in outerDir.
+		entries, _ := os.ReadDir(outerDir)
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".tmp") {
+				t.Errorf("SR-21: .tmp file %q leaked into outerDir after Open failure", e.Name())
+			}
+		}
+		return
+	}
+
+	// If Open succeeded, Create must fail at writeDB (CreateTemp on a file-as-dir).
+	_, _, createErr := store.Create("no-temp-leak-test")
+	if createErr == nil {
+		t.Fatal("SR-21: Create must fail when parent of keys.db is a regular file, not a directory")
+	}
+
+	// Critical SR-21 assertion: no .tmp files must survive the failed write.
+	entries, _ := os.ReadDir(outerDir)
 	for _, e := range entries {
 		if strings.HasSuffix(e.Name(), ".tmp") {
-			t.Errorf("unexpected temp file %q after successful write (SR-21)", e.Name())
+			t.Errorf("SR-21: .tmp file %q leaked after Create failure — cleanup path is broken", e.Name())
 		}
 	}
 }

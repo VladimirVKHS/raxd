@@ -167,6 +167,36 @@ func TestStaticNoFileCreationWithWideModes(t *testing.T) {
 	}
 }
 
+// TestStaticNoMathRand verifies that neither internal/keystore nor internal/cli/key.go
+// import or reference math/rand or math/rand/v2.
+// SR-2: "math/rand отсутствует во всей key-логике — ни тело, ни salt, ни id не используют math/rand".
+// Scope: only key-management source files (not the whole project).
+func TestStaticNoMathRand(t *testing.T) {
+	// Collect production (non-test) sources in the key-management scope.
+	files := append(
+		goSourceFiles(t, "internal/keystore"),
+		"internal/cli/key.go",
+	)
+
+	forbiddenPatterns := []string{
+		`"math/rand"`,
+		`"math/rand/v2"`,
+		`math/rand.`,
+		`rand.Intn`,
+		`rand.Int63`,
+		`rand.Float`,
+		`rand.New(`,
+		`rand.NewSource`,
+	}
+
+	for _, pat := range forbiddenPatterns {
+		if matches := grepFiles(t, files, pat); len(matches) > 0 {
+			t.Errorf("SR-2 VIOLATION: math/rand pattern %q found in key-management sources (must use crypto/rand only):\n  %s",
+				pat, strings.Join(matches, "\n  "))
+		}
+	}
+}
+
 // TestGoModuleNameAndGoVersion verifies that go.mod declares the correct
 // module name and minimum Go version as specified in spec.md D1/D2.
 // AC: "go.mod с именем модуля github.com/vladimirvkhs/raxd и минимальной версией go 1.25".
