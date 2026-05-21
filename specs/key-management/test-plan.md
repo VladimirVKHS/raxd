@@ -1,6 +1,6 @@
 # Test Plan: key-management — управление API-ключами raxd
 
-> Автор: qa. Дата: 2026-05-21. Статус: FINAL — 117 top-level тестов + 3 sub-теста = 120 PASS, 0 провалов, 0 skip.
+> Автор: qa. Дата: 2026-05-21. Статус: FINAL — 122 top-level тестов + 3 sub-теста = 125 PASS, 0 провалов, 0 skip.
 > Проверяет: qa-guardian. Читает: reviewer (доказательство покрытия AC+SR).
 > Запуск **только в Docker** (SECURITY-BASELINE §6).
 
@@ -16,7 +16,7 @@
 | **Static** | Отсутствие `math/rand`, `exec.Command`, `net.Listen`, хардкод-секретов в исходниках | корень проекта |
 | **Install-flow** | Вне scope задачи `key-management` (задача `distribution`) | — |
 
-**Среда:** `golang:1.25`, `CGO_ENABLED=0`, Linux/amd64 в контейнере.
+**Среда:** `golang:1.25`, `CGO_ENABLED=0` (обычные тесты), `CGO_ENABLED=1` для `-race` (keystore), Linux/amd64 в контейнере. Dockerfile CMD включает оба прогона: `go test ./...` + `CGO_ENABLED=1 go test -race ./internal/keystore/...`.
 
 ---
 
@@ -38,28 +38,28 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 docker run --rm -v "$PWD":/src -w /src golang:1.25 \
   sh -c "CGO_ENABLED=0 go vet ./..."
 
-# С -race (параллелизм):
+# С -race (параллелизм); CGO_ENABLED=1 обязателен для race detector:
 docker run --rm -v "$PWD":/src -w /src golang:1.25 \
-  sh -c "CGO_ENABLED=0 go test -race -count=1 ./internal/keystore/..."
+  sh -c "CGO_ENABLED=1 go test -race -count=1 ./internal/keystore/..."
 ```
 
 ---
 
 ## Критерий прохождения
 
-**117 top-level тестов + 3 sub-теста = 120 PASS, 0 провалов, 0 skip** в Docker (факт подтверждён 2026-05-21).
+**122 top-level тестов + 3 sub-теста = 125 PASS, 0 провалов, 0 skip** в Docker (факт подтверждён 2026-05-21).
 
-Подсчёт: `go test -v -count=1 ./... | grep 'PASS:' | wc -l` → 120.
+Подсчёт: `go test -v -count=1 ./... | grep 'PASS:' | wc -l` → 125. `keystore` дополнительно прогоняется с `-race` (`CGO_ENABLED=1 go test -race ./internal/keystore/...`) — 0 гонок.
 
 Разбивка по пакетам (top-level / sub-тесты):
 - `github.com/vladimirvkhs/raxd` — **6** top-level (статический анализ, +1 `TestStaticNoMathRand` SR-2)
 - `github.com/vladimirvkhs/raxd/internal/banner` — **5** top-level
 - `github.com/vladimirvkhs/raxd/internal/cli` — **45** top-level + **3** sub-теста = 48 (cli_test + cli_gaps_test + security_test + **cli_key_qa_test**; sub-тесты: `TestErrorMessagesLowercase/{missing_arg,not_found,long_label}`)
 - `github.com/vladimirvkhs/raxd/internal/config` — **9** top-level
-- `github.com/vladimirvkhs/raxd/internal/keystore` — **47** top-level (keystore_test + **keystore_qa_test**)
+- `github.com/vladimirvkhs/raxd/internal/keystore` — **52** top-level (keystore_test + **keystore_qa_test**; +5 по сравнению с предыдущей ревизией: `TestLabelMultibyteExact64`, `TestLabelMultibyteTooLong`, `TestConcurrentVerifyNoRace`, `TestConcurrentVerifyAndFlush` от developer + `TestConcurrentVerifyMixWithFlush` от QA)
 - `github.com/vladimirvkhs/raxd/internal/version` — **5** top-level
 
-**До QA:** 83 теста. **После QA:** 117 top-level (+34 новых, включая `TestStaticNoMathRand`).
+**До QA:** 83 теста. **После QA (все раунды):** 122 top-level (+39 новых).
 
 ---
 
@@ -76,7 +76,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 | AC-7: Аудит create/delete — timestamp+id+fingerprint, НЕ тело | integration | `cli_key_qa_test.go::TestKeyCreateAuditContainsFingerprintNotBody`, `TestKeyDeleteAuditContainsFingerprintNotBody`, `keystore_test.go::TestFingerprintPersistedInRecord` | PASS |
 | AC-8: Constant-time Verify (`subtle.ConstantTimeCompare`); нет `==` по секретам | unit | `keystore_test.go::TestVerifyBeforeAfterRevoke`, `TestHashScheme`, `keystore_qa_test.go::TestVerifyCorrectWrongRevoked` | PASS |
 | AC-9: `keys.db` 0600 по пути KeysDB | unit | `keystore_test.go::TestFilePermissions`, `keystore_qa_test.go::TestAtomicWriteTempFilePermissions` | PASS |
-| AC-10: label опционален; дубликаты разрешены; длина ≤64; превышение → ошибка exit≠0 | unit+integration | `keystore_test.go::TestLabelTooLong`, `TestLabelMaxLength`, `TestEmptyLabel`, `TestDuplicateLabels`, `cli_key_qa_test.go::TestKeyCreateLabelTooLongCLI`, `TestKeyCreateNoLabelShowsDash` | PASS |
+| AC-10: label опционален; дубликаты разрешены; длина ≤64 рун; превышение → ошибка exit≠0 | unit+integration | `keystore_test.go::TestLabelTooLong`, `TestLabelMaxLength`, `TestEmptyLabel`, `TestDuplicateLabels`, `TestLabelMultibyteExact64`, `TestLabelMultibyteTooLong`, `cli_key_qa_test.go::TestKeyCreateLabelTooLongCLI`, `TestKeyCreateNoLabelShowsDash` | PASS |
 | AC-11: Секрет не в логах/ошибках/list; только одноразовый вывод при create | unit+integration | `keystore_test.go::TestListNoSecrets`, `cli_key_qa_test.go::TestKeyListNoSecretsOnStdout`, `TestKeyCreateBodyOnlyOnStdout`, `keystore_qa_test.go::TestSentinelErrorMessagesNoSecrets` | PASS |
 | AC-12: Повреждённый DB → ErrCorrupt без перезаписи; отсутствующий → пустое хранилище | unit+integration | `keystore_test.go::TestCorruptFileReturnsErrCorrupt`, `TestMissingFileIsEmptyStore`, `TestWrappedErrCorruptFromOpen`, `TestWrappedErrCorruptFromReadDB`, `keystore_qa_test.go::TestCorruptFileByteForByteUnchanged`, `cli_key_qa_test.go::TestKeyListExitNonZeroOnCorrupt` | PASS |
 
@@ -108,7 +108,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 | SR-20 | Атомарная запись; temp 0600 ДО содержимого; нет temp-файлов | unit | `TestAtomicWritePermissions`, `TestAtomicWriteTempFilePermissions` | PASS |
 | SR-21 | temp не утекает при ошибке записи | unit | `TestNoTempFileAfterError` (parent=файл → CreateTemp fails, root-устойчиво), `TestAtomicWritePermissions`, `TestAtomicWriteTempFilePermissions` | PASS |
 | SR-22 | Corrupt → ErrCorrupt без перезаписи байт-в-байт | unit+integration | `TestCorruptFileReturnsErrCorrupt`, `TestCorruptFileByteForByteUnchanged`, `TestWrappedErrCorruptFromOpen`, `TestWrappedErrCorruptFromReadDB`, `TestKeyListExitNonZeroOnCorrupt` | PASS |
-| SR-23 | flock корректен, параллельные операции не повреждают файл | unit | `TestConcurrentCreateAndList` | PASS |
+| SR-23 | flock корректен, параллельные операции не повреждают файл; usageBuf защищён mu | unit | `TestConcurrentCreateAndList`, `TestConcurrentVerifyNoRace`, `TestConcurrentVerifyAndFlush`, `keystore_qa_test.go::TestConcurrentVerifyMixWithFlush` (проверяется с -race) | PASS |
 | SR-24 | Аудит create/delete с fingerprint, без тела | integration | `TestKeyCreateAuditContainsFingerprintNotBody`, `TestKeyDeleteAuditContainsFingerprintNotBody`, `TestFingerprintPersistedInRecord` | PASS |
 | SR-25 | PlainKey не оседает в Store (best-effort) | инспекция+unit | `TestNoPlaintextInDB`; `keystore.go`: `PlainKey` не в полях Store | PASS (best-effort) |
 
@@ -120,6 +120,8 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 |---|---|---|
 | label > 64 символов → ErrLabelTooLong, exit≠0 | `TestLabelTooLong`, `TestKeyCreateLabelTooLongCLI` | keystore, cli |
 | label = 64 символа → ОК | `TestLabelMaxLength` | keystore |
+| label = 64 Unicode-руны (кириллица, 128 байт) → ОК (rune count, не bytes) | `TestLabelMultibyteExact64` | keystore |
+| label = 65 Unicode-рун → ErrLabelTooLong | `TestLabelMultibyteTooLong` | keystore |
 | label пустой → stored as "", CLI показывает "-" | `TestEmptyLabel`, `TestEmptyLabelShownAsDash`, `TestKeyCreateNoLabelShowsDash` | keystore, cli |
 | Дублирующийся label → разные id | `TestDuplicateLabels` | keystore |
 | Пустое хранилище (нет файла) → пустой List, false Verify, exit 0 | `TestMissingFileIsEmptyStore`, `TestEmptyListReturnsNil`, `TestVerifyEmptyStoreReturnsNoMatch`, `TestKeyListEmptyShowsMessageOnStdout` | keystore, cli |
@@ -131,6 +133,9 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 | revoked-запись остаётся в keys.db для аудита | `TestRevokePreservesRecordForAudit` | keystore |
 | FlushUsage после Revoke → ключ по-прежнему revoked | `TestFlushUsageMergeDoesNotOverwriteRevoke`, `TestFlushUsageDoesNotResurrect` | keystore |
 | Параллельные Create + List (4 горутины) → файл не повреждён | `TestConcurrentCreateAndList` | keystore |
+| 20 горутин Verify одного ключа → нет гонок на usageBuf | `TestConcurrentVerifyNoRace` (+ -race) | keystore |
+| 10 Verify + 10 FlushUsage параллельно → нет гонок | `TestConcurrentVerifyAndFlush` (+ -race) | keystore |
+| 16 Verify (8 valid + 8 invalid) + 4 FlushUsage параллельно → корректность + нет гонок | `TestConcurrentVerifyMixWithFlush` (+ -race) | keystore |
 | Нет .tmp после успешной записи | `TestAtomicWritePermissions`, `TestAtomicWriteTempFilePermissions`, `TestNoTempFileAfterError` | keystore |
 
 ---
@@ -163,6 +168,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 | fingerprint ≤12 hex-символов, не тело | `TestFingerprintLengthBounds`, `TestFingerprint`, `TestFingerprintNotKeyBody` | keystore |
 | ID — hex, 16 символов, не из тела | `TestIDFormat`, `TestIDNotDerivedFromBody`, `TestIDIsRandom` | keystore |
 | Параллельные операции не повреждают файл (flock) | `TestConcurrentCreateAndList` | keystore |
+| usageBuf защищён mu; нет гонок Verify/FlushUsage | `TestConcurrentVerifyNoRace`, `TestConcurrentVerifyAndFlush`, `TestConcurrentVerifyMixWithFlush` (все с -race) | keystore |
 
 ---
 
@@ -173,15 +179,15 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 
 ---
 
-## Новые тесты, добавленные QA (+34)
+## Новые тесты, добавленные QA (+35) и developer (+4)
 
-### `security_static_test.go` (+1 тест)
+### `security_static_test.go` (+1 тест, QA)
 
 | Имя теста | Закрытый пробел | SR/AC |
 |---|---|---|
 | `TestStaticNoMathRand` | grep `math/rand`/`math/rand/v2` по `internal/keystore` + `cli/key.go` | SR-2 |
 
-### `internal/keystore/keystore_qa_test.go` (+19 тестов)
+### `internal/keystore/keystore_qa_test.go` (+20 тестов, QA)
 
 | Имя теста | Закрытый пробел | SR/AC |
 |---|---|---|
@@ -204,8 +210,18 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 | `TestFlushUsagePersistsLastUsedOnReopen` | LastUsed виден в re-opened Store после FlushUsage | SR-17, AC |
 | `TestVerifyEmptyStoreReturnsNoMatch` | Verify на пустом хранилище → (_, false, nil) | AC-12 |
 | `TestHashSizeInDB` | Hash в DB = 32 байта (SHA-256) | SR-8 |
+| `TestConcurrentVerifyMixWithFlush` | 16 Verify (valid+invalid) + 4 FlushUsage параллельно; корректность + нет гонок (target for -race) | SR-23 |
 
-### `internal/cli/cli_key_qa_test.go` (+14 тестов)
+### `internal/keystore/keystore_test.go` (+4 теста, developer — Round 3)
+
+| Имя теста | Закрытый пробел | SR/AC |
+|---|---|---|
+| `TestLabelMultibyteExact64` | label = 64 Cyrillic рун (128 байт) → OK; проверка rune count | AC-10, D4 |
+| `TestLabelMultibyteTooLong` | label = 65 рун → ErrLabelTooLong | AC-10, D4 |
+| `TestConcurrentVerifyNoRace` | 20 горутин Verify одного Store → нет data races | SR-23 |
+| `TestConcurrentVerifyAndFlush` | 10 Verify + 10 FlushUsage параллельно | SR-23, SR-17 |
+
+### `internal/cli/cli_key_qa_test.go` (+14 тестов, QA)
 
 | Имя теста | Закрытый пробел | SR/AC |
 |---|---|---|
@@ -230,7 +246,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 
 Ни одного нового бага не обнаружено. Все тесты прошли с первого прогона.
 
-Ранее закрытые баги (ISSUE-1..4) задокументированы в `specs/key-management/impl-notes.md`.
+Round 1–2: ISSUE-1..4 (data race в usageBuf, ложный TestNoTempFileAfterError, SR-2 без теста, неверный счётчик) — исправлены в `feature/key-management`. Developer устранил ISSUE-1 (mu + snapshot) и ISSUE-2 (rune-based label). QA зафиксировала ISSUE-3 (math/rand test), ISSUE-4 (root-safe SR-21 test).
 
 ---
 
