@@ -36,4 +36,4 @@ FROM base AS test
 # Run go vet + go test (all packages) + go test -race (keystore).
 # -race requires CGO; the keystore step overrides CGO_ENABLED=0.
 # All module resolution is from vendor/ — no outbound network calls.
-CMD ["sh", "-c", "go vet ./... && go test -v -count=1 ./... && CGO_ENABLED=1 go test -race -count=1 ./internal/keystore/... ./internal/server/..."]
+CMD ["sh", "-c", "go vet ./... && go test -v -count=1 ./... && CGO_ENABLED=1 go test -race -count=1 ./internal/keystore/... ./internal/server/... ./internal/mcp/..."]
