@@ -1,11 +1,10 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
-	"os"
 	"strings"
-	"time"
 	"unicode/utf8"
 
 	"github.com/charmbracelet/log"
@@ -89,47 +88,70 @@ func printError(w io.Writer, message string, hints ...string) {
 	}
 }
 
+// printStoreError maps a keystore error to the canonical user-facing message+hints.
+// ISSUE-3: uses errors.Is for wrapped-error compatibility.
+func printStoreError(w io.Writer, err error, op string) {
+	switch {
+	case errors.Is(err, keystore.ErrCorrupt):
+		printError(w,
+			"key store is corrupted or unreadable",
+			`check file permissions on keys.db (must be readable by current user)`,
+			`do not attempt to repair the file manually — contact support if data recovery is needed`)
+	case errors.Is(err, keystore.ErrLabelTooLong):
+		printError(w,
+			"label is too long (max 64 characters)",
+			"choose a shorter label and try again")
+	case errors.Is(err, keystore.ErrNotFound):
+		// Caller should provide context (id); handled in runKeyDelete directly.
+		printError(w, fmt.Sprintf("%s: key not found", op))
+	case errors.Is(err, keystore.ErrAlreadyRevoked):
+		printError(w, fmt.Sprintf("%s: key is already revoked", op))
+	default:
+		printError(w, fmt.Sprintf("%s: %s", op, err.Error()))
+	}
+}
+
 // runKeyCreate implements "raxd key create [--name <label>]".
 // ux-spec: key on stdout in box, warning+metadata on stderr, exit 0 on success.
 func runKeyCreate(cmd *cobra.Command, _ []string) error {
 	label, _ := cmd.Flags().GetString("name")
+	stderr := cmd.ErrOrStderr()
+	stdout := cmd.OutOrStdout()
 
 	store, err := openStore()
 	if err != nil {
-		switch err {
-		case keystore.ErrCorrupt:
-			printError(cmd.ErrOrStderr(),
+		// ISSUE-3: errors.Is covers wrapped ErrCorrupt from fmt.Errorf("%w", ErrCorrupt).
+		if errors.Is(err, keystore.ErrCorrupt) {
+			printError(stderr,
 				"key store is corrupted or unreadable",
 				`check file permissions on keys.db (must be readable by current user)`,
 				`do not attempt to repair the file manually — contact support if data recovery is needed`)
-		default:
-			printError(cmd.ErrOrStderr(), fmt.Sprintf("cannot open key store: %s", friendlyErr(err)))
+		} else {
+			printError(stderr, fmt.Sprintf("cannot open key store: %s", err.Error()))
 		}
 		return err
 	}
 
 	plain, rec, err := store.Create(label)
 	if err != nil {
-		switch err {
-		case keystore.ErrLabelTooLong:
-			printError(cmd.ErrOrStderr(),
+		// ISSUE-3: errors.Is for all sentinel errors.
+		switch {
+		case errors.Is(err, keystore.ErrLabelTooLong):
+			printError(stderr,
 				"label is too long (max 64 characters)",
 				"choose a shorter label and try again")
-		case keystore.ErrCorrupt:
-			printError(cmd.ErrOrStderr(),
+		case errors.Is(err, keystore.ErrCorrupt):
+			printError(stderr,
 				"key store is corrupted or unreadable",
 				`check file permissions on keys.db (must be readable by current user)`,
 				`do not attempt to repair the file manually — contact support if data recovery is needed`)
 		default:
-			printError(cmd.ErrOrStderr(), fmt.Sprintf("cannot create key: %s", friendlyErr(err)))
+			printError(stderr, fmt.Sprintf("cannot create key: %s", err.Error()))
 		}
 		return err
 	}
 
 	// ux-spec §Принцип 1: WARNING first, to stderr, before the key.
-	stderr := cmd.ErrOrStderr()
-	stdout := cmd.OutOrStdout()
-
 	fmt.Fprintln(stderr, "  ! WARNING: This key will NOT be shown again. Save it now.")
 	fmt.Fprintln(stderr)
 
@@ -148,11 +170,13 @@ func runKeyCreate(cmd *cobra.Command, _ []string) error {
 	fmt.Fprintln(stderr)
 
 	// SR-24: audit log: timestamp+action+id+fingerprint, NOT the key body.
+	// Fingerprint taken from rec.Fingerprint (persisted at Create time) for consistency with delete audit.
+	// ISSUE-1: use cmd.ErrOrStderr() not os.Stderr — honours cobra's output redirection in tests.
 	logger := log.New(stderr)
 	logger.Info("key created",
 		"action", "create",
 		"id", rec.ID,
-		"fingerprint", keystore.Fingerprint(string(plain)),
+		"fingerprint", rec.Fingerprint,
 	)
 
 	return nil
@@ -174,35 +198,36 @@ func printKeyBox(w io.Writer, key string) {
 // runKeyList implements "raxd key list".
 // ux-spec: table on stdout, empty message on stdout, exit 0 always.
 func runKeyList(cmd *cobra.Command, _ []string) error {
+	stderr := cmd.ErrOrStderr()
+	stdout := cmd.OutOrStdout()
+
 	store, err := openStore()
 	if err != nil {
-		switch err {
-		case keystore.ErrCorrupt:
-			printError(cmd.ErrOrStderr(),
+		// ISSUE-3: errors.Is for wrapped ErrCorrupt.
+		if errors.Is(err, keystore.ErrCorrupt) {
+			printError(stderr,
 				"key store is corrupted or unreadable",
 				`check file permissions on keys.db (must be readable by current user)`,
 				`do not attempt to repair the file manually — contact support if data recovery is needed`)
-		default:
-			printError(cmd.ErrOrStderr(), fmt.Sprintf("cannot open key store: %s", friendlyErr(err)))
+		} else {
+			printError(stderr, fmt.Sprintf("cannot open key store: %s", err.Error()))
 		}
 		return err
 	}
 
 	records, err := store.List()
 	if err != nil {
-		switch err {
-		case keystore.ErrCorrupt:
-			printError(cmd.ErrOrStderr(),
+		// ISSUE-3: errors.Is for wrapped ErrCorrupt.
+		if errors.Is(err, keystore.ErrCorrupt) {
+			printError(stderr,
 				"key store is corrupted or unreadable",
 				`check file permissions on keys.db (must be readable by current user)`,
 				`do not attempt to repair the file manually — contact support if data recovery is needed`)
-		default:
-			printError(cmd.ErrOrStderr(), fmt.Sprintf("cannot list keys: %s", friendlyErr(err)))
+		} else {
+			printError(stderr, fmt.Sprintf("cannot list keys: %s", err.Error()))
 		}
 		return err
 	}
-
-	stdout := cmd.OutOrStdout()
 
 	if len(records) == 0 {
 		fmt.Fprintln(stdout, "  No API keys found.")
@@ -253,8 +278,10 @@ func runKeyList(cmd *cobra.Command, _ []string) error {
 // runKeyDelete implements "raxd key delete <id>".
 // ux-spec: confirmation on stderr, exit 0 on success; exit 1 on not-found/already-revoked.
 func runKeyDelete(cmd *cobra.Command, args []string) error {
+	stderr := cmd.ErrOrStderr()
+
 	if len(args) == 0 {
-		printError(cmd.ErrOrStderr(),
+		printError(stderr,
 			"key delete requires an id argument",
 			`run "raxd key list" to find the key ID, then use "raxd key delete <id>"`)
 		return fmt.Errorf("missing id argument")
@@ -264,52 +291,65 @@ func runKeyDelete(cmd *cobra.Command, args []string) error {
 
 	store, err := openStore()
 	if err != nil {
-		switch err {
-		case keystore.ErrCorrupt:
-			printError(cmd.ErrOrStderr(),
+		// ISSUE-3: errors.Is for wrapped ErrCorrupt.
+		if errors.Is(err, keystore.ErrCorrupt) {
+			printError(stderr,
 				"key store is corrupted or unreadable",
 				`check file permissions on keys.db (must be readable by current user)`,
 				`do not attempt to repair the file manually — contact support if data recovery is needed`)
-		default:
-			printError(cmd.ErrOrStderr(), fmt.Sprintf("cannot open key store: %s", friendlyErr(err)))
+		} else {
+			printError(stderr, fmt.Sprintf("cannot open key store: %s", err.Error()))
 		}
 		return err
 	}
 
-	// Compute fingerprint before revoke for audit (SR-24).
-	// Note: we use id as identifier in audit, fingerprint is optional here since
-	// we don't have the plain key at delete time — we log id+action per SR-24 contract.
-	// SR-24: audit record uses id (not key body).
+	// ISSUE-2: retrieve fingerprint from persisted record BEFORE revoking,
+	// so that the audit log for delete includes fingerprint (SR-24).
+	// We use store.List() which reads all active records under shared flock.
+	// Fingerprint is safe to read here: it is a non-sensitive sha256 prefix (SR-15).
+	fp := ""
+	if recs, lerr := store.List(); lerr == nil {
+		for _, r := range recs {
+			if r.ID == id {
+				fp = r.Fingerprint
+				break
+			}
+		}
+	}
+
 	if err := store.Revoke(id); err != nil {
-		switch err {
-		case keystore.ErrNotFound:
-			printError(cmd.ErrOrStderr(),
+		// ISSUE-3: errors.Is for all sentinel errors.
+		switch {
+		case errors.Is(err, keystore.ErrNotFound):
+			printError(stderr,
 				fmt.Sprintf("key %q not found", id),
 				`run "raxd key list" to see available key IDs`)
-		case keystore.ErrAlreadyRevoked:
-			printError(cmd.ErrOrStderr(),
+		case errors.Is(err, keystore.ErrAlreadyRevoked):
+			printError(stderr,
 				fmt.Sprintf("key %q is already revoked", id),
 				`run "raxd key list" to see active keys`)
-		case keystore.ErrCorrupt:
-			printError(cmd.ErrOrStderr(),
+		case errors.Is(err, keystore.ErrCorrupt):
+			printError(stderr,
 				"key store is corrupted or unreadable",
 				`check file permissions on keys.db (must be readable by current user)`,
 				`do not attempt to repair the file manually — contact support if data recovery is needed`)
 		default:
-			printError(cmd.ErrOrStderr(), fmt.Sprintf("cannot revoke key: %s", friendlyErr(err)))
+			printError(stderr, fmt.Sprintf("cannot revoke key: %s", err.Error()))
 		}
 		return err
 	}
 
-	stderr := cmd.ErrOrStderr()
 	fmt.Fprintf(stderr, "  key %s revoked\n", id)
 	fmt.Fprintln(stderr, `  hint: the key can no longer be used for authentication`)
 
-	// SR-24: audit log for delete action.
-	logger := log.New(os.Stderr)
+	// SR-24: audit log for delete action with fingerprint from persisted record.
+	// ISSUE-1: use cmd.ErrOrStderr() not os.Stderr.
+	// ISSUE-2: fingerprint now available from rec.Fingerprint (persisted at Create).
+	logger := log.New(stderr)
 	logger.Info("key revoked",
 		"action", "delete",
 		"id", id,
+		"fingerprint", fp,
 	)
 
 	return nil
@@ -335,21 +375,10 @@ func truncateEllipsis(s string, n int) string {
 	return string(runes[:n-1]) + "…"
 }
 
-// friendlyErr strips go-internal formatting from errors for user-facing display.
+// friendlyErr returns a user-facing error string (no stack traces, no Go internals).
 func friendlyErr(err error) string {
 	if err == nil {
 		return ""
 	}
-	msg := err.Error()
-	// Strip "key store is locked" noise — already handled by specific case.
-	_ = msg
 	return err.Error()
-}
-
-// formatDate formats a time for display; returns "never" for zero time.
-func formatDate(t time.Time) string {
-	if t.IsZero() {
-		return "never"
-	}
-	return t.Format("2006-01-02")
 }
