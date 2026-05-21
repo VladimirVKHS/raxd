@@ -107,36 +107,35 @@ func TestConfigPortSubcommandRegistered(t *testing.T) {
 
 // --- AC: Stub commands exit non-zero ---
 
-func TestStubKeyCreate(t *testing.T) {
-	_, stderr, err := executeCmd("key", "create")
-	if err == nil {
-		t.Error("key create must return non-nil error (non-zero exit)")
+// TestKeyCreateExitZero verifies that "key create" exits 0 on success.
+// After key-management implementation, key create no longer returns "not implemented yet".
+func TestKeyCreateExitZero(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	_, _, err := executeCmd("key", "create")
+	if err != nil {
+		t.Errorf("key create must exit 0 on success, got: %v", err)
 	}
-	if !strings.Contains(stderr, "not implemented yet") {
-		t.Errorf("stderr %q must contain 'not implemented yet'", stderr)
+}
+
+// TestKeyListExitZero verifies that "key list" exits 0 (empty list is not an error).
+// After key-management implementation, key list outputs table/empty message on stdout.
+func TestKeyListExitZero(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	_, _, err := executeCmd("key", "list")
+	if err != nil {
+		t.Errorf("key list must exit 0 on success, got: %v", err)
+	}
+}
+
+// TestKeyDeleteMissingArg verifies that "key delete" without an id returns non-zero exit.
+func TestKeyDeleteMissingArg(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	_, stderr, err := executeCmd("key", "delete")
+	if err == nil {
+		t.Error("key delete without id must return non-nil error")
 	}
 	if !strings.Contains(stderr, "error:") {
 		t.Errorf("stderr %q must contain 'error:' prefix", stderr)
-	}
-}
-
-func TestStubKeyList(t *testing.T) {
-	_, stderr, err := executeCmd("key", "list")
-	if err == nil {
-		t.Error("key list must return non-nil error")
-	}
-	if !strings.Contains(stderr, "not implemented yet") {
-		t.Errorf("stderr = %q", stderr)
-	}
-}
-
-func TestStubKeyDelete(t *testing.T) {
-	_, stderr, err := executeCmd("key", "delete", "someid")
-	if err == nil {
-		t.Error("key delete must return non-nil error")
-	}
-	if !strings.Contains(stderr, "not implemented yet") {
-		t.Errorf("stderr = %q", stderr)
 	}
 }
 
@@ -222,13 +221,12 @@ func TestStatusNoSecrets(t *testing.T) {
 	}
 }
 
-// --- SECURITY: Stubs must not produce stdout (machine-readable channel) ---
+// --- SECURITY: Non-key stubs must not produce stdout (machine-readable channel) ---
 
-func TestStubsProduceNoStdout(t *testing.T) {
+// TestNonKeyStubsProduceNoStdout verifies that remaining stubs (config port, serve)
+// do not write to stdout. Key commands are now implemented and have defined stdout behaviour.
+func TestNonKeyStubsProduceNoStdout(t *testing.T) {
 	cases := [][]string{
-		{"key", "create"},
-		{"key", "list"},
-		{"key", "delete", "id"},
 		{"config", "port", "8080"},
 		{"serve"},
 	}
@@ -237,5 +235,52 @@ func TestStubsProduceNoStdout(t *testing.T) {
 		if strings.TrimSpace(stdout) != "" {
 			t.Errorf("stub %v must not write to stdout, got: %q", args, stdout)
 		}
+	}
+}
+
+// TestKeyDeleteProducesNoStdout verifies that "key delete" does not write to stdout
+// (confirmation goes to stderr per ux-spec).
+func TestKeyDeleteProducesNoStdout(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	// delete without args — must error but still produce no stdout.
+	stdout, _, _ := executeCmd("key", "delete")
+	if strings.TrimSpace(stdout) != "" {
+		t.Errorf("key delete must not write to stdout, got: %q", stdout)
+	}
+}
+
+// TestKeyCreateKeyOnStdout verifies that "key create" outputs the key to stdout.
+// ux-spec: key body in box frame on stdout; warning+metadata on stderr.
+func TestKeyCreateKeyOnStdout(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	stdout, stderr, err := executeCmd("key", "create")
+	if err != nil {
+		t.Fatalf("key create must exit 0, got: %v", err)
+	}
+	// Key must appear on stdout.
+	if !strings.Contains(stdout, "rax_") {
+		t.Errorf("stdout must contain key body; got stdout=%q", stdout)
+	}
+	// Warning must appear on stderr.
+	if !strings.Contains(stderr, "WARNING") {
+		t.Errorf("stderr must contain WARNING; got stderr=%q", stderr)
+	}
+	// Key must NOT appear on stderr (SR-11).
+	if strings.Contains(stderr, "rax_live_") {
+		t.Errorf("key body must not appear on stderr (SR-11); got stderr=%q", stderr)
+	}
+}
+
+// TestKeyListOutputOnStdout verifies that "key list" output goes to stdout.
+// ux-spec: table is machine-readable, stdout channel.
+func TestKeyListOutputOnStdout(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	stdout, _, err := executeCmd("key", "list")
+	if err != nil {
+		t.Fatalf("key list must exit 0, got: %v", err)
+	}
+	// Empty list must contain helpful message on stdout.
+	if !strings.Contains(stdout, "No API keys found") {
+		t.Errorf("empty key list must contain 'No API keys found' on stdout; got=%q", stdout)
 	}
 }

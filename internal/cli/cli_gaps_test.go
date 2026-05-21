@@ -118,17 +118,15 @@ func TestVersionDefaultValues(t *testing.T) {
 
 // --- AC: stub error messages contain the correct command name ---
 
-// TestStubErrorMessageContainsCommandName verifies that each stub outputs
-// "error: <cmd>: not implemented yet" with the exact command name.
-// AC: "команды-заглушки завершаются с понятным сообщением вида <команда>: not implemented yet".
-func TestStubErrorMessageContainsCommandName(t *testing.T) {
+// TestRemainingStubErrorMessageContainsCommandName verifies that remaining stubs
+// (config port, serve) output "error: <cmd>: not implemented yet".
+// Key commands are now implemented and have their own error messages.
+// AC: "оставшиеся заглушки завершаются с понятным сообщением вида <команда>: not implemented yet".
+func TestRemainingStubErrorMessageContainsCommandName(t *testing.T) {
 	cases := []struct {
 		args    []string
 		wantCmd string
 	}{
-		{[]string{"key", "create"}, "key create"},
-		{[]string{"key", "list"}, "key list"},
-		{[]string{"key", "delete", "id"}, "key delete"},
 		{[]string{"config", "port", "8080"}, "config port"},
 		{[]string{"serve"}, "serve"},
 	}
