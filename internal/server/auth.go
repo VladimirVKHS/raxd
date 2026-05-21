@@ -100,14 +100,41 @@ func authMiddleware(store *keystore.Store, auditFn AuditFn) func(http.Handler) h
 			ctx := context.WithValue(r.Context(), ctxKeyFingerprint, fp)
 			ctx = context.WithValue(ctx, ctxKeyKeyID, rec.ID)
 
-			// SR-19/SR-20: write AUTH audit record on successful authentication.
+			// SR-19/SR-20 (ISSUE-3): AUTH audit record is NOT written here.
+			// It is written by authSuccessAuditMiddleware AFTER rate-limit passes,
+			// ensuring exactly ONE audit record per request that reaches a handler.
+			// Writing AUTH here + RATE in rateLimitMiddleware would produce two records
+			// for valid-key rate-limited requests, violating the one-record invariant.
+
+			next.ServeHTTP(w, r.WithContext(ctx))
+		})
+	}
+}
+
+// authSuccessAuditMiddleware writes a single AUTH audit record for every request
+// that passes BOTH authentication AND rate-limiting (i.e., reaches a real handler).
+//
+// ISSUE-3 / SR-19 invariant: exactly ONE audit record per request.
+//   - Rejected by Host/Origin → DENY record (hostOriginMiddleware), stop.
+//   - Rejected by auth → FAIL record (authMiddleware), stop.
+//   - Rejected by rate-limit → RATE record (rateLimitMiddleware), stop.
+//   - Passed everything → AUTH record here (authSuccessAuditMiddleware), once.
+//
+// This middleware must be placed AFTER rateLimitMiddleware in the chain so it
+// runs only when rate-limit allows the request through.
+// Requires authMiddleware to have already stored the fingerprint in context.
+func authSuccessAuditMiddleware(auditFn AuditFn) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fp := fingerprintFromCtx(r.Context())
+			remote := remoteIP(r)
+			// Write AUTH success record — request has cleared all gates.
 			auditFn(AuditRecord{
 				Fingerprint: fp,
 				RemoteAddr:  remote,
 				Result:      "success",
 			})
-
-			next.ServeHTTP(w, r.WithContext(ctx))
+			next.ServeHTTP(w, r)
 		})
 	}
 }
