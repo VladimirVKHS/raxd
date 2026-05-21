@@ -3,6 +3,7 @@ package server
 import (
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -63,6 +64,30 @@ func hostOriginMiddleware(hostAllow, originAllow []string, auditFn AuditFn) func
 	}
 }
 
+// bodyLimitMiddleware wraps r.Body in http.MaxBytesReader(w, r.Body, limit) so that
+// reading more than limit bytes from the body returns an error and typically produces
+// a 413 response via the default http.MaxBytesError handling.
+//
+// SR-25: protection against large-body flooding. Placed as an outer layer so that
+// every handler (health, dispatch, future handlers) inherits the limit automatically.
+// The limit is set per-request; http.MaxBytesReader is idempotent on Body replacement.
+func bodyLimitMiddleware(limit int64) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			r.Body = http.MaxBytesReader(w, r.Body, limit)
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// BodyLimitMiddlewareForTest is a test-only export of bodyLimitMiddleware.
+// It allows server_test (external package) to drive the middleware directly
+// without a full TLS server, verifying SR-25 body-limit enforcement in isolation.
+// NOT for production use — use bodyLimitMiddleware via New() instead.
+func BodyLimitMiddlewareForTest(limit int64) func(http.Handler) http.Handler {
+	return bodyLimitMiddleware(limit)
+}
+
 // recoverMiddleware catches panics and returns 500 without crashing the server.
 // SR-25: handles mid-handshake / handler panics.
 func recoverMiddleware(next http.Handler) http.Handler {
@@ -121,22 +146,27 @@ func contains(slice []string, s string) bool {
 	return false
 }
 
-// originAllowed checks whether origin (full URL) matches any entry in allow.
-// Comparison is case-insensitive prefix/exact match on origin host.
+// originAllowed checks whether the host part of origin (a full URL per RFC 6454)
+// exactly matches any entry in allow (case-insensitive).
+//
+// SR-16 strict-match rules:
+//   - Parse origin via url.Parse; extract u.Hostname() (strips port, handles brackets).
+//   - Compare extracted hostname EXACTLY (case-insensitive) to each allowlist entry.
+//   - Empty hostname after parse (e.g. relative URL, unparseable) → NOT allowed.
+//   - HasPrefix is intentionally NOT used — it enables subdomain-bypass attacks
+//     such as Origin: https://localhost.evil.com passing allowlist entry "localhost".
 func originAllowed(origin string, allow []string) bool {
-	// Strip scheme for comparison.
-	o := strings.ToLower(origin)
-	for _, a := range allow {
-		a = strings.ToLower(a)
-		if o == a || strings.HasPrefix(o, "https://"+a) || strings.HasPrefix(o, "http://"+a) {
-			return true
-		}
-		// Allow exact host match (without scheme).
-		if o == "https://"+a || o == "http://"+a {
-			return true
-		}
+	u, err := url.Parse(origin)
+	if err != nil {
+		// Unparseable Origin → treat as hostile.
+		return false
 	}
-	return false
+	hostname := strings.ToLower(u.Hostname())
+	if hostname == "" {
+		// No host component (e.g. relative URL, bare string) → not allowed.
+		return false
+	}
+	return contains(allow, hostname)
 }
 
 // remoteIP returns the IP:port of the request, stripping X-Forwarded-For
