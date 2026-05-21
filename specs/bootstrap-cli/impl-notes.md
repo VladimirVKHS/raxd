@@ -68,13 +68,14 @@ docker build --target build -t raxd-build .
 docker build --target test -t raxd-test . && docker run --rm raxd-test
 ```
 
-**Результат (все зелёные, 20 тестов, 0 skip):**
+**Результат (все зелёные, 50 тестов, 0 skip):**
 
 ```
+ok  github.com/vladimirvkhs/raxd              0.061s  (5 тестов — статические проверки)
 ok  github.com/vladimirvkhs/raxd/internal/banner  0.001s  (5 тестов)
-ok  github.com/vladimirvkhs/raxd/internal/cli     0.002s  (13 тестов)
-ok  github.com/vladimirvkhs/raxd/internal/config  0.002s  (6 тестов)
-ok  github.com/vladimirvkhs/raxd/internal/version 0.001s  (3 теста)
+ok  github.com/vladimirvkhs/raxd/internal/cli     0.003s  (25 тестов)
+ok  github.com/vladimirvkhs/raxd/internal/config  0.003s  (9 тестов)
+ok  github.com/vladimirvkhs/raxd/internal/version 0.001s  (5 тестов)
 ```
 
 **Покрытые Acceptance Criteria:**
@@ -116,7 +117,7 @@ ok  github.com/vladimirvkhs/raxd/internal/version 0.001s  (3 теста)
 
 - **Дефолты `Config` без секретов**: только `Port: 7822`. Покрыто `TestLoadMissingFileReturnsDefaults`.
 
-- **Баннер на stderr**: `PersistentPreRun` использует `os.Stderr`, не смешивает с machine-readable stdout. Контракт покрыт в ux-spec и подтверждён тестами (баннер пишется в `cmd.ErrOrStderr()`).
+- **Баннер на stderr**: `PersistentPreRun` использует `cmd.ErrOrStderr()`, не смешивает с machine-readable stdout. Уважает `cmd.SetErr()` — вывод захватывается в тестах через `bytes.Buffer`. Контракт покрыт в ux-spec и подтверждён тестами.
 
 - **Запуск только в Docker**: Dockerfile задокументирован; на хосте `raxd` не запускается (инструкции только docker-run).
 
