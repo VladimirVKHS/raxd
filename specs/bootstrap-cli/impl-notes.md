@@ -46,6 +46,10 @@
 
 - **Issue 5 (t.Skip)**: `TestGetPathsDefault` → `TestPathsDefault` переписан детерминированно: `t.Setenv("HOME", t.TempDir())` задаёт контролируемый HOME, `t.Skip` удалён. Тест всегда выполняется независимо от хост-окружения.
 
+## Исправления по qa (rev.2)
+
+- **BUG-001**: в `internal/cli/root.go` (`PersistentPreRun`) заменено `fmt.Fprintln(os.Stderr, banner.Render())` на `fmt.Fprintln(cmd.ErrOrStderr(), banner.Render())`. Теперь баннер пишется в канал, заданный через `cmd.SetErr()`, что обеспечивает тестируемость (захват вывода в `bytes.Buffer`) и корректную работу при перенаправлении `2>file`. Неиспользуемый импорт `"os"` удалён из `root.go`.
+
 ## Тесты
 
 **Команда сборки и тестов (только Docker, SECURITY-BASELINE §6):**

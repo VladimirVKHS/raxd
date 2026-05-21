@@ -3,7 +3,6 @@ package cli
 
 import (
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
 	"github.com/vladimirvkhs/raxd/internal/banner"
@@ -26,7 +25,7 @@ Use "raxd [command] --help" for more information about a command.`,
 		// PersistentPreRun prints the banner to stderr before every command.
 		// It does NOT run for --help (cobra skips PersistentPreRun on help).
 		PersistentPreRun: func(cmd *cobra.Command, _ []string) {
-			fmt.Fprintln(os.Stderr, banner.Render())
+			fmt.Fprintln(cmd.ErrOrStderr(), banner.Render())
 
 			// Ensure XDG directories exist on every invocation.
 			// Failure is non-fatal for banner/version — only status/serve care.
