@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 const dbVersion = 1
@@ -19,28 +21,33 @@ const dbVersion = 1
 type Store struct {
 	path string
 
+	// mu protects usageBuf from concurrent access (data-race fix, reviewer Issue 1).
+	mu sync.Mutex
+
 	// usageBuf buffers LastUsed timestamps from Verify calls.
 	// Written to disk only by FlushUsage (SR-17).
+	// Access must be guarded by mu.
 	usageBuf map[string]time.Time
 }
 
 // Open creates a Store bound to path (the KeysDB path from config.PathSet).
 // If the file does not exist or is empty, the Store treats it as empty (not an error) — SR-22.
 // If the file exists, is non-empty, and is malformed, Open returns ErrCorrupt without modifying the file.
+//
+// Bonus fix (reviewer): uses json.Unmarshal (consistent with readDB) so that valid JSON followed
+// by trailing garbage is detected as corrupt, matching readDB behaviour exactly.
 func Open(path string) (*Store, error) {
 	// Probe for corruption only if the file exists and is non-empty.
 	info, err := os.Stat(path)
 	if err == nil && info.Size() > 0 {
-		f, err := os.Open(path)
+		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, fmt.Errorf("%w: %s", ErrCorrupt, err.Error())
 		}
 		var db Database
-		if err := json.NewDecoder(f).Decode(&db); err != nil {
-			_ = f.Close()
+		if err := json.Unmarshal(data, &db); err != nil {
 			return nil, ErrCorrupt
 		}
-		_ = f.Close()
 	}
 	return &Store{
 		path:     path,
@@ -56,7 +63,8 @@ func Open(path string) (*Store, error) {
 // Lock: exclusive flock for the duration of read-modify-write (SR-23).
 // SR-25: PlainKey is returned to the caller; Store never retains it.
 func (s *Store) Create(label string) (PlainKey, Record, error) {
-	if len(label) > 64 {
+	// Issue 2 (reviewer): use rune count for Unicode-correct label length check.
+	if utf8.RuneCountInString(label) > 64 {
 		return "", Record{}, ErrLabelTooLong
 	}
 
@@ -216,8 +224,12 @@ func (s *Store) Verify(presented string) (Record, bool, error) {
 
 	if found {
 		// Buffer LastUsed update; do NOT write file here (SR-17).
-		s.usageBuf[matched.ID] = time.Now().UTC()
-		matched.LastUsed = s.usageBuf[matched.ID]
+		// Issue 1 (reviewer): guard usageBuf with mu to prevent data race.
+		ts := time.Now().UTC()
+		s.mu.Lock()
+		s.usageBuf[matched.ID] = ts
+		s.mu.Unlock()
+		matched.LastUsed = ts
 	}
 
 	return matched, found, nil
@@ -227,24 +239,49 @@ func (s *Store) Verify(presented string) (Record, bool, error) {
 // Uses exclusive flock; re-reads the file to avoid overwriting concurrent Revoke (SR-17).
 // Revoked records are not updated (FlushUsage never resurrects a revoked key).
 // No-op when the buffer is empty.
+//
+// Issue 1 (reviewer): all usageBuf accesses guarded by mu.
 func (s *Store) FlushUsage() error {
+	// Take a snapshot of the buffer under the lock, then release the lock
+	// before doing file I/O so that Verify can continue buffering during flush.
+	s.mu.Lock()
 	if len(s.usageBuf) == 0 {
+		s.mu.Unlock()
 		return nil
 	}
+	snapshot := s.usageBuf
+	s.usageBuf = make(map[string]time.Time)
+	s.mu.Unlock()
 
 	lf, err := acquireLock(s.path, lockExclusive)
 	if err != nil {
+		// Restore snapshot on lock failure so timestamps are not lost.
+		s.mu.Lock()
+		for id, t := range snapshot {
+			if _, exists := s.usageBuf[id]; !exists {
+				s.usageBuf[id] = t
+			}
+		}
+		s.mu.Unlock()
 		return err
 	}
 	defer releaseLock(lf)
 
 	db, err := s.readDB()
 	if err != nil {
+		// Restore snapshot on read failure.
+		s.mu.Lock()
+		for id, t := range snapshot {
+			if _, exists := s.usageBuf[id]; !exists {
+				s.usageBuf[id] = t
+			}
+		}
+		s.mu.Unlock()
 		return err
 	}
 
 	for i, k := range db.Keys {
-		t, ok := s.usageBuf[k.ID]
+		t, ok := snapshot[k.ID]
 		if !ok {
 			continue
 		}
@@ -255,13 +292,7 @@ func (s *Store) FlushUsage() error {
 		db.Keys[i].LastUsed = t
 	}
 
-	if err := s.writeDB(db); err != nil {
-		return err
-	}
-
-	// Clear buffer after successful flush.
-	s.usageBuf = make(map[string]time.Time)
-	return nil
+	return s.writeDB(db)
 }
 
 // readDB reads and parses the JSON database from disk.

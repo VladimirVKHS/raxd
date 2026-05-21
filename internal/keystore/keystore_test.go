@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/vladimirvkhs/raxd/internal/keystore"
@@ -639,6 +640,90 @@ func TestListHidesRevoked(t *testing.T) {
 	if !found {
 		t.Errorf("active key %q must appear in List", r1.ID)
 	}
+}
+
+// --- Reviewer Issue 2: multibyte label (utf8.RuneCountInString) ---
+
+// TestLabelMultibyteExact64 verifies that a 64-rune Cyrillic label is accepted.
+// Issue 2 (reviewer): len() counts bytes, utf8.RuneCountInString counts characters.
+// A 64-rune Cyrillic string is 128 bytes — would fail len(label)>64 incorrectly.
+func TestLabelMultibyteExact64(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	// 64 Cyrillic runes = 128 bytes; must be accepted.
+	label64runes := strings.Repeat("я", 64)
+	_, _, err := store.Create(label64runes)
+	if err != nil {
+		t.Errorf("Create with 64-rune Cyrillic label (128 bytes) must succeed; got %v", err)
+	}
+}
+
+// TestLabelMultibyteTooLong verifies that a 65-rune Cyrillic label is rejected.
+func TestLabelMultibyteTooLong(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	// 65 Cyrillic runes = 130 bytes; must be rejected.
+	label65runes := strings.Repeat("я", 65)
+	_, _, err := store.Create(label65runes)
+	if !errors.Is(err, keystore.ErrLabelTooLong) {
+		t.Errorf("Create with 65-rune Cyrillic label must return ErrLabelTooLong; got %v", err)
+	}
+}
+
+// --- Reviewer Issue 1: concurrent Verify — data race ---
+
+// TestConcurrentVerifyNoRace verifies that concurrent Verify calls on the same Store
+// do not cause a data race on usageBuf (detected by go test -race).
+// This test is meaningful only with the race detector; it passes without it too.
+func TestConcurrentVerifyNoRace(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	plain, _, err := store.Create("race-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	const goroutines = 20
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			_, _, _ = store.Verify(string(plain))
+		}()
+	}
+	wg.Wait()
+}
+
+// TestConcurrentVerifyAndFlush verifies that concurrent Verify + FlushUsage calls
+// do not race on usageBuf (the mu-snapshot pattern in FlushUsage).
+func TestConcurrentVerifyAndFlush(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	plain, _, err := store.Create("race-flush")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	const goroutines = 10
+	wg.Add(goroutines * 2)
+
+	// Half goroutines call Verify.
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			_, _, _ = store.Verify(string(plain))
+		}()
+	}
+	// Half goroutines call FlushUsage.
+	for range goroutines {
+		go func() {
+			defer wg.Done()
+			_ = store.FlushUsage()
+		}()
+	}
+	wg.Wait()
 }
 
 // TestEmptyListReturnsNil verifies that an empty store returns nil slice, nil error.
