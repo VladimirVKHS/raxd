@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	clog "github.com/charmbracelet/log"
@@ -113,7 +114,7 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	fmt.Fprintln(stderr)
 
 	if runErr != nil {
-		if errors.Is(runErr, server.ErrPortInUse) || serveContains(runErr.Error(), "address already in use") {
+		if errors.Is(runErr, server.ErrPortInUse) || strings.Contains(runErr.Error(), "address already in use") {
 			addr := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.Port)
 			fmt.Fprintf(stderr, "error: cannot bind to %s: address already in use\n", addr)
 			fmt.Fprintf(stderr, "  hint: check what is using port %d with \"lsof -i :%d\" and stop it, or change the port with \"raxd config port <PORT>\"\n", cfg.Port, cfg.Port)
@@ -146,7 +147,7 @@ func printStartBlock(w io.Writer, ci server.CertInfo, cfg *config.Config) {
 // printStartError prints a startup error in ux-spec error:/hint: format.
 func printStartError(w io.Writer, err error, paths config.PathSet) {
 	switch {
-	case errors.Is(err, server.ErrTLSCert) || serveContains(err.Error(), "TLS certificate"):
+	case errors.Is(err, server.ErrTLSCert) || strings.Contains(err.Error(), "TLS certificate"):
 		fmt.Fprintf(w, "error: TLS certificate or key is corrupted or unreadable\n")
 		fmt.Fprintf(w, "  hint: remove the files in %s and run \"raxd serve\" again to regenerate\n", paths.TLSDir)
 	default:
@@ -155,18 +156,3 @@ func printStartError(w io.Writer, err error, paths config.PathSet) {
 	}
 }
 
-// serveContains reports whether s contains substr.
-func serveContains(s, substr string) bool {
-	if len(substr) == 0 {
-		return true
-	}
-	if len(s) < len(substr) {
-		return false
-	}
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}
