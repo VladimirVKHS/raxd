@@ -22,6 +22,10 @@ type AuditRecord struct {
 	Result string
 	// Reason describes the failure; empty on success.
 	Reason string
+	// Tool is the MCP tool name for MCP-layer audit records.
+	// Empty for non-MCP connection records (auth/deny/rate).
+	// SECURITY (SR-36): Tool holds the tool name (not a secret); key body MUST NOT be stored.
+	Tool string
 }
 
 // AuditFn is the function signature for writing an audit record.
@@ -29,15 +33,17 @@ type AuditRecord struct {
 type AuditFn func(rec AuditRecord)
 
 // writeAudit writes a structured audit record via charmbracelet/log.
-// Format: time=<UTC> level=<LEVEL> msg=<LABEL> fp=<fingerprint> remote=<IP:port> [reason=<text>]
+// Format: time=<UTC> level=<LEVEL> msg=<LABEL> fp=<fingerprint> remote=<IP:port> [tool=<name>] [reason=<text>]
 // Levels and msg labels per ux-spec §3:
-//   - success → INFO / AUTH
+//   - success (Tool=="") → INFO / AUTH
+//   - success (Tool!="") → INFO / MCP  (SR-36: MCP-layer tool call success)
 //   - fail    → WARN / FAIL
 //   - deny    → WARN / DENY
 //   - rate-limited → WARN / RATE
 //
 // SR-21: this function MUST NOT log any key body, Authorization header value,
 // hash, salt, or private TLS key material.
+// SR-36: tool= is logged ONLY when rec.Tool != "" — non-MCP records are unchanged.
 func writeAudit(logger *clog.Logger, rec AuditRecord) {
 	fp := rec.Fingerprint
 	if fp == "" {
@@ -46,10 +52,22 @@ func writeAudit(logger *clog.Logger, rec AuditRecord) {
 
 	switch rec.Result {
 	case "success":
-		logger.Info("AUTH",
-			"fp", fp,
-			"remote", rec.RemoteAddr,
-		)
+		if rec.Tool != "" {
+			// SR-36: MCP tool call success — emit "MCP" label with tool= field.
+			// result=ok per mcp-spec §2.2 format.
+			logger.Info("MCP",
+				"fp", fp,
+				"remote", rec.RemoteAddr,
+				"tool", rec.Tool,
+				"result", "ok",
+			)
+		} else {
+			// Non-MCP connection success — preserve existing format.
+			logger.Info("AUTH",
+				"fp", fp,
+				"remote", rec.RemoteAddr,
+			)
+		}
 	case "fail":
 		logger.Warn("FAIL",
 			"fp", fp,
@@ -75,4 +93,21 @@ func writeAudit(logger *clog.Logger, rec AuditRecord) {
 			"reason", rec.Reason,
 		)
 	}
+}
+
+// NewAuditFn creates an AuditFn backed by the given logger.
+// Used by both production code (serve.go) and tests.
+// SR-21: the returned function MUST NOT be called with key body, Authorization header,
+// hash, salt, or private TLS key material in any AuditRecord field.
+func NewAuditFn(logger *clog.Logger) AuditFn {
+	return func(rec AuditRecord) {
+		writeAudit(logger, rec)
+	}
+}
+
+// NewAuditFnForTest is an alias for NewAuditFn for use in tests.
+// Kept for backward compatibility with test files.
+// NOT semantically different from NewAuditFn.
+func NewAuditFnForTest(logger *clog.Logger) AuditFn {
+	return NewAuditFn(logger)
 }

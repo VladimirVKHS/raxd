@@ -57,7 +57,7 @@ func TestTLS13EnforcedRawDial(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -97,7 +97,7 @@ func TestSANLocalhostConnection(t *testing.T) {
 	// Allow "localhost" in Host header for this test.
 	cfg.HostAllow = []string{"localhost", "127.0.0.1", "::1"}
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -183,7 +183,7 @@ func TestKeyPemNotRewrittenOnSecondNew(t *testing.T) {
 	var logBuf bytes.Buffer
 
 	// First call — generates cert+key.
-	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf))
+	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("first server.New: %v", err)
 	}
@@ -199,7 +199,7 @@ func TestKeyPemNotRewrittenOnSecondNew(t *testing.T) {
 	}
 
 	// Second call — must not touch key.pem.
-	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf))
+	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("second server.New: %v", err)
 	}
@@ -238,7 +238,7 @@ func TestMalformedAuthorizationFormats(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -317,7 +317,7 @@ func TestAuthFailBodyNoEnumeration(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -409,7 +409,7 @@ func TestNoKeyBodyInLogOnFailPaths(t *testing.T) {
 	cfg.RateLimit = 0.001 // ensure rate-limit triggers quickly
 	cfg.RateBurst = 1
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -475,7 +475,7 @@ func TestAuditFieldsOnAllPaths(t *testing.T) {
 	cfg.RateLimit = 0.001
 	cfg.RateBurst = 1
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -558,7 +558,7 @@ func TestRateLimitRefillAfterPause(t *testing.T) {
 	cfg.RateLimit = 2
 	cfg.RateBurst = 1
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -703,7 +703,7 @@ func TestHealthContentType(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -736,7 +736,7 @@ func TestUnauthHealthReturns401NotFound(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -776,7 +776,7 @@ func TestHostDeniedBeforeAuth(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -837,7 +837,7 @@ func TestAuthSuccessAuditFpNotDash(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -997,7 +997,7 @@ func TestDispatchBodyNotImplemented(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1033,7 +1033,7 @@ func TestGracefulShutdownWithinDeadline(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1091,7 +1091,7 @@ func TestEmptyTLSDirCreatesNewCert(t *testing.T) {
 
 	cfg := newTestConfig(0)
 	var logBuf bytes.Buffer
-	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf))
+	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("AC2/SR-3: server.New on empty TLSDir must succeed; got: %v", err)
 	}
@@ -1129,7 +1129,7 @@ func TestPartialCertStateReturnsError(t *testing.T) {
 
 		cfg := newTestConfig(0)
 		var logBuf bytes.Buffer
-		_, err = server.New(cfg, paths, store, newTestLogger(&logBuf))
+		_, err = server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 		if err == nil {
 			t.Error("AC13/SR-6: cert-only partial state must return error, got nil")
 		}
@@ -1150,7 +1150,7 @@ func TestPartialCertStateReturnsError(t *testing.T) {
 
 		cfg := newTestConfig(0)
 		var logBuf bytes.Buffer
-		_, err = server.New(cfg, paths, store, newTestLogger(&logBuf))
+		_, err = server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 		if err == nil {
 			t.Error("AC13/SR-6: key-only partial state must return error, got nil")
 		}
@@ -1180,7 +1180,7 @@ func TestRateLimitPerIPAndKeyBothApply(t *testing.T) {
 	cfg.RateLimit = 1
 	cfg.RateBurst = 1
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}

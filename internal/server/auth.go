@@ -26,6 +26,16 @@ func fingerprintFromCtx(ctx context.Context) string {
 	return "-"
 }
 
+// FingerprintFromContext is the exported version of fingerprintFromCtx for use
+// by the internal/mcp package (withAudit decorator). Returns the fingerprint
+// stored in ctx by authMiddleware ("-" if not set).
+//
+// SECURITY (SR-35/SR-29): only the fingerprint (non-reversible, 12 hex) is
+// exposed — the key body is never put into context and cannot be extracted here.
+func FingerprintFromContext(ctx context.Context) string {
+	return fingerprintFromCtx(ctx)
+}
+
 // authMiddleware extracts the Bearer token from the Authorization header,
 // verifies it via store.Verify, and stores the fingerprint in the request
 // context for downstream use (audit, rate-limit).
