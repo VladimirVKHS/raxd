@@ -102,10 +102,13 @@ func printStoreError(w io.Writer, err error, op string) {
 			"label is too long (max 64 characters)",
 			"choose a shorter label and try again")
 	case errors.Is(err, keystore.ErrNotFound):
-		printError(w, fmt.Sprintf("%s: key not found", op),
+		// ux-spec: error: key "<id>" not found
+		printError(w, fmt.Sprintf("key %q not found", op),
 			`run "raxd key list" to see available key IDs`)
 	case errors.Is(err, keystore.ErrAlreadyRevoked):
-		printError(w, fmt.Sprintf("%s: key is already revoked", op))
+		// ux-spec: error: key "<id>" is already revoked + hint
+		printError(w, fmt.Sprintf("key %q is already revoked", op),
+			`run "raxd key list" to see active keys`)
 	default:
 		printError(w, fmt.Sprintf("%s: %s", op, err.Error()))
 	}

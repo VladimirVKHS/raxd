@@ -7,6 +7,7 @@ package cli_test
 // All tests run in Docker per SECURITY-BASELINE §6.
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -88,20 +89,26 @@ func TestKeyCreateListDeleteIntegration(t *testing.T) {
 // --- SR-18/CLI: delete non-existent id gives error: + hint: and exit ≠0 ---
 
 // TestKeyDeleteNotFoundCLI verifies that "key delete <nonexistent>" gives exit≠0,
-// "error:" prefix, and a useful "hint:".
+// exact ux-spec error message and hint.
 // SR-18: "неизвестный id → ErrNotFound; exit≠0; сообщение без секрета".
+// ux-spec: error: key "<id>" not found + hint: run "raxd key list" to see available key IDs
 func TestKeyDeleteNotFoundCLI(t *testing.T) {
 	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
-	_, stderr, err := executeCmd("key", "delete", "nonexistent123")
+	const id = "nonexistent123"
+	_, stderr, err := executeCmd("key", "delete", id)
 	if err == nil {
 		t.Error("key delete with nonexistent id must return non-zero exit")
 	}
-	if !strings.Contains(stderr, "error:") {
-		t.Errorf("stderr must contain 'error:'; got=%q", stderr)
+	// ux-spec exact message: error: key "<id>" not found
+	wantMsg := fmt.Sprintf("error: key %q not found", id)
+	if !strings.Contains(stderr, wantMsg) {
+		t.Errorf("stderr must contain %q; got=%q", wantMsg, stderr)
 	}
-	if !strings.Contains(stderr, "hint:") {
-		t.Errorf("stderr must contain 'hint:'; got=%q", stderr)
+	// ux-spec exact hint
+	wantHint := `hint: run "raxd key list" to see available key IDs`
+	if !strings.Contains(stderr, wantHint) {
+		t.Errorf("stderr must contain %q; got=%q", wantHint, stderr)
 	}
 	// Must not contain any secret material.
 	if strings.Contains(stderr, "rax_live_") {
@@ -141,16 +148,20 @@ func TestKeyDeleteAlreadyRevokedCLI(t *testing.T) {
 		t.Fatalf("first key delete must succeed; err=%v", err)
 	}
 
-	// Second delete: must fail with "already revoked" message.
+	// Second delete: must fail with ux-spec exact messages.
 	_, stderr, err := executeCmd("key", "delete", id)
 	if err == nil {
 		t.Error("second key delete must return non-zero exit (already revoked)")
 	}
-	if !strings.Contains(stderr, "already revoked") {
-		t.Errorf("stderr must contain 'already revoked'; got=%q", stderr)
+	// ux-spec exact message: error: key "<id>" is already revoked
+	wantMsg := fmt.Sprintf("error: key %q is already revoked", id)
+	if !strings.Contains(stderr, wantMsg) {
+		t.Errorf("stderr must contain %q; got=%q", wantMsg, stderr)
 	}
-	if !strings.Contains(stderr, "error:") {
-		t.Errorf("stderr must start with 'error:'; got=%q", stderr)
+	// ux-spec exact hint
+	wantHint := `hint: run "raxd key list" to see active keys`
+	if !strings.Contains(stderr, wantHint) {
+		t.Errorf("stderr must contain %q; got=%q", wantHint, stderr)
 	}
 }
 
