@@ -2,6 +2,8 @@ package cli_test
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -282,5 +284,46 @@ func TestKeyListOutputOnStdout(t *testing.T) {
 	// Empty list must contain helpful message on stdout.
 	if !strings.Contains(stdout, "No API keys found") {
 		t.Errorf("empty key list must contain 'No API keys found' on stdout; got=%q", stdout)
+	}
+}
+
+// --- ISSUE-3: wrapped ErrCorrupt produces specific error message in CLI ---
+
+// TestCorruptDBGivesSpecificMessage verifies that a corrupted keys.db produces the
+// canonical "key store is corrupted or unreadable" error message (not a generic one).
+// ISSUE-3: CLI uses errors.Is(err, keystore.ErrCorrupt) to catch wrapped errors.
+func TestCorruptDBGivesSpecificMessage(t *testing.T) {
+	stateDir := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", stateDir)
+
+	// Create the raxd subdirectory and a corrupt keys.db inside it.
+	raxdDir := filepath.Join(stateDir, "raxd")
+	if err := os.MkdirAll(raxdDir, 0o700); err != nil {
+		t.Fatalf("MkdirAll: %v", err)
+	}
+	keysDB := filepath.Join(raxdDir, "keys.db")
+	if err := os.WriteFile(keysDB, []byte("{bad json!!!}"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	cases := [][]string{
+		{"key", "create"},
+		{"key", "list"},
+		{"key", "delete", "someid"},
+	}
+	for _, args := range cases {
+		_, stderr, err := executeCmd(args...)
+		if err == nil {
+			t.Errorf("%v: must return non-zero exit with corrupt db", args)
+			continue
+		}
+		// Must produce the specific corruption message, not a generic Go error.
+		if !strings.Contains(stderr, "corrupted or unreadable") {
+			t.Errorf("%v: stderr must contain 'corrupted or unreadable'; got: %q", args, stderr)
+		}
+		// Must include a hint about file permissions.
+		if !strings.Contains(stderr, "hint:") {
+			t.Errorf("%v: stderr must contain 'hint:' with recovery guidance; got: %q", args, stderr)
+		}
 	}
 }

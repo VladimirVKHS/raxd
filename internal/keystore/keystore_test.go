@@ -405,6 +405,116 @@ func TestMissingFileIsEmptyStore(t *testing.T) {
 	}
 }
 
+// --- ISSUE-2: Fingerprint persisted in Record ---
+
+// TestFingerprintPersistedInRecord verifies that Create stores fingerprint in the returned Record.
+// ISSUE-2: fingerprint must be persisted so delete audit can include it without the plaintext key.
+func TestFingerprintPersistedInRecord(t *testing.T) {
+	store, path := newTestStore(t)
+
+	plain, rec, err := store.Create("fp-persist-test")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	// Fingerprint in returned Record must match Fingerprint(plaintext).
+	expectedFP := keystore.Fingerprint(string(plain))
+	if rec.Fingerprint != expectedFP {
+		t.Errorf("rec.Fingerprint = %q, want %q (Fingerprint(plain))", rec.Fingerprint, expectedFP)
+	}
+	if rec.Fingerprint == "" {
+		t.Error("rec.Fingerprint must not be empty")
+	}
+
+	// Fingerprint must also be present in List() result (persisted to disk).
+	store2, err := keystore.Open(path)
+	if err != nil {
+		t.Fatalf("Open store2: %v", err)
+	}
+	records, err := store2.List()
+	if err != nil {
+		t.Fatalf("List store2: %v", err)
+	}
+	for _, r := range records {
+		if r.ID == rec.ID {
+			if r.Fingerprint != expectedFP {
+				t.Errorf("persisted Fingerprint = %q, want %q", r.Fingerprint, expectedFP)
+			}
+			return
+		}
+	}
+	t.Errorf("record %q not found in store2", rec.ID)
+}
+
+// TestFingerprintNotKeyBody verifies that fingerprint stored in Record is not the key body.
+// SR-15: fingerprint must not allow reconstruction of the key.
+func TestFingerprintNotKeyBody(t *testing.T) {
+	store, _ := newTestStore(t)
+
+	plain, rec, err := store.Create("")
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	body := strings.TrimPrefix(string(plain), "rax_live_")
+	if rec.Fingerprint == string(plain) {
+		t.Error("Fingerprint must not equal the full plaintext key")
+	}
+	if rec.Fingerprint == body {
+		t.Error("Fingerprint must not equal the key body (base64url part)")
+	}
+}
+
+// --- ISSUE-3: errors.Is handles wrapped ErrCorrupt ---
+
+// TestWrappedErrCorruptFromOpen verifies that Open returns an error matching ErrCorrupt
+// via errors.Is even when the error is wrapped (fmt.Errorf("%w", ErrCorrupt)).
+// ISSUE-3: CLI must use errors.Is, not == comparison, for correct behaviour.
+func TestWrappedErrCorruptFromOpen(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.db")
+
+	// Write content that is clearly non-empty but not valid JSON.
+	if err := os.WriteFile(path, []byte("{bad json!!!}"), 0o600); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	_, err := keystore.Open(path)
+	if err == nil {
+		t.Fatal("Open with corrupt JSON must return error")
+	}
+	// errors.Is must match ErrCorrupt even if the error is wrapped.
+	if !errors.Is(err, keystore.ErrCorrupt) {
+		t.Errorf("errors.Is(err, ErrCorrupt) must be true for corrupt file; got %v", err)
+	}
+}
+
+// TestWrappedErrCorruptFromReadDB verifies that readDB (called inside List/Verify/etc.)
+// returns an error matching ErrCorrupt when the file becomes corrupt between Open and List.
+func TestWrappedErrCorruptFromReadDB(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "keys.db")
+
+	// Open succeeds on empty file.
+	store, err := keystore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	// Now corrupt the file after Open.
+	if err := os.WriteFile(path, []byte("not json"), 0o600); err != nil {
+		t.Fatalf("WriteFile corrupt: %v", err)
+	}
+
+	_, err = store.List()
+	if err == nil {
+		t.Fatal("List with corrupt file must return error")
+	}
+	if !errors.Is(err, keystore.ErrCorrupt) {
+		t.Errorf("errors.Is(err, ErrCorrupt) must be true; got %v (type %T)", err, err)
+	}
+}
+
 // --- SR-15: Fingerprint ---
 
 // TestFingerprint verifies fingerprint properties: deterministic, ≤12 chars, != body, != full hash.
