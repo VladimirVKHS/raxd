@@ -23,16 +23,18 @@
 - Фоновый TTL-GC удаляет простаивающие записи; горутина останавливается по контексту Run (SR-18).
 
 ### `internal/server/auth.go`
-Функция `authMiddleware(store, auditFn)`:
+Функции `authMiddleware(store, auditFn)` и `authSuccessAuditMiddleware(auditFn)`:
 - Извлекает Bearer-токен из заголовка `Authorization: Bearer` (AC4, SR-9, SR-12).
 - Нет заголовка / не Bearer / пустой токен → 401 + FAIL-аудит.
 - `store.Verify(token)` → `(_, false, nil)` → 401 + FAIL-аудит (SR-9).
 - `store.Verify(token)` → `error`/`ErrCorrupt` → 403 + DENY-аудит (SR-13).
-- Успех → `fp` и `rec.ID` в контекст запроса + AUTH-аудит (SR-19/SR-20).
+- Успех → `fp` и `rec.ID` в контекст запроса; **[ISSUE-3 fix]** AUTH-аудит НЕ пишется здесь.
+- `authSuccessAuditMiddleware` **[ISSUE-3 new]** — самый внутренний слой (после rate-limit): пишет одну AUTH-запись только когда запрос прошёл все gate'ы. Инвариант: ровно одна аудит-запись на запрос (DENY / FAIL / RATE / AUTH) — без дубля AUTH+RATE при rate-limited valid-key.
 - Никакого самостоятельного сравнения ключей/хэшей (SR-10); только через `keystore.Verify`.
 
 ### `internal/server/middleware.go`
-- `hostOriginMiddleware(hostAllow, originAllow, auditFn)`: Host вне allowlist → 403 + DENY-аудит (SR-19/SR-20); Origin present & вне allowlist → 403 + DENY-аудит; отсутствие Origin → пропуск (SR-14, SR-15, SR-16). Причина отказа не передаётся в тело HTTP-ответа (anti-enumeration, ux-spec §3.5/§3.6).
+- `hostOriginMiddleware(hostAllow, originAllow, auditFn)`: Host вне allowlist → 403 + DENY-аудит (SR-19/SR-20); Origin present & вне allowlist → 403 + DENY-аудит; отсутствие Origin → пропуск (SR-14, SR-15, SR-16). Причина отказа не передаётся в тело HTTP-ответа (anti-enumeration, ux-spec §3.5/§3.6). **[ISSUE-1 fix]** `originAllowed` переписан через `url.Parse(origin).Hostname()` + exact-match (case-insensitive via `contains`). Предыдущий `strings.HasPrefix` допускал subdomain-bypass: Origin `https://localhost.evil.com` проходил allowlist-запись `localhost`. Теперь сравнивается только hostname-часть строго; непарсящийся Origin → 403.
+- `bodyLimitMiddleware(limit int64)`: **[ISSUE-2 new]** оборачивает `r.Body` в `http.MaxBytesReader(w, r.Body, limit)` per-request. Размещён как outermost layer — все обработчики автоматически получают лимит. SR-25 теперь закрыт полностью (заголовки через `MaxHeaderBytes`, тело через `MaxBytesReader`).
 - `recoverMiddleware`: перехват паник → 500, без краша сервера (SR-25, AC13).
 - `rateLimitMiddleware(limiters, auditFn)`: 429 + RATE-аудит при превышении лимита (AC6, SR-17).
 
@@ -54,6 +56,7 @@
 ### `internal/config/config.go`
 Расширение `Config`:
 - Поля: `BindAddr` (дефолт `127.0.0.1`), `RateLimit` (10 req/s), `RateBurst` (20), `OriginAllow`/`HostAllow` (localhost/127.0.0.1/::1), `ReadTimeout`/`ReadHeaderTimeout`/`WriteTimeout`/`IdleTimeout`/`MaxHeaderBytes` (SR-7, SR-15, SR-16, SR-17, SR-25).
+- **[ISSUE-2 new]** Поле `MaxBodyBytes int64` (дефолт 1 MiB = 1 048 576, viper-ключ `max_body_bytes`); используется `bodyLimitMiddleware` в server.go.
 - Валидация `BindAddr` как IP через `net.ParseIP` при загрузке (ux-spec §5.6).
 
 ### `internal/cli/serve.go`
@@ -76,6 +79,26 @@
 
 ### Отклонение 4: сигнатура hostOriginMiddleware расширена (guardian needs-changes)
 Plan.md задаёт сигнатуру без auditFn: `hostOriginMiddleware(hostAllow, originAllow []string)`. Для выполнения SR-19/SR-20 (аудит каждого отказа) сигнатура расширена до `hostOriginMiddleware(hostAllow, originAllow []string, auditFn AuditFn)`. Изменение обосновано нарушением требований безопасности в исходной реализации — устранение замечания ISSUE-1 developer-guardian.
+
+### Правка ISSUE-1 (reviewer needs-changes): строгое сравнение Origin hostname (SR-16)
+
+`originAllowed` переписан: вместо `strings.HasPrefix(o, "https://"+a)` используется
+`url.Parse(origin).Hostname()` + точное совпадение через `contains`. Закрыт bypass:
+`https://localhost.evil.com` больше не проходит allowlist-запись `localhost`.
+Непарсящийся Origin → 403 (трактуется как present&invalid).
+
+### Правка ISSUE-2 (reviewer needs-changes): лимит тела запроса (SR-25)
+
+Добавлены `Config.MaxBodyBytes` (int64, дефолт 1 MiB, viper-ключ `max_body_bytes`)
+и `bodyLimitMiddleware` — оборачивает `r.Body` в `http.MaxBytesReader` per-request.
+Размещён как outermost layer (до recover), все обработчики наследуют лимит автоматически.
+SR-25 закрыт полностью: заголовки ограничены `MaxHeaderBytes`, тело — `MaxBytesReader`.
+
+### Правка ISSUE-3 (reviewer needs-changes): одна аудит-запись на запрос (SR-19)
+
+AUTH-аудит убран из `authMiddleware`. Добавлен `authSuccessAuditMiddleware` как самый
+внутренний слой (после `rateLimitMiddleware`): пишет AUTH только когда запрос прошёл
+все gate'ы. Инвариант: ровно одна запись на запрос (DENY|FAIL|RATE|AUTH), дубля нет.
 
 ### Решение OQ-1 (маршрут в аудит): поле `path` не добавлено
 По ux-spec OQ-1 решено не добавлять — аудит уровня security, не application-лога.
@@ -118,16 +141,16 @@ SR-12: нет ключа в argv/env — code inspection (`serve.go`).
 SR-13: ErrCorrupt → 403 — `TestErrCorruptReturns403` (corrupts keys.db after server.New, sends Bearer token, expects 403 + DENY audit). Уточнение: `TestCorruptCertReturnsError` покрывает SR-6 (corrupt TLS cert), а не SR-13.
 SR-14: Host/Origin перед auth — middleware chain order.
 SR-15: invalid Host → 403 + DENY audit — `TestInvalidHostReturns403` (проверяет статус 403 и наличие "DENY"/"invalid host header" в логе).
-SR-16: invalid Origin → 403 + DENY audit; absent → pass — `TestInvalidOriginReturns403` (проверяет статус 403 и наличие "DENY"/"invalid origin header" в логе), `TestAbsentOriginNotRejected`.
+SR-16: invalid Origin → 403 + DENY audit; absent → pass — `TestInvalidOriginReturns403`, `TestAbsentOriginNotRejected`. **[ISSUE-1]** Строгое совпадение hostname: `TestOriginBypassAttemptRejected` (3 bypass-кейса → 403), `TestInvalidOriginUnparseable` (непарсящийся Origin → 403).
 SR-17: 429 per-key/per-IP — `TestRateLimitPerKeyReturns429`, `TestRateLimitPerIPReturns429`.
 SR-18: mutex + no race — `TestRateLimiterConcurrency` (под `-race`).
-SR-19: audit fields — `TestAuditHasFingerprintField`.
+SR-19: audit fields — `TestAuditHasFingerprintField`. **[ISSUE-3]** Ровно одна запись: `TestSingleAuditRecordOnSuccess` (1 AUTH на success), `TestSingleAuditRecordOnRateLimit` (authCount==successCount, нет AUTH на 429).
 SR-20: FAIL/RATE audit — `TestAuditFailRecorded`, `TestAuditRateRecorded`.
 SR-21: нет секретов в логе — `TestAuditHasNoKeyBody`.
 SR-22: health после auth — `TestValidKeyReachesHealth`, `TestHealthReturnsPoong`.
 SR-23: 501 dispatch — `TestDispatchReturns501`.
 SR-24: Shutdown → FlushUsage, deadline — `TestGracefulShutdown` (дедлайн) + `TestGracefulShutdownOrder` (порядок через SetAfterShutdownHook seam).
-SR-25: таймауты — code inspection (server.go httpSrv fields).
+SR-25: таймауты — code inspection (server.go httpSrv fields). **[ISSUE-2]** Лимит тела — `TestMaxBodyBytesRejected` (body > 16 bytes limit → 413), `TestMaxBodyBytesDefault` (MaxBodyBytes > 0 в дефолтном конфиге).
 SR-26: Docker vendor — CI прогон подтверждён.
 
 ### Команды запуска в Docker
@@ -146,19 +169,27 @@ docker run --rm raxd-test sh -c "go vet ./..."
 ### Результаты Docker (хвост вывода)
 
 ```
-=== RUN   TestTLS13Enforced
---- PASS: TestTLS13Enforced (0.03s)
-=== RUN   TestCertGeneratedWithCorrectPerms
---- PASS: TestCertGeneratedWithCorrectPerms (0.00s)
 ...
-=== RUN   TestAuditRateRecorded
---- PASS: TestAuditRateRecorded (0.04s)
+=== RUN   TestOriginBypassAttemptRejected
+=== RUN   TestOriginBypassAttemptRejected/localhost_prefix_bypass
+--- PASS: TestOriginBypassAttemptRejected/localhost_prefix_bypass (0.00s)
+=== RUN   TestOriginBypassAttemptRejected/127.0.0.1_prefix_bypass
+--- PASS: TestOriginBypassAttemptRejected/127.0.0.1_prefix_bypass (0.00s)
+=== RUN   TestOriginBypassAttemptRejected/::1_prefix_bypass
+--- PASS: TestOriginBypassAttemptRejected/::1_prefix_bypass (0.00s)
+--- PASS: TestOriginBypassAttemptRejected (0.03s)
+=== RUN   TestSingleAuditRecordOnSuccess
+--- PASS: TestSingleAuditRecordOnSuccess (0.03s)
+=== RUN   TestSingleAuditRecordOnRateLimit
+--- PASS: TestSingleAuditRecordOnRateLimit (0.03s)
+=== RUN   TestMaxBodyBytesRejected
+--- PASS: TestMaxBodyBytesRejected (0.00s)
 PASS
-ok  github.com/vladimirvkhs/raxd/internal/server  0.647s (go test -v)
-ok  github.com/vladimirvkhs/raxd/internal/server  1.899s (CGO_ENABLED=1 -race)
+ok  github.com/vladimirvkhs/raxd/internal/server  2.237s (go test -v)
+ok  github.com/vladimirvkhs/raxd/internal/server  3.948s (CGO_ENABLED=1 -race)
 ```
 
-Все 28 тестов server (добавлены TestErrCorruptReturns403, TestGracefulShutdownOrder + расширены TestInvalidHostReturns403/TestInvalidOriginReturns403) + 50+ cli/config/keystore/banner/version тестов PASS.
+Все 37 тестов server (добавлены по reviewer needs-changes: TestOriginBypassAttemptRejected, TestInvalidOriginUnparseable, TestMaxBodyBytesRejected, TestMaxBodyBytesDefault, TestSingleAuditRecordOnSuccess, TestSingleAuditRecordOnRateLimit + исходные 28 + QA) + 50+ cli/config/keystore/banner/version тестов PASS.
 Нет `t.Skip`, нет закомментированных проверок.
 
 ## Безопасность
@@ -176,6 +207,7 @@ ok  github.com/vladimirvkhs/raxd/internal/server  1.899s (CGO_ENABLED=1 -race)
 | Rate limiting per-key/per-IP | `ratelimit.go`: `Limiters.Allow(fp, ip)` |
 | Graceful shutdown | `server.go`: `Run` → ctx cancel → `Shutdown` → `FlushUsage` |
 | Таймауты (Slowloris) | `server.go`: `ReadTimeout`, `ReadHeaderTimeout`, `WriteTimeout`, `IdleTimeout` |
+| Лимит тела (Slowloris) | `middleware.go`: `bodyLimitMiddleware` → `http.MaxBytesReader`; `config.go`: `MaxBodyBytes` (дефолт 1 MiB) |
 | TLS 1.3 minimum | `server.go`: `buildTLSConfig` → `MinVersion: tls.VersionTLS13` |
 | Нет CipherSuites в TLS 1.3 | `server.go`: `buildTLSConfig` не задаёт `CipherSuites` |
 | Сборка/тесты только в Docker | Все тесты прогнаны в Docker, raxd на хосте не запускался |

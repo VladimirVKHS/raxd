@@ -128,15 +128,21 @@ docker run --rm raxd-test sh -c "go test -mod=vendor -count=1 ./..."
 | SR-14 | Host/Origin до auth: невалидный Host без auth → 403 не 401 | `server_qa_test.go::TestHostDeniedBeforeAuth` | PASS |
 | SR-15 | Недопустимый Host → 403 + DENY-аудит | `TestInvalidHostReturns403` | PASS |
 | SR-16 | Недопустимый Origin → 403; нет Origin → пропуск | `TestInvalidOriginReturns403`, `TestAbsentOriginNotRejected` | PASS |
+| SR-16 | Строгое сравнение host (bypass через HasPrefix закрыт) | `TestOriginBypassAttemptRejected` (3 подтеста: localhost.evil.com, 127.0.0.1.evil.com, ::1.evil.com → 403) | PASS |
+| SR-16 | Непарсящийся Origin → 403 (трактуется как present&invalid) | `TestInvalidOriginUnparseable` | PASS |
 | SR-17 | Rate-limit per-key и per-IP, 429 | `TestRateLimitPerKeyReturns429`, `TestRateLimitPerIPReturns429`, `TestRateLimitRefillAfterPause` | PASS |
 | SR-18 | Mutex, нет гонок, TTL-GC | `TestRateLimiterConcurrency` (-race), `TestRateLimiterGCRemovesIdleEntries` | PASS |
 | SR-19 | Аудит на каждом пути: fp/remote/result | `TestAuditHasFingerprintField`, `TestAuditFieldsOnAllPaths` | PASS |
+| SR-19 | Ровно одна аудит-запись на success-запрос | `TestSingleAuditRecordOnSuccess` (authCount==1) | PASS |
+| SR-19 | Ровно одна аудит-запись на rate-limited запрос (только RATE, не AUTH+RATE) | `TestSingleAuditRecordOnRateLimit` (authCount==successCount) | PASS |
 | SR-20 | FAIL/RATE обязательно логируются | `TestAuditFailRecorded`, `TestAuditRateRecorded` | PASS |
 | SR-21 | Нет секретов в логах (ВСЕ пути) | `TestAuditHasNoKeyBody`, `TestNoKeyBodyInLogOnFailPaths` | PASS |
 | SR-22 | /healthz только после auth → pong | `TestValidKeyReachesHealth`, `TestHealthReturnsPoong` | PASS |
 | SR-23 | Dispatch 501 без побочных эффектов | `TestDispatchReturns501`, `TestDispatchBodyNotImplemented` | PASS |
 | SR-24 | Shutdown → FlushUsage, дедлайн | `TestGracefulShutdown`, `TestGracefulShutdownOrder`, `TestGracefulShutdownWithinDeadline` | PASS |
 | SR-25 | Таймауты заданы (Slowloris) | инспекция `server.go::New` (ReadTimeout и др. заданы) | PASS |
+| SR-25 | Лимит тела: MaxBytesReader применяется per-request | `TestMaxBodyBytesRejected` (unit через BodyLimitMiddlewareForTest: body>limit → 413) | PASS |
+| SR-25 | MaxBodyBytes по умолчанию > 0 в Config | `TestMaxBodyBytesDefault` | PASS |
 | SR-26 | Docker, vendor, offline | `docker run --rm raxd-test` весь прогон | PASS |
 
 ---
@@ -188,6 +194,16 @@ docker run --rm raxd-test sh -c "go test -mod=vendor -count=1 ./..."
 - **Graceful shutdown** завершается в пределах 5s дедлайна.
 - **Порядок Shutdown → FlushUsage** через test seam `SetAfterShutdownHook`.
 - **Занятый порт** → ErrPortInUse, понятное сообщение.
+
+---
+
+## Правки по замечаниям reviewer (needs-changes)
+
+| ISSUE | Дефект | Что изменено | Тест |
+|---|---|---|---|
+| ISSUE-1 | SR-16: originAllowed использовала HasPrefix → обход subdomain-prefix | `originAllowed` переписан через `url.Parse`+`u.Hostname()` + exact-match | `TestOriginBypassAttemptRejected`, `TestInvalidOriginUnparseable` |
+| ISSUE-2 | SR-25: лимит тела отсутствовал (только MaxHeaderBytes) | `bodyLimitMiddleware` + `Config.MaxBodyBytes` (дефолт 1 MiB) | `TestMaxBodyBytesRejected`, `TestMaxBodyBytesDefault` |
+| ISSUE-3 | SR-19: двойная аудит-запись AUTH+RATE при valid-key rate-limit | AUTH убран из `authMiddleware`; добавлен `authSuccessAuditMiddleware` после rate-limit | `TestSingleAuditRecordOnSuccess`, `TestSingleAuditRecordOnRateLimit` |
 
 ---
 
