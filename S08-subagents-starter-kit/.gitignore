@@ -1,0 +1,16 @@
+# Минимальный .gitignore для стартер-кита.
+# Добавь свои языкоспецифичные исключения (node_modules/, __pycache__/, target/) поверх.
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local env / secrets
+.env
+.env.local
