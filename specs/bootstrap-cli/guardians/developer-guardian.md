@@ -28,6 +28,24 @@
 - Git-flow: feature/bootstrap-cli от develop, 9 атомарных Conventional Commits, без деструктивных операций.
 - Сборка/тесты — docker-команды (baseline §6), 20 тестов pass.
 
-## Verdict
+## Verdict (раунд 1)
 needs-changes
 (MUST: Issue 1, 2; ЭСКАЛАЦИЯ: Issue 3. INFO: 4, 5 — желательно закрыть.)
+
+---
+
+## Повторная проверка (rev.2)
+
+Все три обязательных исправления выполнены корректно:
+- Issue 1: `config.GetPaths()`→`config.Paths()` сквозь (paths.go, root.go, status.go, тесты, impl-notes). Тип структуры переименован `Paths`→`PathSet` (Go запрещает функцию и тип с одним именем в пакете — объективное ограничение, не выбор; контракт «функция Paths() + структура путей» выполнен; задокументировано).
+- Issue 2: `EnsureDirs` оборачивает сам `err` (`%w`), первопричина сохраняется; импорт errors удалён.
+- Issue 5: `t.Skip` убран; `TestPathsDefault` детерминирован через `t.Setenv("HOME", t.TempDir())`.
+- Issue 3 (adrg/xdg): закрыт architect (plan.md) + STACK синхронизирован дирижёром.
+- Issue 4 (формат version): закрыт cli-ux (ux-spec).
+
+Docker: go vet чисто, go build OK, go test 20/20 PASS, 0 SKIP. Посторонних правок нет.
+
+Рекомендация (не блокер, выполнено дирижёром через architect): синхронизировать `plan.md` до `config.Paths() (PathSet, error)`.
+
+## Verdict (финал)
+pass

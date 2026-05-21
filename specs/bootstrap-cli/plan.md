@@ -31,10 +31,10 @@ TLS/ключи/exec/MCP присутствуют только как TODO-гра
 - `cli.Execute() error` — строит root, исполняет; возвращает ошибку команды (nil → exit 0, иначе exit 1).
 - `cli.NewRootCmd() *cobra.Command` — собирает дерево; `SilenceUsage/SilenceErrors=true` (контроль вывода в main).
 - `newStub(name string) func(*cobra.Command, []string) error` — RunE, всегда возвращает `fmt.Errorf("%s: not implemented yet", name)` (обёртка `errNotImplemented`); cobra → exit ≠0.
-- `config.Paths() (Paths, error)` — `Paths{ConfigDir, ConfigFile, StateDir, KeysDB, TLSDir string}`;
+- `config.Paths() (PathSet, error)` — `PathSet{ConfigDir, ConfigFile, StateDir, KeysDB, TLSDir string}`;
   `ConfigDir = XDG_CONFIG_HOME/raxd` если переменная задана, иначе `$HOME/.config/raxd`; state — аналогично через `XDG_STATE_HOME`/`$HOME/.local/state`. Ошибка только при недоступном `$HOME`.
 - `config.Load() (*Config, error)` — viper читает `config.yaml`; отсутствие файла НЕ ошибка (дефолты, в т.ч. `Port`); ошибка только при битом YAML.
-- `config.EnsureDirs(p Paths) error` — создаёт ConfigDir/StateDir/TLSDir с `0700` (idempotent, `MkdirAll`); файлы, когда появятся, — `0600`. Ошибка → пробрасывается вызывающему.
+- `config.EnsureDirs(p PathSet) error` — создаёт ConfigDir/StateDir/TLSDir с `0700` (idempotent, `MkdirAll`); файлы, когда появятся, — `0600`. Ошибка → пробрасывается вызывающему.
 - `banner.Render() string` — многострочный plain-текст: название `raxd`, краткое описание, строка автора `Vladimir Kovalev, OEM TECH`. Вызывается в `PersistentPreRun` root (на stderr, чтобы не мешать машиночитаемому stdout).
 - `status` Run: печатает `state: not running`, `config: <ConfigFile>`, `keys: <KeysDB>`, `tls: <TLSDir>`; exit 0. Формат — выровненные `key: value` строки (визуал/таблицы — за cli-ux).
 - Точки расширения (TODO-границы, без реализации): `Config` несёт поля путей для будущих `internal/keystore`, `internal/tls`, `internal/server`; интерфейсы этих пакетов вводят соответствующие task-id.
