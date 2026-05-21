@@ -256,3 +256,68 @@ func TestStatusStateNotRunning(t *testing.T) {
 		t.Errorf("status stdout must contain 'not running'; got:\n%s", stdout)
 	}
 }
+
+// ============================================================================
+// D-1 / ux-spec §5: startup block must NOT appear on bind error
+// ============================================================================
+
+// TestServePortInUseNoStartupBlock verifies ux-spec §5: when the port is already in use,
+// the startup block ("listening", "cert", "tls", "press Ctrl+C") must NOT be printed.
+// Only "error:" and "hint:" must appear on stderr, and the command must exit non-zero.
+// Regression: previously serve.go printed the startup block BEFORE srv.Run(), so a bind
+// error still showed "listening on https://..." — a false positive (D-1).
+func TestServePortInUseNoStartupBlock(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	// Occupy port 7822 so serve fails fast at bind.
+	ln, err := net.Listen("tcp", "127.0.0.1:7822")
+	if err != nil {
+		t.Skip("port 7822 unavailable for test setup")
+	}
+	defer ln.Close()
+
+	_, stderr, cmdErr := executeCmd("serve")
+
+	// Command must exit non-zero (bind error → exit 1).
+	if cmdErr == nil {
+		t.Error("D-1/ux-spec §5: serve with occupied port must exit non-zero, got nil error")
+	}
+
+	// "listening" must NOT appear — the server never bound.
+	if strings.Contains(stderr, "listening") {
+		t.Errorf("D-1/ux-spec §5: startup block 'listening' must not appear on bind error; stderr=%q", stderr)
+	}
+
+	// "press Ctrl+C" must NOT appear.
+	if strings.Contains(stderr, "press Ctrl+C") {
+		t.Errorf("D-1/ux-spec §5: startup block 'press Ctrl+C' must not appear on bind error; stderr=%q", stderr)
+	}
+
+	// "error:" must appear on stderr (ux-spec §5.1).
+	if !strings.Contains(stderr, "error:") {
+		t.Errorf("D-1/ux-spec §5: 'error:' must appear on bind error; stderr=%q", stderr)
+	}
+}
+
+// TestServePortInUseNoShutdownBlock verifies ux-spec §5: when the port is already in use,
+// the shutdown block ("shutting down", "draining", "flushing", "stopped") must NOT appear.
+// The server never started, so there is nothing to shut down.
+func TestServePortInUseNoShutdownBlock(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	ln, err := net.Listen("tcp", "127.0.0.1:7822")
+	if err != nil {
+		t.Skip("port 7822 unavailable for test setup")
+	}
+	defer ln.Close()
+
+	_, stderr, _ := executeCmd("serve")
+
+	shutdownPhrases := []string{"shutting down", "draining", "flushing", "stopped"}
+	for _, phrase := range shutdownPhrases {
+		if strings.Contains(stderr, phrase) {
+			t.Errorf("D-1/ux-spec §5: shutdown block phrase %q must not appear on bind error; stderr=%q",
+				phrase, stderr)
+		}
+	}
+}

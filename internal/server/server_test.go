@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1475,5 +1476,119 @@ func TestGracefulShutdownOrder(t *testing.T) {
 	// The hook must have been called (meaning Shutdown completed before FlushUsage).
 	if shutdownReturnedAt == 0 {
 		t.Error("SR-24: afterShutdownHook was never called — Shutdown may not have run")
+	}
+}
+
+// ============================================================================
+// D-1 / ux-spec §5: OnListen hook fires AFTER successful bind, not on error
+// ============================================================================
+
+// TestOnListenHookCalledOnSuccessfulBind verifies that SetOnListen hook is
+// called after the server successfully binds the port (the seam serve.go uses
+// to defer the startup block until after the real listener is up).
+//
+// Uses sync/atomic to access hookCalled across goroutines without data race.
+func TestOnListenHookCalledOnSuccessfulBind(t *testing.T) {
+	paths := newTestPaths(t)
+	store, err := keystore.Open(paths.KeysDB)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	port := freePort(t)
+	cfg := newTestConfig(port)
+	var logBuf bytes.Buffer
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+
+	// Use atomic flag to avoid data race: hook fires in Run's goroutine,
+	// polling loop reads from the test goroutine.
+	var hookCalled int32 // 0 = not called, 1 = called
+	var hookAddr string
+	var hookAddrMu sync.Mutex
+	srv.SetOnListen(func(addr string) {
+		hookAddrMu.Lock()
+		hookAddr = addr
+		hookAddrMu.Unlock()
+		atomic.StoreInt32(&hookCalled, 1)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- srv.Run(ctx)
+	}()
+
+	// Wait for hook to be called (server is up).
+	deadline := time.Now().Add(3 * time.Second)
+	for atomic.LoadInt32(&hookCalled) == 0 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-runDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("D-1: Run did not return after cancel")
+	}
+
+	if atomic.LoadInt32(&hookCalled) == 0 {
+		t.Error("D-1/ux-spec §5: SetOnListen hook was not called on successful bind")
+	}
+	hookAddrMu.Lock()
+	addr := hookAddr
+	hookAddrMu.Unlock()
+	if addr == "" {
+		t.Error("D-1: OnListen hook received empty addr")
+	}
+}
+
+// TestOnListenHookNotCalledOnPortInUse verifies that when the port is already in
+// use, Run returns an error WITHOUT calling the OnListen hook.
+// This is the core D-1 invariant: serve.go only prints the startup block
+// when the hook fires, so it will never print "listening" on bind failure.
+//
+// Run is called synchronously here (no goroutine), so no data race risk.
+func TestOnListenHookNotCalledOnPortInUse(t *testing.T) {
+	paths := newTestPaths(t)
+	store, err := keystore.Open(paths.KeysDB)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	// Block the port.
+	blocker, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen blocker: %v", err)
+	}
+	defer blocker.Close()
+	port := blocker.Addr().(*net.TCPAddr).Port
+
+	cfg := newTestConfig(port)
+	var logBuf bytes.Buffer
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+
+	// Run is called synchronously below; no cross-goroutine sharing needed.
+	hookCalled := false
+	srv.SetOnListen(func(_ string) {
+		hookCalled = true
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	runErr := srv.Run(ctx)
+	if runErr == nil {
+		t.Fatal("D-1: expected error for port-in-use, got nil")
+	}
+
+	if hookCalled {
+		t.Error("D-1/ux-spec §5: OnListen hook must NOT be called when bind fails; " +
+			"serve.go would have printed false 'listening' startup block")
 	}
 }

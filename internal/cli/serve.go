@@ -86,34 +86,37 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	// Print startup block (ux-spec.md §1/§2).
+	// Register OnListen hook: prints the startup block ONLY after the TCP listener
+	// is successfully bound. This satisfies ux-spec §5 (D-1): if bind fails, Run
+	// returns an error without ever calling this hook, so no startup block is printed.
 	ci := srv.GetCertInfo()
-	printStartBlock(stderr, ci, cfg)
-
-	// Check whether there are any active keys; warn if none (ux-spec §5.7).
 	keys, listErr := ks.List()
-	if listErr == nil && len(keys) == 0 {
-		fmt.Fprintf(stderr, "  warning   no API keys found — all connections will be rejected\n")
-		fmt.Fprintf(stderr, "  hint      create a key with \"raxd key create --name <label>\"\n")
-	}
-	fmt.Fprintf(stderr, "  press Ctrl+C to stop\n")
-	fmt.Fprintln(stderr)
+	noKeys := listErr == nil && len(keys) == 0
+	started := false // true if onListen fired (used to gate the shutdown block)
+	srv.SetOnListen(func(_ string) {
+		started = true
+		// Print startup block (ux-spec.md §1/§2).
+		printStartBlock(stderr, ci, cfg)
+		// Warn if no active keys (ux-spec §5.7).
+		if noKeys {
+			fmt.Fprintf(stderr, "  warning   no API keys found — all connections will be rejected\n")
+			fmt.Fprintf(stderr, "  hint      create a key with \"raxd key create --name <label>\"\n")
+		}
+		fmt.Fprintf(stderr, "  press Ctrl+C to stop\n")
+		fmt.Fprintln(stderr)
+	})
 
 	// Setup graceful shutdown via signal (AC12, SR-24).
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// Run server — blocks until ctx is cancelled.
+	// Run server — blocks until ctx is cancelled or a fatal error occurs.
+	// onListen fires inside Run, after successful bind, before Serve.
 	runErr := srv.Run(ctx)
 
-	// Print shutdown block (ux-spec.md §4).
-	fmt.Fprintf(stderr, "  shutting down  signal received\n")
-	fmt.Fprintf(stderr, "  draining       waiting for active connections to finish\n")
-	fmt.Fprintf(stderr, "  flushing       usage data flushed\n")
-	fmt.Fprintf(stderr, "  stopped\n")
-	fmt.Fprintln(stderr)
-
 	if runErr != nil {
+		// Bind / startup error: no startup block was printed (started == false),
+		// so no shutdown block either. Print error+hint per ux-spec §5.
 		if errors.Is(runErr, server.ErrPortInUse) || strings.Contains(runErr.Error(), "address already in use") {
 			addr := fmt.Sprintf("%s:%d", cfg.BindAddr, cfg.Port)
 			fmt.Fprintf(stderr, "error: cannot bind to %s: address already in use\n", addr)
@@ -122,6 +125,16 @@ func runServe(cmd *cobra.Command, _ []string) error {
 			fmt.Fprintf(stderr, "error: %s\n", runErr)
 		}
 		return runErr
+	}
+
+	// Server started and completed graceful shutdown (started == true).
+	// Print shutdown block only if we actually started (ux-spec §4).
+	if started {
+		fmt.Fprintf(stderr, "  shutting down  signal received\n")
+		fmt.Fprintf(stderr, "  draining       waiting for active connections to finish\n")
+		fmt.Fprintf(stderr, "  flushing       usage data flushed\n")
+		fmt.Fprintf(stderr, "  stopped\n")
+		fmt.Fprintln(stderr)
 	}
 
 	return nil

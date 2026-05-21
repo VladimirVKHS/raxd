@@ -34,6 +34,12 @@ type Server struct {
 	logger     *clog.Logger
 	certInfo   CertInfo
 
+	// onListen is called once, immediately after the TCP listener is successfully
+	// created and before Serve begins. The addr argument is the actual bound address.
+	// Used by serve.go to defer the startup block until the port is really bound.
+	// Nil means no hook. Must not be called when Run returns an error before listen.
+	onListen func(addr string)
+
 	// afterShutdownHook is called immediately after http.Server.Shutdown returns,
 	// before store.FlushUsage(). Nil in production; set by tests to verify SR-24 order.
 	afterShutdownHook func()
@@ -133,6 +139,17 @@ func (s *Server) GetCertInfo() CertInfo {
 	return s.certInfo
 }
 
+// SetOnListen registers a function to be called once, immediately after the TCP
+// listener is successfully bound and before the server starts accepting connections.
+// The addr argument is the actual bound address (e.g. "127.0.0.1:7822").
+//
+// This is the seam used by serve.go to print the startup block only after a
+// successful bind — satisfying ux-spec §5 (no startup block on bind error).
+// Must be set before calling Run. Safe to leave nil (no-op).
+func (s *Server) SetOnListen(fn func(addr string)) {
+	s.onListen = fn
+}
+
 // SetAfterShutdownHook registers a function to be called immediately after
 // http.Server.Shutdown returns and before store.FlushUsage().
 // This is a test seam for verifying SR-24 ordering; must not be called in production code.
@@ -168,6 +185,13 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// Wrap in TLS.
 	tlsLn := tls.NewListener(ln, s.httpServer.TLSConfig)
+
+	// Fire onListen hook AFTER successful bind, BEFORE Serve.
+	// serve.go uses this to print the startup block only when the port is actually bound.
+	// Satisfies ux-spec §5: no startup block on bind error (D-1).
+	if s.onListen != nil {
+		s.onListen(ln.Addr().String())
+	}
 
 	// Serve in a goroutine; wait for ctx cancellation.
 	serveErr := make(chan error, 1)
