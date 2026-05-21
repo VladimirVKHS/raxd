@@ -19,8 +19,11 @@ plan.md, impl-notes.md. Автор продукта: Vladimir Kovalev, OEM TECH.
   net.Listen вне server, CipherSuites в tls.Config, ключей в argv/env).
 - **Race-тесты** — `CGO_ENABLED=1 go test -race ./internal/server/...`: покрывают SR-18
   (конкурентность rate-limiter), а также все остальные тесты в режиме детектора гонок.
-- **Install-flow** — вне scope tls-transport (задача `distribution`); install.sh не существует.
-  AC14 требует только Docker + vendor — проверяется CI/docker run.
+- **Install-flow** — **вне scope задачи `tls-transport`**. Spec.md явно выносит install.sh
+  и goreleaser в отдельную задачу `distribution` (раздел «Out of Scope»: install script,
+  release pipeline). Решение дирижёра зафиксировано: install-flow тестируется в задаче
+  `distribution`. В рамках `tls-transport` AC14 требует только Docker + vendor — проверяется
+  командами `docker run --rm raxd-test`.
 
 Все тесты прогоняются **только в Docker**, офлайн из `vendor/`. На хосте тесты не
 запускаются (SECURITY-BASELINE §6).
@@ -121,7 +124,8 @@ docker run --rm raxd-test sh -c "go test -mod=vendor -count=1 ./..."
 | SR-11 | Отзыв мгновенный | `TestRevokedKeyReturns401` | PASS |
 | SR-12 | Ключ не в argv/env | `TestStaticServeNoKeyFromArgvOrEnv` (grep serve.go) | PASS |
 | SR-13 | Anti-enumeration: тело 401/403 без причины | `TestAuthFailBodyNoEnumeration` | PASS |
-| SR-14 | Host/Origin до auth в цепочке | инспекция порядка `server.go::New` | PASS |
+| SR-14 | Host/Origin до auth в цепочке | `server_qa_test.go::TestHostDeniedBeforeAuth` | PASS |
+| SR-14 | Host/Origin до auth: невалидный Host без auth → 403 не 401 | `server_qa_test.go::TestHostDeniedBeforeAuth` | PASS |
 | SR-15 | Недопустимый Host → 403 + DENY-аудит | `TestInvalidHostReturns403` | PASS |
 | SR-16 | Недопустимый Origin → 403; нет Origin → пропуск | `TestInvalidOriginReturns403`, `TestAbsentOriginNotRejected` | PASS |
 | SR-17 | Rate-limit per-key и per-IP, 429 | `TestRateLimitPerKeyReturns429`, `TestRateLimitPerIPReturns429`, `TestRateLimitRefillAfterPause` | PASS |
@@ -216,13 +220,24 @@ docker run --rm raxd-test sh -c "go test -mod=vendor -count=1 ./..."
 
 ## Найденные баги в продуктовом коде
 
-Баги в продуктовом коде не обнаружены. Все 57 тестов (`server_test.go`: 28 + `server_qa_test.go`:
-29) зелёные в Docker с `-mod=vendor`, `go vet` чист, `-race` чист.
+Баги в продуктовом коде не обнаружены. Все тесты зелёные в Docker с `-mod=vendor`,
+`go vet` чист, `-race` чист.
 
 > **Примечание по `TestRateLimitIsolationBetweenKeys`** (первоначальная версия QA-теста):
 > Тест предполагал, что ключ B на том же IP не получит 429 после исчерпания бюджета ключа A.
 > Это неверная семантика: per-IP лимитер срабатывает независимо от ключа. Поведение корректно
 > по spec (SR-17: per-key И per-IP). Тест исправлен — переписан как `TestRateLimitPerKeyBudgetsAreIndependent`.
+
+> **Правки по qa-guardian (needs-changes, раунд 2):**
+> Issue 1: `t.Skip` в `TestRateLimitRefillAfterPause` удалён → заменён на `t.Fatal` с диагностикой.
+> Issue 2: `TestRateLimitPerKeyBudgetsAreIndependent` переписан как unit-тест через `server.NewLimiters`
+> с разными IP для A/B; добавлены строгие `t.Fatal` при нарушении инварианта изоляции.
+> Issue 3: добавлен `TestHostDeniedBeforeAuth` (SR-14): невалидный Host/Origin без auth → 403, не 401;
+> матрица SR-14 обновлена с «инспекция порядка» на реальный тест.
+> Issue 4: RATE-ветка в `TestAuditFieldsOnAllPaths` усилена: строгий `t.Fatalf` при отсутствии 429
+> и отсутствии RATE в логе.
+> Issue 5: добавлена явная ссылка на Out of Scope spec.md и решение дирижёра об install-flow.
+> Issue 6: мягкий `t.Logf`+`return` в `TestSANLocalhostConnection` заменён на `t.Fatalf`.
 
 ---
 

@@ -154,9 +154,11 @@ func TestSANLocalhostConnection(t *testing.T) {
 
 	resp, err := localhostClient.Do(req)
 	if err != nil {
-		// TLS error here means SAN doesn't include localhost — that's a bug worth noting.
-		t.Logf("SR-3: TLS connection via localhost failed (expected if loopback routing absent): %v", err)
-		return
+		// In Docker (and on any loopback-capable host) "localhost" resolves to 127.0.0.1,
+		// which is exactly where the server listens. A TLS error here means the cert SAN
+		// does not include "localhost" — that is a real SR-3 violation, not an env issue.
+		t.Fatalf("SR-3: TLS connection via localhost failed — cert SAN must include 'localhost' "+
+			"so that loopback TLS handshake succeeds; error: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
@@ -510,15 +512,26 @@ func TestAuditFieldsOnAllPaths(t *testing.T) {
 	checkFields(t, "DENY")
 	logBuf.Reset()
 
-	// RATE path — exhaust burst.
-	for i := 0; i < 10; i++ {
+	// RATE path — with burst=1 and rate=0.001, the first request consumes the
+	// single token. Every subsequent rapid request must trigger 429 + RATE audit.
+	// We send 5 requests; at least one must be rate-limited.
+	got429Rate := false
+	for i := 0; i < 5; i++ {
 		resp = get(t, client, baseURL(port)+"/healthz", string(plain), nil)
 		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			got429Rate = true
+		}
 	}
-	if !strings.Contains(logBuf.String(), "RATE") {
-		t.Logf("note: RATE may not have triggered with current limiter state; log=%s", logBuf.String())
+	if !got429Rate {
+		t.Fatalf("AC8/SR-19: RATE path: expected at least one 429 with burst=1 rate=0.001 "+
+			"(5 rapid requests) — rate limiter is not enforcing the limit; log=%s", logBuf.String())
 	}
-	checkFields(t, "RATE-or-AUTH")
+	rateLog := logBuf.String()
+	if !strings.Contains(rateLog, "RATE") {
+		t.Fatalf("AC8/SR-19: RATE audit entry missing after 429 was triggered; log=%s", rateLog)
+	}
+	checkFields(t, "RATE")
 }
 
 // ============================================================================
@@ -554,7 +567,9 @@ func TestRateLimitRefillAfterPause(t *testing.T) {
 
 	url := baseURL(port) + "/healthz"
 
-	// Exhaust burst.
+	// Exhaust burst: burst=1 means the first request consumes the single token.
+	// The second rapid request must receive 429. We send up to 5 to be robust against
+	// scheduling jitter, but 429 MUST appear — if it does not, the limiter is broken.
 	got429 := false
 	for i := 0; i < 5; i++ {
 		resp := get(t, client, url, string(plain), nil)
@@ -565,17 +580,22 @@ func TestRateLimitRefillAfterPause(t *testing.T) {
 		}
 	}
 	if !got429 {
-		t.Skip("could not exhaust rate limit to verify refill; skipping refill check")
+		// burst=1 and rate=2 mean we MUST see 429 within 5 rapid requests.
+		// Failing here is a real product bug, not a test infrastructure issue.
+		t.Fatal("AC6/SR-17: could not exhaust per-key rate limit (burst=1, rate=2, 5 attempts): " +
+			"expected 429 before refill — token bucket is not enforcing the limit")
 	}
 
-	// Wait for token bucket to refill (at 2 req/s, 1 token arrives in ~500ms).
+	// Wait for token bucket to refill: at 2 req/s one token arrives every ~500ms.
+	// We wait 700ms for headroom against scheduling jitter.
 	time.Sleep(700 * time.Millisecond)
 
 	// After refill, must be able to make at least one successful request.
 	resp := get(t, client, url, string(plain), nil)
 	defer resp.Body.Close()
 	if resp.StatusCode == http.StatusTooManyRequests {
-		t.Error("AC6/SR-17: rate-limit did not refill after pause (token bucket should restore tokens)")
+		t.Errorf("AC6/SR-17: rate-limit did not refill after 700ms pause "+
+			"(rate=2 req/s, burst=1 — one token must have been restored); got 429")
 	}
 }
 
@@ -583,84 +603,43 @@ func TestRateLimitRefillAfterPause(t *testing.T) {
 // AC6/SR-17: different keys do not share rate-limit budgets
 // ============================================================================
 
-// TestRateLimitPerKeyBudgetsAreIndependent verifies that per-key rate-limit
-// budgets are independent: consuming tokens for key A does not reduce tokens
-// for key B's per-key limiter.
+// TestRateLimitPerKeyBudgetsAreIndependent verifies the isolation invariant:
+// exhausting the per-key token budget for key A must NOT reduce key B's budget.
 //
-// The test uses a large per-IP burst (so IP-level limit is not the bottleneck)
-// and a small per-key burst, sending requests with each key in alternation and
-// verifying that both keys eventually get 429 only when their own per-key
-// budgets are exhausted, not when the other key's budget runs out.
+// Strategy (unit-level via server.NewLimiters):
+//   - burst=1, rate=0.001 (effectively no refill during the test)
+//   - key A uses IP "1.2.3.4", key B uses IP "5.6.7.8" (different IPs → separate per-IP limiters)
+//   - Allow("fp-a", "1.2.3.4") → true  (key_A: 1→0, ip1: 1→0)
+//   - Allow("fp-a", "1.2.3.4") → false (key_A: 0, ip1 not touched by Allow's early-exit)
+//   - Allow("fp-b", "5.6.7.8") → true  (key_B is a fresh limiter: 1→0, ip2: 1→0)
+//
+// The invariant: after A is exhausted, B's first Allow still returns true.
+// This proves per-key limiters are independent maps, not a shared budget.
 func TestRateLimitPerKeyBudgetsAreIndependent(t *testing.T) {
-	paths := newTestPaths(t)
-	store, err := keystore.Open(paths.KeysDB)
-	if err != nil {
-		t.Fatalf("open store: %v", err)
-	}
-	plainA, _, err := store.Create("isolation-key-a")
-	if err != nil {
-		t.Fatalf("create key A: %v", err)
-	}
-	plainB, _, err := store.Create("isolation-key-b")
-	if err != nil {
-		t.Fatalf("create key B: %v", err)
+	// Use a near-zero rate so no refill can happen during rapid calls.
+	lim := server.NewLimiters(0.001, 1, 5*time.Minute)
+
+	// Step 1: consume key A's single token.
+	if !lim.Allow("fp-key-a", "1.2.3.4") {
+		t.Fatal("AC6/SR-17: first Allow for key A must succeed (fresh burst=1 limiter)")
 	}
 
-	port := freePort(t)
-	cfg := newTestConfig(port)
-	// Large per-key and per-IP burst to first prime both limiters with one call each.
-	// After priming, reduce effective rate so that sending 3 rapid requests to A
-	// causes A's 429, while B (primed separately) still has its burst available.
-	cfg.RateLimit = 1000 // effectively unlimited for this test
-	cfg.RateBurst = 2    // burst of 2 per key/IP
-	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
-	if err != nil {
-		t.Fatalf("server.New: %v", err)
+	// Step 2: key A's budget is exhausted — must be denied.
+	if lim.Allow("fp-key-a", "1.2.3.4") {
+		t.Fatal("AC6/SR-17: second Allow for key A must be denied after burst=1 exhausted")
 	}
-	startServer(t, srv, port)
-	client := clientForCert(t, paths.TLSDir)
 
-	url := baseURL(port) + "/healthz"
-
-	// Prime key A (consume 1 token) and key B (consume 1 token) — this initialises
-	// both per-key limiters in the internal map.
-	respA := get(t, client, url, string(plainA), nil)
-	respA.Body.Close()
-	respB := get(t, client, url, string(plainB), nil)
-	respB.Body.Close()
-
-	// Verify both are initially allowed (burst=2, so second call should still pass).
-	resp2A := get(t, client, url, string(plainA), nil)
-	resp2A.Body.Close()
-	resp2B := get(t, client, url, string(plainB), nil)
-	resp2B.Body.Close()
-
-	// At burst=2, each key has consumed 2 tokens. Third request for each should be 429.
-	// Key A's third request:
-	resp3A := get(t, client, url, string(plainA), nil)
-	statusA := resp3A.StatusCode
-	resp3A.Body.Close()
-
-	// Key B should also get 429 on its third request (own budget, independent).
-	resp3B := get(t, client, url, string(plainB), nil)
-	statusB := resp3B.StatusCode
-	resp3B.Body.Close()
-
-	// Both should be rate-limited (their own budgets exhausted independently).
-	// If they shared a budget, one would get 429 before the other using its own tokens.
-	if statusA != http.StatusTooManyRequests && statusA != http.StatusOK {
-		t.Logf("AC6/SR-17: key A third request: %d (expected 429 or 200 depending on IP limiter)", statusA)
+	// Step 3: key B has its own per-key limiter and its own per-IP limiter (different IP).
+	// Key A exhaustion must NOT affect key B — this is the core isolation invariant.
+	if !lim.Allow("fp-key-b", "5.6.7.8") {
+		t.Fatal("AC6/SR-17: Allow for key B must succeed — " +
+			"key A exhaustion must NOT drain key B's per-key budget (budgets are independent)")
 	}
-	if statusB != http.StatusTooManyRequests && statusB != http.StatusOK {
-		t.Logf("AC6/SR-17: key B third request: %d (expected 429 or 200 depending on IP limiter)", statusB)
+
+	// Step 4: key B's budget is also exhausted — must be denied.
+	if lim.Allow("fp-key-b", "5.6.7.8") {
+		t.Error("AC6/SR-17: second Allow for key B must be denied after burst=1 exhausted")
 	}
-	// The key invariant: if A is NOT rate-limited, B must also NOT be rate-limited
-	// for the same number of requests (they each have their own per-key budget).
-	// We verify that both keys' limiters were created and operate independently by
-	// checking that we can observe either both passing or both being limited.
-	// This test primarily confirms that the per-key limiters are not shared.
-	t.Logf("AC6/SR-17 isolation: key A status=%d, key B status=%d (per-key budgets independent)", statusA, statusB)
 }
 
 // ============================================================================
@@ -773,6 +752,68 @@ func TestUnauthHealthReturns401NotFound(t *testing.T) {
 	}
 	if resp.StatusCode != http.StatusUnauthorized {
 		t.Errorf("AC4/SR-8: /healthz without auth → want 401, got %d", resp.StatusCode)
+	}
+}
+
+// ============================================================================
+// SR-14: Host/Origin validation fires BEFORE auth in middleware chain
+// ============================================================================
+
+// TestHostDeniedBeforeAuth proves that SR-14 ordering is enforced:
+// a request with an invalid Host and NO Authorization header must receive
+// 403 (Host middleware rejects it first), not 401 (auth middleware did NOT run first).
+//
+// If the middleware order were reversed (auth before Host/Origin), the server
+// would return 401 (no auth header) instead of 403 (invalid host). This test
+// fails if auth runs before Host validation — detecting the ordering regression.
+func TestHostDeniedBeforeAuth(t *testing.T) {
+	paths := newTestPaths(t)
+	store, err := keystore.Open(paths.KeysDB)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	port := freePort(t)
+	cfg := newTestConfig(port)
+	var logBuf bytes.Buffer
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	startServer(t, srv, port)
+	client := clientForCert(t, paths.TLSDir)
+
+	// Case 1: invalid Host, no Authorization header → must be 403 (Host check before auth).
+	resp := get(t, client, baseURL(port)+"/healthz", "", map[string]string{
+		"Host": "evil.attacker.com",
+	})
+	resp.Body.Close()
+	if resp.StatusCode == http.StatusUnauthorized {
+		t.Errorf("SR-14: invalid Host without auth returned 401 — "+
+			"auth ran BEFORE Host validation; middleware order is wrong (want 403, got 401)")
+	}
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("SR-14: invalid Host without auth → want 403, got %d", resp.StatusCode)
+	}
+
+	// Case 2: invalid Origin, no Authorization header → must also be 403.
+	logBuf.Reset()
+	resp2 := get(t, client, baseURL(port)+"/healthz", "", map[string]string{
+		"Origin": "https://evil.attacker.com",
+	})
+	resp2.Body.Close()
+	if resp2.StatusCode == http.StatusUnauthorized {
+		t.Errorf("SR-14: invalid Origin without auth returned 401 — "+
+			"auth ran BEFORE Origin validation; middleware order is wrong (want 403, got 401)")
+	}
+	if resp2.StatusCode != http.StatusForbidden {
+		t.Errorf("SR-14: invalid Origin without auth → want 403, got %d", resp2.StatusCode)
+	}
+
+	// Both cases must produce DENY audit entries (not FAIL).
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "DENY") {
+		t.Errorf("SR-14: invalid Origin denial must produce DENY audit entry; log=%s", logOutput)
 	}
 }
 
