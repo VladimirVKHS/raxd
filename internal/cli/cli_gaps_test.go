@@ -29,11 +29,13 @@ func TestVersionOnStdout(t *testing.T) {
 	if !strings.Contains(stdout, "raxd 2.0.0") {
 		t.Errorf("stdout %q must contain version info", stdout)
 	}
-	// Version info must NOT be on stderr (only banner should be there).
+	// Version info must NOT appear on stderr outside the banner.
+	// Banner itself carries the version in its second line (alongside "raxd  —"), so
+	// we tolerate version text that co-appears with the banner header. Any occurrence
+	// of "2.0.0" on stderr WITHOUT the banner header line means version.Info() leaked
+	// to the diagnostic channel outside the intended banner context.
 	if strings.Contains(stderr, "2.0.0") && !strings.Contains(stderr, "raxd  —") {
-		// If stderr contains the version, it's NOT because of banner — it's a leak.
-		// Banner line2 contains version too, so we tolerate it only inside banner.
-		// Strict check: version.Info() string must not appear standalone in stderr.
+		t.Errorf("version info leaked to stderr outside banner context: stderr=%q", stderr)
 	}
 	// stdout must NOT contain banner box-drawing characters.
 	if strings.Contains(stdout, "┌") || strings.Contains(stdout, "│") {
@@ -41,15 +43,13 @@ func TestVersionOnStdout(t *testing.T) {
 	}
 }
 
-// TestStatusOnStdout verifies that status key-value output goes to stdout.
-// NOTE: banner is written to os.Stderr directly in PersistentPreRun (root.go:29),
-// not through cmd.ErrOrStderr() — so it is NOT captured in errBuf via executeCmd.
-// BUG FOUND (bootstrap-cli): root.go PersistentPreRun uses os.Stderr instead of
-// cmd.ErrOrStderr() — this means the banner cannot be redirected in tests via
-// cobra's SetErr. Documented as a finding for developer; do not mask the symptom.
+// TestStatusOnStdout verifies that status key-value output goes to stdout
+// and the banner goes to stderr (diagnostic channel, via cmd.ErrOrStderr()).
 // AC: "raxd status … exit 0"; ux-spec: "Канал: stdout".
+// BUG-001 fixed: PersistentPreRun now uses cmd.ErrOrStderr(), so banner IS
+// captured in errBuf via executeCmd, enabling the full channel-split assertion.
 func TestStatusOnStdout(t *testing.T) {
-	stdout, _, err := executeCmd("status")
+	stdout, stderr, err := executeCmd("status")
 	if err != nil {
 		t.Fatalf("status must exit 0, got: %v", err)
 	}
@@ -61,11 +61,14 @@ func TestStatusOnStdout(t *testing.T) {
 		}
 	}
 
-	// Key-value pairs must NOT bleed to stderr (errBuf) — they belong on stdout.
-	// (Banner via os.Stderr is not captured by errBuf — see note above.)
-	_, stderrBuf, _ := executeCmd("status")
-	if strings.Contains(stderrBuf, "not running") {
-		t.Errorf("status key-value output must not appear in stderr (errBuf); got: %q", stderrBuf)
+	// Banner MUST be on stderr (captured via cmd.ErrOrStderr()).
+	if !strings.Contains(stderr, "Vladimir Kovalev, OEM TECH") {
+		t.Errorf("banner author line must appear in stderr; got stderr=%q", stderr)
+	}
+
+	// Key-value state output must NOT bleed to stderr.
+	if strings.Contains(stderr, "not running") {
+		t.Errorf("status key-value output must not appear in stderr; got stderr=%q", stderr)
 	}
 }
 
@@ -168,17 +171,17 @@ func TestServeDoesNotBlock(t *testing.T) {
 
 // --- SECURITY: banner channel verification ---
 
-// TestBannerNotOnStdout verifies that banner output does NOT pollute stdout
-// (machine-readable channel). Banner is written to os.Stderr in PersistentPreRun,
-// so it is NOT captured in errBuf via executeCmd (a known limitation — see
-// BUG FOUND note in TestStatusOnStdout). What we CAN verify: stdout is clean.
-// Security requirement: "баннер … не засоряет машиночитаемый stdout".
-func TestBannerNotOnStdout(t *testing.T) {
+// TestBannerChannelSplit verifies that the banner goes to stderr and does NOT
+// pollute stdout (machine-readable channel).
+// BUG-001 fixed: PersistentPreRun uses cmd.ErrOrStderr(), so we can assert
+// both sides of the channel split.
+// Security requirement: "баннер выводится на stderr … не засоряет машиночитаемый stdout".
+func TestBannerChannelSplit(t *testing.T) {
 	version.Set("dev", "none", "unknown")
 	defer version.Set("dev", "none", "unknown")
 
 	// version exits 0 and puts only version.Info() on stdout — clean baseline.
-	stdout, _, err := executeCmd("version")
+	stdout, stderr, err := executeCmd("version")
 	if err != nil {
 		t.Fatalf("version must exit 0: %v", err)
 	}
@@ -190,6 +193,14 @@ func TestBannerNotOnStdout(t *testing.T) {
 	// Author string must NOT appear on stdout.
 	if strings.Contains(stdout, "Vladimir Kovalev, OEM TECH") {
 		t.Errorf("banner author line leaked to stdout; stdout=%q", stdout)
+	}
+
+	// Banner MUST appear on stderr (via cmd.ErrOrStderr()).
+	if !strings.Contains(stderr, "┌") {
+		t.Errorf("banner box-drawing not found in stderr; stderr=%q", stderr)
+	}
+	if !strings.Contains(stderr, "Vladimir Kovalev, OEM TECH") {
+		t.Errorf("banner author line not found in stderr; stderr=%q", stderr)
 	}
 }
 
