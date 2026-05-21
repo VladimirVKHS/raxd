@@ -587,10 +587,13 @@ func TestMCPAuditExactRecordsPerToolsCall(t *testing.T) {
 	if !strings.Contains(logOutput, "AUTH") {
 		t.Errorf("SR-36: want AUTH record from transport; log=%s", logOutput)
 	}
-	// fp= present in MCP record.
+	// fp= present in MCP record and must be a REAL fingerprint (not fp=- and not empty after fp=).
+	// SR-35: fingerprint in the MCP audit record comes from the authenticated context;
+	// for a successful tools/call the fingerprint MUST be a non-empty hex string, never "-".
 	if !strings.Contains(logOutput, "fp=") {
 		t.Errorf("SR-35: audit must contain fp=; log=%s", logOutput)
 	}
+	assertRealFingerprint(t, "SR-35/TestMCPAuditExactRecordsPerToolsCall", logOutput)
 	// SR-34: API key must not appear.
 	if strings.Contains(logOutput, keyStr) {
 		t.Errorf("SR-34: API key appears in audit log! log=%s", logOutput)
@@ -598,8 +601,240 @@ func TestMCPAuditExactRecordsPerToolsCall(t *testing.T) {
 }
 
 // ============================================================================
+// Issue 1 (MEDIUM — SR-27): ErrCorrupt → 403 before MCP, no panic
+//
+// Scenario: server starts normally, a valid Bearer token is issued, then
+// keys.db is overwritten with invalid JSON while the server is running.
+// The next request with the valid-looking Bearer must return HTTP 403
+// (keystore.Verify → readDB → ErrCorrupt → authMiddleware returns 403).
+// The server must NOT panic and must remain alive.
+//
+// This test proves:
+//   - The auth-chain ErrCorrupt→403 branch (auth.go line 74-89) is exercised via MCP.
+//   - MCP layer is never reached: no tool= in audit log.
+//   - No panic in the server under corruption.
+// ============================================================================
+
+// TestMCPKeystoreCorruptReturns403 verifies SR-27/AC2:
+//   When keys.db is corrupted at runtime, a Bearer request to /mcp returns 403,
+//   NOT 401 or 200, and the server does NOT panic.
+//   MCP layer must NOT be reached (no tool= in audit log).
+//
+// If this test fails with 200 → product bug: corrupt keystore accepted.
+// If this test fails with 401 → product bug: ErrCorrupt treated as auth failure, not store error.
+// If this test panics → product bug: server not guarded against corrupt store.
+// Escalate any failure to developer; do NOT weaken this assertion.
+func TestMCPKeystoreCorruptReturns403(t *testing.T) {
+	paths := newTestPaths(t)
+
+	// Start with a healthy keystore and create one key.
+	store, err := keystore.Open(paths.KeysDB)
+	if err != nil {
+		t.Fatalf("SR-27/ErrCorrupt: open store: %v", err)
+	}
+	plain, _, err := store.Create("corrupt-test-key")
+	if err != nil {
+		t.Fatalf("SR-27/ErrCorrupt: create key: %v", err)
+	}
+	keyStr := string(plain)
+
+	auditBuf := &bytes.Buffer{}
+	logger := newTestLogger(auditBuf)
+	auditFn := server.NewAuditFnForTest(logger)
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn)
+	if err != nil {
+		t.Fatalf("SR-27/ErrCorrupt: mcp.NewHandler: %v", err)
+	}
+
+	port := freePort(t)
+	cfg := newTestConfig(port)
+	srv, err := server.New(cfg, paths, store, logger, mcpH)
+	if err != nil {
+		t.Fatalf("SR-27/ErrCorrupt: server.New: %v", err)
+	}
+
+	// Build TLS client.
+	certPath := filepath.Join(paths.TLSDir, "cert.pem")
+	pool := x509.NewCertPool()
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("SR-27/ErrCorrupt: read cert: %v", err)
+	}
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("SR-27/ErrCorrupt: append cert")
+	}
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_ = srv.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+		}
+	})
+
+	// Wait for server to be ready.
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, dialErr := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec
+		if dialErr == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	baseURL := fmt.Sprintf("https://127.0.0.1:%d", port)
+
+	// Verify server is healthy before corrupting: a valid request must succeed.
+	initBody := jsonrpcBody(1, "initialize", map[string]interface{}{
+		"protocolVersion": "2025-11-25",
+		"capabilities":    map[string]interface{}{},
+		"clientInfo":      map[string]interface{}{"name": "corrupt-test", "version": "1"},
+	})
+	preResp := postMCP(t, client, baseURL, keyStr, initBody, nil)
+	preBody := readBody(t, preResp)
+	if preResp.StatusCode != http.StatusOK {
+		t.Fatalf("SR-27/ErrCorrupt: pre-corrupt request failed (want 200): got %d; body=%s",
+			preResp.StatusCode, preBody)
+	}
+
+	// CORRUPT keys.db at runtime by overwriting with invalid JSON.
+	// This mimics on-disk corruption that can happen between server start and request.
+	// After this write, store.Verify(any_token) will call readDB → ErrCorrupt.
+	if err := os.WriteFile(paths.KeysDB, []byte(`{broken json`), 0o600); err != nil {
+		t.Fatalf("SR-27/ErrCorrupt: write corrupt keys.db: %v", err)
+	}
+
+	auditBuf.Reset()
+
+	// Send a POST /mcp with a valid-looking Bearer. The key format is correct,
+	// but Verify will fail with ErrCorrupt when it tries to read keys.db.
+	// authMiddleware MUST return 403 (not 401, not 200).
+	callBody := jsonrpcBody(2, "tools/call", map[string]interface{}{
+		"name": "ping", "arguments": map[string]interface{}{},
+	})
+	resp := postMCP(t, client, baseURL, keyStr, callBody, map[string]string{
+		"MCP-Protocol-Version": "2025-11-25",
+	})
+	respBody := readBody(t, resp)
+
+	// Primary assertion: ErrCorrupt must map to 403 (not 401, not 200).
+	// Failure here means the auth-chain ErrCorrupt→403 branch is broken.
+	// DO NOT weaken this assertion — it is a security requirement (SR-27).
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf(
+			"SR-27/ErrCorrupt PRODUCT BUG: corrupt keys.db → want HTTP 403, got %d.\n"+
+				"Possible causes: ErrCorrupt treated as auth failure (401) or ignored (200).\n"+
+				"Escalate to developer — do NOT change the expected status code.\n"+
+				"body=%s",
+			resp.StatusCode, respBody,
+		)
+	}
+
+	// Secondary assertion: MCP layer must NOT have been reached.
+	// If tool= appears in the log, authMiddleware passed through despite corruption.
+	logOutput := auditBuf.String()
+	if strings.Contains(logOutput, "tool=") {
+		t.Errorf(
+			"SR-27/ErrCorrupt: MCP layer reached despite corrupt keystore (found tool= in audit log).\n"+
+				"authMiddleware must reject BEFORE MCP handler is invoked.\n"+
+				"log=%s",
+			logOutput,
+		)
+	}
+
+	// Liveness check: server must survive corruption and still respond.
+	livenessBody := jsonrpcBody(99, "initialize", map[string]interface{}{
+		"protocolVersion": "2025-11-25",
+		"capabilities":    map[string]interface{}{},
+		"clientInfo":      map[string]interface{}{"name": "liveness", "version": "1"},
+	})
+	livenessResp := postMCP(t, client, baseURL, keyStr, livenessBody, nil)
+	livenessResp.Body.Close()
+	// Response can be 403 (store still corrupt) — what matters is no panic/connection refused.
+	if livenessResp.StatusCode == 0 {
+		t.Error("SR-27/ErrCorrupt: server appears to have crashed after keystore corruption (status 0)")
+	}
+}
+
+// ============================================================================
 // Helpers specific to this file
 // ============================================================================
+
+// assertRealFingerprint verifies that the log output contains a non-dash, non-empty
+// hex fingerprint in an MCP/AUTH audit record. The fingerprint field is formatted as
+// "fp=<value>" by charmbracelet/log. We extract the value after "fp=" and verify:
+//   - it is not "-" (the sentinel for missing/anonymous fingerprint)
+//   - it contains at least one hex character (0-9, a-f)
+//
+// A failure here means the fingerprint in the audit record is fp=- or empty,
+// which would indicate the fingerprint was not propagated from the auth context
+// into the MCP/audit layer. Escalate to developer.
+func assertRealFingerprint(t *testing.T, label, logOutput string) {
+	t.Helper()
+	// charmbracelet/log formats key=value pairs; find "fp=" and extract value up to
+	// the next space or end-of-field. The value may be quoted in some log formats.
+	for _, line := range strings.Split(logOutput, "\n") {
+		idx := strings.Index(line, "fp=")
+		if idx < 0 {
+			continue
+		}
+		// Extract value after "fp=": runs until space, newline or end of string.
+		// Handles both quoted ("fp=\"abc\"") and unquoted ("fp=abc123") formats.
+		rest := line[idx+3:]
+		// Strip optional surrounding quotes.
+		rest = strings.TrimPrefix(rest, `"`)
+		end := strings.IndexAny(rest, " \t\n\r\"")
+		var fpVal string
+		if end >= 0 {
+			fpVal = rest[:end]
+		} else {
+			fpVal = rest
+		}
+		fpVal = strings.TrimSuffix(fpVal, `"`)
+
+		if fpVal == "-" || fpVal == "" {
+			t.Errorf(
+				"%s: audit log contains fp=- or empty fingerprint.\n"+
+					"For authenticated tools/call, fingerprint must be a non-empty hex value.\n"+
+					"This means the fingerprint was NOT propagated from auth context to audit.\n"+
+					"Escalate to developer — do NOT weaken this assertion.\n"+
+					"line: %q",
+				label, line,
+			)
+		} else {
+			// Verify it contains at least one hex character.
+			hasHex := false
+			for _, c := range fpVal {
+				if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+					hasHex = true
+					break
+				}
+			}
+			if !hasHex {
+				t.Errorf(
+					"%s: fingerprint value %q contains no hex characters (want non-empty hex).\n"+
+						"line: %q",
+					label, fpVal, line,
+				)
+			}
+		}
+		// Found and validated (or reported) — stop on first fp= occurrence per line.
+	}
+}
 
 // startMCPServerWithTLSKey starts a full raxd server and returns the raw content
 // of key.pem from TLSDir — required by MEDIUM-1 no-secrets test.

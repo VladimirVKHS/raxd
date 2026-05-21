@@ -89,7 +89,7 @@ docker run --rm raxd-test sh -c \
 
 | SR | Описание | Файл::Тест | Статус |
 |---|---|---|---|
-| SR-27 | Auth до MCP: нет/неизвестный/отозванный → 401; ErrCorrupt → 403 | `mcp_test.go::TestMCPNoAuthReturns401`, `TestMCPUnknownKeyReturns401` | green |
+| SR-27 | Auth до MCP: нет/неизвестный/отозванный → 401; ErrCorrupt → 403 | `mcp_test.go::TestMCPNoAuthReturns401`, `TestMCPUnknownKeyReturns401`; `mcp_security_test.go::TestMCPKeystoreCorruptReturns403` | green |
 | SR-28 | internal/mcp не импортирует keystore (статич.) | `mcp_test.go::TestMCPPackageDoesNotImportKeystore` | green |
 | SR-29 | MCP за тем же server.New (тест с полным сервером) | все integration-тесты `startMCPServer` | green |
 | SR-30 | Невалидный JSON → error; неизвестный инструмент → -32601/-32602; GET → 405 | `mcp_security_test.go::TestInvalidJSONReturnsParseError`, `TestUnknownToolNotExecuted`, `mcp_test.go::TestMCPGetReturns405` | green |
@@ -97,7 +97,7 @@ docker run --rm raxd-test sh -c \
 | SR-32 | Origin present&invalid → 403 до MCP; absent → проходит; valid → проходит | `mcp_security_test.go::TestOriginInvalidReturnsForbiddenBeforeMCP`, `TestOriginAbsentPassesOriginCheck`, `TestOriginValidAllowsRequest` | green |
 | SR-33 | server_info возвращает только {name,version,protocolVersion} без секретов | `mcp_security_test.go::TestServerInfoExactFields` | green |
 | SR-34 | key.pem (реальное содержимое) + API-ключ не в ответах и логе | `mcp_security_test.go::TestNoSecretsInMCPResponsesAndAuditLog` | green |
-| SR-35 | withAudit: fingerprint+tool= в каждой MCP-записи | `mcp_test.go::TestMCPAuditHasFingerprintAndTool`, `TestNewHandlerAuditContainsToolAndFP` | green |
+| SR-35 | withAudit: реальный (не fp=-) fingerprint + tool= в каждой MCP-записи | `mcp_test.go::TestMCPAuditHasFingerprintAndTool` (усилен: fp≠- + hex), `TestNewHandlerAuditContainsToolAndFP`; `mcp_security_test.go::TestMCPAuditExactRecordsPerToolsCall` (усилен: fp≠- + hex) | green |
 | SR-36 | AuditRecord.Tool; writeAudit: MCP-успех → label MCP + tool=; не-MCP → AUTH без tool= | `audit_mcp_test.go::TestAuditRecordToolField`, `TestWriteAuditMCPSuccessLabel`, `TestWriteAuditNonMCPUnchanged` | green |
 | SR-37 | execute_command не зарегистрирован; tools/call → error не исполнение | `mcp_security_test.go::TestUnknownToolNotExecuted`, `mcp_test.go::TestMCPToolsList` | green |
 | SR-38 | vendor/ офлайн, -mod=vendor, CGO_ENABLED=0 | Docker build (все тесты компилируются без сети) | green |
@@ -162,6 +162,16 @@ docker run --rm raxd-test sh -c \
 Оба теста теперь детерминированы. Единственный оставшийся `t.Skipf` в `occupyFreePort` —
 тривиальная гонка ОС между двумя `net.Listen` (крайне маловероятна в CI), с диагностическим
 сообщением. Это не отключение логики теста, а корректная обработка внешнего ресурса.
+
+**Статус t.Skipf в occupyFreePort: LOW-risk, принятый necessary-defensive.**
+Ситуация: между первым `net.Listen("tcp","127.0.0.1:0")` (probe, немедленно закрывается) и
+вторым `net.Listen(port)` (occupy) ОС теоретически может выдать тот же порт другому процессу.
+Вероятность в CI — крайне низкая (порт выбирается ОС из ephemeral range, гонка длиной ~1мс).
+Решение принято: `t.Skipf` в этой ситуации корректен — он пропускает тест целиком из-за
+проблемы с внешним ресурсом, а не маскирует логику. Логика теста (port-in-use error handling)
+остаётся нетронутой.
+**Пересмотреть, если тест станет flaky в CI** — перейти к O_EXCL-биндингу или использовать
+`SO_REUSEPORT` с проверкой. До появления flakiness изменение не требуется.
 
 Прогон в Docker подтверждён:
 - `TestServePortInUseNoStartupBlock` — PASS

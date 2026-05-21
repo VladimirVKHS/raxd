@@ -650,13 +650,68 @@ func TestMCPAuditHasFingerprintAndTool(t *testing.T) {
 	if !strings.Contains(logOutput, "tool=ping") {
 		t.Errorf("AC9/SR-35: audit log missing tool=ping; log=%s", logOutput)
 	}
-	// SR-35: audit must contain a non-dash fingerprint (fp= but not fp=-).
+	// SR-35: audit must contain fp= field.
 	if !strings.Contains(logOutput, "fp=") {
 		t.Errorf("AC9/SR-35: audit log missing fp= field; log=%s", logOutput)
 	}
+	// SR-35 (strengthened): fingerprint must be a REAL hex value — not fp=- and not empty.
+	// For a successful tools/call, the fingerprint comes from the authenticated context
+	// and MUST be a non-empty hex string. fp=- means it was not propagated.
+	// If this assertion fails → product bug: fingerprint not stored in auth context.
+	// Escalate to developer; do NOT weaken this assertion.
+	assertMCPRealFingerprint(t, "AC9/SR-35/TestMCPAuditHasFingerprintAndTool", logOutput)
 	// SR-34/AC10: key body must NOT be in audit log.
 	if strings.Contains(logOutput, keyStr) {
 		t.Errorf("AC10/SR-34: key body found in audit log! log=%s", logOutput)
+	}
+}
+
+// assertMCPRealFingerprint verifies that every "fp=" occurrence in logOutput
+// is followed by a non-empty hex value (not "-"). Mirrors assertRealFingerprint
+// in mcp_security_test.go (different package file, same package mcp_test).
+//
+// A failure means fp=- or empty was written to the audit log for an authenticated
+// request — the fingerprint was not propagated from the auth context. Escalate.
+func assertMCPRealFingerprint(t *testing.T, label, logOutput string) {
+	t.Helper()
+	for _, line := range strings.Split(logOutput, "\n") {
+		idx := strings.Index(line, "fp=")
+		if idx < 0 {
+			continue
+		}
+		rest := line[idx+3:]
+		rest = strings.TrimPrefix(rest, `"`)
+		end := strings.IndexAny(rest, " \t\n\r\"")
+		var fpVal string
+		if end >= 0 {
+			fpVal = rest[:end]
+		} else {
+			fpVal = rest
+		}
+		fpVal = strings.TrimSuffix(fpVal, `"`)
+
+		if fpVal == "-" || fpVal == "" {
+			t.Errorf(
+				"%s: audit log has fp=- or empty fingerprint for authenticated tools/call.\n"+
+					"fingerprint must be a real hex value; fp=- means not propagated from auth context.\n"+
+					"Escalate to developer — do NOT weaken this assertion.\nline: %q",
+				label, line,
+			)
+		} else {
+			hasHex := false
+			for _, c := range fpVal {
+				if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') {
+					hasHex = true
+					break
+				}
+			}
+			if !hasHex {
+				t.Errorf(
+					"%s: fingerprint %q has no hex chars; want non-empty hex. line: %q",
+					label, fpVal, line,
+				)
+			}
+		}
 	}
 }
 
