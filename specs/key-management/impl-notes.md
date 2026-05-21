@@ -177,6 +177,30 @@ ok  github.com/vladimirvkhs/raxd/internal/keystore 1.135s  (race detector: 0 rac
 - `TestConcurrentVerifyNoRace` (reviewer Issue 1 — data race, проверяется `-race`)
 - `TestConcurrentVerifyAndFlush` (reviewer Issue 1 — concurrent Verify+FlushUsage)
 
+### Выравнивание текстов ux-spec (developer-guardian, Round 4)
+
+Выявлено после рефактора `printStoreError`: тексты `ErrNotFound` и `ErrAlreadyRevoked` не совпадали
+с ux-spec (раздел «raxd key delete <id> — ошибки»).
+
+**ErrNotFound** — было: `"<id>: key not found"` без hint → стало:
+```
+error: key "<id>" not found
+  hint: run "raxd key list" to see available key IDs
+```
+
+**ErrAlreadyRevoked** — было: `"<id>: key is already revoked"` без hint → стало:
+```
+error: key "<id>" is already revoked
+  hint: run "raxd key list" to see active keys
+```
+
+**ErrCorrupt** и **ErrLabelTooLong** — тексты совпадали с ux-spec, изменений не требовали.
+
+Тесты `TestKeyDeleteNotFoundCLI` и `TestKeyDeleteAlreadyRevokedCLI` обновлены: теперь сверяют
+точные строки (`wantMsg + wantHint`) вместо рыхлых `strings.Contains`.
+
+После правки: `go test ./...` — 87 тестов, 0 skip; `go test -race ./internal/keystore/...` — OK.
+
 ### Покрытые Acceptance Criteria
 
 | AC | Тест | Статус |
