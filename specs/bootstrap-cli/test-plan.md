@@ -33,7 +33,7 @@
 | AC-5: без литерального `v`-префикса в версии                            | unit/integ  | `version_gaps_test.go::TestInfoNoVPrefix`, `cli_gaps_test.go::TestVersionNoVPrefix` | green |
 | AC-6: `status` печатает `state: not running`, exit 0                    | integration | `cli_test.go::TestStatusExitZero`, `cli_gaps_test.go::TestStatusStateNotRunning` | green |
 | AC-6: `status` показывает пути config.yaml, keys.db, tls               | integration | `cli_test.go::TestStatusOutputFields`, `cli_gaps_test.go::TestStatusPathSuffixes` | green |
-| AC-6: `version`/`status` на stdout, баннер не загрязняет stdout        | integration | `cli_gaps_test.go::TestVersionOnStdout`, `TestStatusOnStdout`, `TestBannerNotOnStdout` | green |
+| AC-6: `version`/`status` на stdout, баннер не загрязняет stdout        | integration | `cli_gaps_test.go::TestVersionOnStdout`, `TestStatusOnStdout`, `TestBannerChannelSplit` | green |
 | AC-7: XDG — `$HOME/.config/raxd` по умолчанию (Linux и macOS)         | unit        | `paths_test.go::TestPathsDefault`                                | green  |
 | AC-7: `XDG_CONFIG_HOME` имеет приоритет                                 | unit        | `paths_test.go::TestPathsXDGOverride`                            | green  |
 | AC-7: отсутствие `config.yaml` — не ошибка                              | unit        | `paths_test.go::TestLoadMissingFileReturnsDefaults`              | green  |
@@ -46,6 +46,14 @@
 | AC-10: нет секретов в выводе (version/status/banner)                    | integration | `cli_test.go::TestStatusNoSecrets`, `banner_test.go::TestRenderNoSecrets`, `cli_gaps_test.go::TestVersionOutputNoSecretPatterns`, `TestBannerNoSecretPatterns` | green |
 | AC-11: есть `Dockerfile`, внутри проходят `go build` и `go test`       | build       | `docker build --target build` + `--target test` (см. раздел «Как запускать») | green |
 | AC-12: unit-тесты покрывают регистрацию команд, exit-коды, XDG         | unit/integ  | весь набор `*_test.go` — зелёный в Docker (см. раздел «Как запускать») | green |
+
+### Дополнительные тесты устойчивости
+
+| Тест (файл :: имя)                                          | Что проверяет                                                                              | Статус |
+|-------------------------------------------------------------|-------------------------------------------------------------------------------------------|--------|
+| `version_test.go::TestSetPreservesNonEmpty`                 | `version.Set()` корректно сохраняет все три поля; повторный вызов не стирает значения      | green  |
+| `banner_test.go::TestRenderHasBoxDrawing`                   | Баннер содержит Unicode box-drawing символы (`┌`/`┐`/`└`/`┘`) — визуальная структура      | green  |
+| `cli/security_test.go::TestStubsErrorPrefix`                | Все заглушки выводят `error:`-префикс; дополняет `TestStubErrorMessageContainsCommandName` | green  |
 
 ---
 
@@ -88,21 +96,17 @@
 
 ---
 
-## Найденные баги продукта (эскалация к developer)
+## Найденные баги продукта
 
-### BUG-001: `PersistentPreRun` пишет баннер в `os.Stderr`, а не в `cmd.ErrOrStderr()`
+### BUG-001: `PersistentPreRun` пишет баннер в `os.Stderr` вместо `cmd.ErrOrStderr()` — ИСПРАВЛЕН
 
-**Файл**: `internal/cli/root.go`, строка 29.
+**Файл**: `internal/cli/root.go`, строка 28.
 
-**Код**: `fmt.Fprintln(os.Stderr, banner.Render())`
+**Было**: `fmt.Fprintln(os.Stderr, banner.Render())`
 
-**Контракт** (impl-notes.md): «баннер пишется в `cmd.ErrOrStderr()`».
+**Стало**: `fmt.Fprintln(cmd.ErrOrStderr(), banner.Render())`
 
-**Последствие**: при подмене stderr через cobra `SetErr(buf)` (в тестах и потенциально при перенаправлении в пайп) баннер уходит напрямую в `os.Stderr`, минуя cobra-поток. Это нарушает тестируемость и теоретически может загрязнить пайп `raxd status 2>/tmp/err` — баннер попадёт в терминал, а не в файл.
-
-**Исправление (для developer)**: заменить `fmt.Fprintln(os.Stderr, ...)` на `fmt.Fprintln(cmd.ErrOrStderr(), ...)`.
-
-**Статус**: зафиксирован в тесте `TestStatusOnStdout` с подробным комментарием BUG FOUND.
+**Статус**: исправлен developer'ом. Тесты `TestStatusOnStdout` и `TestBannerChannelSplit` переведены в полноценный режим: теперь проверяют обе стороны канального разделения (баннер есть в stderr, нет в stdout).
 
 ---
 
@@ -143,7 +147,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 - `go vet ./...` — ноль предупреждений.
 - `go test ./...` — все тесты PASS, ни одного FAIL или SKIP.
 - Exit code прогона = 0.
-- Количество тестов: **35** (20 исходных + 15 добавленных).
+- Количество тестов: **49** (20 исходных + 29 добавленных).
 
 ---
 
