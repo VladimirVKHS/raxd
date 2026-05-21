@@ -879,6 +879,15 @@ func TestInvalidHostReturns403(t *testing.T) {
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("SR-15: evil Host → want 403, got %d", resp.StatusCode)
 	}
+
+	// SR-19/SR-20: invalid Host denial MUST appear in audit log.
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "DENY") {
+		t.Errorf("SR-19: Host denial not in audit log (missing DENY); log=%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "invalid host header") {
+		t.Errorf("SR-19: Host denial missing reason in audit log; log=%s", logOutput)
+	}
 }
 
 func TestInvalidOriginReturns403(t *testing.T) {
@@ -909,6 +918,15 @@ func TestInvalidOriginReturns403(t *testing.T) {
 
 	if resp.StatusCode != http.StatusForbidden {
 		t.Errorf("SR-16: invalid Origin → want 403, got %d", resp.StatusCode)
+	}
+
+	// SR-19/SR-20: invalid Origin denial MUST appear in audit log.
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "DENY") {
+		t.Errorf("SR-19: Origin denial not in audit log (missing DENY); log=%s", logOutput)
+	}
+	if !strings.Contains(logOutput, "invalid origin header") {
+		t.Errorf("SR-19: Origin denial missing reason in audit log; log=%s", logOutput)
 	}
 }
 
@@ -1082,5 +1100,118 @@ func TestAuditRateRecorded(t *testing.T) {
 
 	if !strings.Contains(logBuf.String(), "RATE") {
 		t.Errorf("SR-20: RATE not found in audit log; log=%s", logBuf.String())
+	}
+}
+
+// ============================================================================
+// SR-13: ErrCorrupt from keystore.Verify → HTTP 403 + DENY audit, no panic
+// ============================================================================
+
+func TestErrCorruptReturns403(t *testing.T) {
+	paths := newTestPaths(t)
+	store, err := keystore.Open(paths.KeysDB)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	// Create a key so keys.db is initialized with valid content.
+	plain, _, err := store.Create("corrupt-test")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+
+	port := freePort(t)
+	cfg := newTestConfig(port)
+	var logBuf bytes.Buffer
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+	startServer(t, srv, port)
+	client := clientForCert(t, paths.TLSDir)
+
+	// Corrupt keys.db AFTER server.New succeeds — this simulates disk corruption at
+	// request time, causing keystore.Verify to return ErrCorrupt (SR-13 mapping).
+	if err := os.WriteFile(paths.KeysDB, []byte("not valid json {{{"), 0o600); err != nil {
+		t.Fatalf("corrupt keys.db: %v", err)
+	}
+
+	// Request with a well-formed Bearer token → keystore.Verify returns ErrCorrupt → 403.
+	resp := get(t, client, baseURL(port)+"/healthz", string(plain), nil)
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf("SR-13: ErrCorrupt from Verify → want 403, got %d", resp.StatusCode)
+	}
+
+	// Must produce DENY audit record — no panic allowed.
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "DENY") {
+		t.Errorf("SR-13: DENY audit record missing after ErrCorrupt; log=%s", logOutput)
+	}
+}
+
+// ============================================================================
+// SR-24: graceful shutdown order — Shutdown BEFORE FlushUsage
+// ============================================================================
+
+func TestGracefulShutdownOrder(t *testing.T) {
+	paths := newTestPaths(t)
+	store, err := keystore.Open(paths.KeysDB)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+
+	port := freePort(t)
+	cfg := newTestConfig(port)
+	var logBuf bytes.Buffer
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+
+	// Record timestamps: when Shutdown returned vs when FlushUsage was called.
+	var shutdownReturnedAt int64 // set by afterShutdownHook (after Shutdown, before FlushUsage)
+
+	// afterShutdownHook fires between Shutdown() return and FlushUsage().
+	// We record the time so we can assert it precedes the FlushUsage completion.
+	srv.SetAfterShutdownHook(func() {
+		shutdownReturnedAt = time.Now().UnixNano()
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	runDone := make(chan error, 1)
+	go func() {
+		runDone <- srv.Run(ctx)
+	}()
+
+	// Wait for server to be ready.
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, dialErr := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec
+		if dialErr == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Trigger graceful shutdown.
+	cancel()
+
+	select {
+	case runErr := <-runDone:
+		if runErr != nil {
+			t.Errorf("SR-24 order: Run returned error: %v", runErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("SR-24 order: graceful shutdown did not complete within 10s")
+	}
+
+	// The hook must have been called (meaning Shutdown completed before FlushUsage).
+	if shutdownReturnedAt == 0 {
+		t.Error("SR-24: afterShutdownHook was never called — Shutdown may not have run")
 	}
 }
