@@ -85,15 +85,24 @@
   `NotBefore/NotAfter time.Time`, `SerialNumber *big.Int`, `KeyUsage`, `ExtKeyUsage`,
   `BasicConstraintsValid bool` — то есть `127.0.0.1`/`localhost` кладутся в SAN (`IPAddresses`/
   `DNSNames`), срок — в `NotBefore/NotAfter`. → https://pkg.go.dev/crypto/x509
-- **Ключ — ECDSA P-256 (рекомендация по умолчанию для нового TLS-деплоя 2025-2026):** ECDSA P-256
-  даёт меньший серт и более быстрый handshake при безопасности, эквивалентной RSA-3072; для нового
-  TLS-сервера в 2025 рекомендуется ECDSA P-256 (RSA 2048 — для legacy-совместимости).
-  → https://www.ssl.com/article/comparing-ecdsa-vs-rsa/ ,
-  → https://www.namesilo.com/blog/en/privacy-security/csr--key-choices-in-2025-rsa-2048-vs-ecdsa-p-256-for-your-certificates
-  - Для self-signed «свой клиент ↔ свой сервер» legacy-совместимость не нужна → ECDSA P-256 уместен.
-    (Генерация: `ecdsa.GenerateKey(elliptic.P256(), rand.Reader)` — stdlib `crypto/ecdsa`,
-    `crypto/elliptic`; ключ сериализуется через `x509.MarshalPKCS8PrivateKey` в PEM.) Сами пакеты —
-    stdlib, см. https://pkg.go.dev/crypto/ecdsa и https://pkg.go.dev/crypto/x509
+- **Ключ — ECDSA на кривой P-256 (secp256r1):** P-256 — допустимая кривая для TLS 1.3: RFC 8446
+  перечисляет `secp256r1(0x0017)` среди named groups (ECDHE) и `ecdsa_secp256r1_sha256(0x0403)` среди
+  signature algorithms. → https://www.rfc-editor.org/rfc/rfc8446 (§4.2.7 Supported Groups, §4.2.3
+  Signature Algorithms). P-256 (она же secp256r1/prime256v1) входит в набор эллиптических кривых,
+  рекомендованных NIST SP 800-186 (февраль 2023, «specifies the set of elliptic curves recommended for
+  U.S. Government use»). → https://csrc.nist.gov/pubs/sp/800/186/final ,
+  PDF: https://nvlpubs.nist.gov/nistpubs/SpecialPublications/NIST.SP.800-186.pdf
+  - Для self-signed «свой клиент ↔ свой сервер» legacy-совместимость не требуется → ECDSA P-256 уместен
+    (поддерживается stdlib без дополнительных зависимостей).
+    Генерация: `ecdsa.GenerateKey(c elliptic.Curve, r io.Reader)` с `elliptic.P256()` — `crypto/ecdsa`
+    явно перечисляет P-256 среди поддерживаемых кривых (constant-time). → https://pkg.go.dev/crypto/ecdsa
+    Ключ сериализуется в PKCS#8 PEM: `x509.MarshalPKCS8PrivateKey` поддерживает `*ecdsa.PrivateKey`.
+    → https://pkg.go.dev/crypto/x509
+  - ⚠️ Количественная формулировка «P-256 ≈ RSA-3072 по стойкости и даёт более быстрый handshake/меньший
+    серт» в нормативных источниках (RFC 8446 / NIST SP 800-186 / Go docs) прямо НЕ подтверждена —
+    перенесена в «Открытые вопросы» (OQ-1). Подтверждённый факт: P-256 — валидная для TLS 1.3 кривая,
+    рекомендованная NIST, поддерживаемая stdlib; ECDSA-ключи P-256 короче RSA при сопоставимом уровне
+    стойкости (точная эквивалентность бит — предмет проверки по NIST SP 800-57 Part 1, см. OQ-1).
 
 ### Rate limiting (для AC6)
 
@@ -102,7 +111,12 @@
   `func NewLimiter(r Limit, b int) *Limiter` (r — событий/сек, b — burst), `Allow() bool`,
   `func Every(interval time.Duration) Limit`, `Wait(ctx)`, `Reserve()`.
   → https://pkg.go.dev/golang.org/x/time/rate
-  - Паттерн per-key/per-IP — это `map[ключ]*rate.Limiter` (стандартная практика, см. варианты ниже).
+  - Паттерн per-key/per-IP: один `*rate.Limiter` на ключ/IP, хранимый в `map[ключ]*rate.Limiter` под
+    мьютексом (lazy-создание лимитера при первом обращении). Официальная дока `x/time/rate`
+    показывает только одиночный `Limiter` и тип `Sometimes`, готового примера map-per-IP в ней нет
+    → конкретная реализация хранилища лимитеров и стратегия очистки устаревших записей — деталь для
+    architect/developer (см. «Технические тезисы» п.5 и «Открытые вопросы»/детали реализации).
+    → https://pkg.go.dev/golang.org/x/time/rate
 
 ### Graceful shutdown (для AC12)
 
@@ -210,15 +224,20 @@
 1. **TLS:** `tls.Config{MinVersion: tls.VersionTLS13, Certificates: []tls.Certificate{cert}}`; **НЕ**
    задавать `CipherSuites` (под TLS1.3 игнорируется). https://pkg.go.dev/crypto/tls
 2. **Self-signed:** `x509.CreateCertificate(rand, tmpl, tmpl, pub, priv)` (template==parent →
-   self-signed); SAN с `127.0.0.1` (`IPAddresses`) и `localhost` (`DNSNames`); ключ — ECDSA P-256;
-   приватный ключ `0600`, серт `0644` (AC2). https://pkg.go.dev/crypto/x509
+   self-signed); SAN с `127.0.0.1` (`IPAddresses`) и `localhost` (`DNSNames`); ключ — ECDSA P-256
+   (`crypto/ecdsa` + `elliptic.P256()`, https://pkg.go.dev/crypto/ecdsa); приватный ключ `0600`,
+   серт `0644` (AC2). https://pkg.go.dev/crypto/x509
 3. **Переиспользование серта (AC3):** при наличии пары в `PathSet.TLSDir` грузить через
    `tls.LoadX509KeyPair`, не перегенерировать. https://pkg.go.dev/crypto/tls
 4. **Аутентификация (AC4/AC5/AC8):** middleware ДО маршрутизации; извлечь ключ из
    `Authorization: Bearer`; `keystore.Verify` → при false/err закрыть 401/403; в аудит — только
    `keystore.Fingerprint`, не тело ключа (AC9). `internal/keystore/*`
-5. **Rate limit (AC6):** `golang.org/x/time/rate`, `map[key]*rate.Limiter` + `map[ip]*rate.Limiter`
-   с TTL-очисткой; превышение → 429 + аудит. https://pkg.go.dev/golang.org/x/time/rate
+5. **Rate limit (AC6):** `golang.org/x/time/rate`; per-key/per-IP — `*rate.Limiter` на ключ/IP в
+   `map[key]*rate.Limiter` + `map[ip]*rate.Limiter` под мьютексом, lazy-создание; превышение → 429 +
+   аудит. **Деталь реализации для architect/developer:** официальная дока `x/time/rate` готового
+   примера хранилища map-per-IP и стратегии очистки устаревших лимитеров не содержит — выбор структуры
+   хранения и механизма очистки (TTL/LRU/sync.Map) оставлен на этап plan/implementation (см. OQ-2).
+   https://pkg.go.dev/golang.org/x/time/rate
 6. **Graceful shutdown (AC12):** SIGINT/SIGTERM → `Server.Shutdown(ctxDeadline)` → `FlushUsage()`;
    ждать `ErrServerClosed`. https://pkg.go.dev/net/http#Server.Shutdown
 7. **Вендоринг (AC14):** `golang.org/x/time` — НОВАЯ зависимость → `go mod vendor` + коммит `vendor/`
@@ -228,7 +247,20 @@
 
 ## Открытые вопросы
 
-- None по делегированным Q1/Q2/Q3 — закрыты фактами и рекомендациями выше.
+- **OQ-1 (факт, требует проверки по нормативу) — количественная стойкость P-256.** Утверждение
+  «P-256 эквивалентна по стойкости RSA-3072 и даёт более быстрый handshake / меньший сертификат» НЕ
+  подтверждено нормативными источниками, использованными в research (RFC 8446, NIST SP 800-186, Go
+  docs). Подтверждено лишь: P-256 — валидная для TLS 1.3 кривая (RFC 8446), рекомендованная NIST
+  (SP 800-186), поддерживаемая stdlib (`crypto/ecdsa`). Эквивалентность «P-256 ↔ ~128-бит / RSA-3072»
+  принято проверить по NIST SP 800-57 Part 1 Rev. 5 (таблицы сравнения уровней стойкости) до выдачи
+  как факта. На выбор кривой для self-signed «свой клиент↔сервер» это не влияет (P-256 уместна
+  независимо от точной эквивалентности), но количественную формулировку в plan/docs использовать
+  нельзя до проверки.
+- **OQ-2 (деталь реализации, не блокирует) — стратегия хранения и очистки rate-лимитеров.** Конкретная
+  структура хранилища (`map`+mutex / `sync.Map`) и механизм удаления устаревших per-IP/per-key
+  лимитеров (TTL, LRU, периодический GC) официальной докой `x/time/rate` не предписаны. Решается
+  architect (plan) / developer (implementation); на выбор транспорта Q1 не влияет.
+
 - Замечания, оставленные НА РЕШЕНИЕ architect (не открытые факты, а проектные развилки в его зоне):
   - конкретная форма health-эндпоинта (REST `GET /healthz` vs JSON-RPC-стиль `POST /`) — AC10;
   - точные дефолты лимитов rate-limit и burst (спека требует «разумные дефолты, конфигурируемы») и их
