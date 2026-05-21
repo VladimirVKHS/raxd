@@ -32,7 +32,7 @@
 - Никакого самостоятельного сравнения ключей/хэшей (SR-10); только через `keystore.Verify`.
 
 ### `internal/server/middleware.go`
-- `hostOriginMiddleware(hostAllow, originAllow)`: Host вне allowlist → 403; Origin present & вне allowlist → 403; отсутствие Origin → пропуск (SR-14, SR-15, SR-16).
+- `hostOriginMiddleware(hostAllow, originAllow, auditFn)`: Host вне allowlist → 403 + DENY-аудит (SR-19/SR-20); Origin present & вне allowlist → 403 + DENY-аудит; отсутствие Origin → пропуск (SR-14, SR-15, SR-16). Причина отказа не передаётся в тело HTTP-ответа (anti-enumeration, ux-spec §3.5/§3.6).
 - `recoverMiddleware`: перехват паник → 500, без краша сервера (SR-25, AC13).
 - `rateLimitMiddleware(limiters, auditFn)`: 429 + RATE-аудит при превышении лимита (AC6, SR-17).
 
@@ -49,6 +49,7 @@
 - Graceful shutdown: ctx → `http.Server.Shutdown(30s)` → `store.FlushUsage()` (AC12, SR-24).
 - `ErrPortInUse` при занятом порте (AC13).
 - Возвращает `ErrTLSCert` при повреждённом сертификате.
+- `SetAfterShutdownHook(fn func())` — test seam для проверки порядка SR-24: вызывается ПОСЛЕ Shutdown(), ДО FlushUsage().
 
 ### `internal/config/config.go`
 Расширение `Config`:
@@ -73,6 +74,9 @@
 ### Отклонение 3: `buildAuditMiddleware` — упрощённый паттерн
 В plan описан "deferred-запись" audit через outermost middleware. Реализовано альтернативно: каждый middleware пишет аудит-запись при принятии решения (authMiddleware, hostOriginMiddleware, rateLimitMiddleware). Это функционально эквивалентно: SR-19/SR-20 выполнены — каждый отказ и успех логируется.
 
+### Отклонение 4: сигнатура hostOriginMiddleware расширена (guardian needs-changes)
+Plan.md задаёт сигнатуру без auditFn: `hostOriginMiddleware(hostAllow, originAllow []string)`. Для выполнения SR-19/SR-20 (аудит каждого отказа) сигнатура расширена до `hostOriginMiddleware(hostAllow, originAllow []string, auditFn AuditFn)`. Изменение обосновано нарушением требований безопасности в исходной реализации — устранение замечания ISSUE-1 developer-guardian.
+
 ### Решение OQ-1 (маршрут в аудит): поле `path` не добавлено
 По ux-spec OQ-1 решено не добавлять — аудит уровня security, не application-лога.
 
@@ -94,8 +98,8 @@
 | AC9 нет секретов в логе | `TestAuditHasNoKeyBody`, `TestAuditFailHasDash` | PASS |
 | AC10 health/dispatch | `TestHealthReturnsPoong`, `TestDispatchReturns501` | PASS |
 | AC11 foreground serve | `TestServeIsNoLongerStub`, `TestServeStartsRealServer` | PASS |
-| AC12 graceful shutdown | `TestGracefulShutdown` | PASS |
-| AC13 edge-cases | `TestCorruptCertReturnsError`, `TestPortInUse` | PASS |
+| AC12 graceful shutdown | `TestGracefulShutdown`, `TestGracefulShutdownOrder` | PASS |
+| AC13 edge-cases | `TestCorruptCertReturnsError`, `TestPortInUse`, `TestErrCorruptReturns403` | PASS |
 | AC14 Docker vendor | все тесты в Docker, -mod=vendor | PASS |
 
 ### Покрытие SR
@@ -111,10 +115,10 @@ SR-9: Bearer extraction, Verify — `TestUnknownKeyReturns401`.
 SR-10: нет прямого сравнения — code inspection (`auth.go` — только через `keystore.Verify`).
 SR-11: revoke immediate — `TestRevokedKeyReturns401`.
 SR-12: нет ключа в argv/env — code inspection (`serve.go`).
-SR-13: ErrCorrupt → 403 — `TestCorruptCertReturnsError` + unit test в server.
+SR-13: ErrCorrupt → 403 — `TestErrCorruptReturns403` (corrupts keys.db after server.New, sends Bearer token, expects 403 + DENY audit). Уточнение: `TestCorruptCertReturnsError` покрывает SR-6 (corrupt TLS cert), а не SR-13.
 SR-14: Host/Origin перед auth — middleware chain order.
-SR-15: invalid Host → 403 — `TestInvalidHostReturns403`.
-SR-16: invalid Origin → 403; absent → pass — `TestInvalidOriginReturns403`, `TestAbsentOriginNotRejected`.
+SR-15: invalid Host → 403 + DENY audit — `TestInvalidHostReturns403` (проверяет статус 403 и наличие "DENY"/"invalid host header" в логе).
+SR-16: invalid Origin → 403 + DENY audit; absent → pass — `TestInvalidOriginReturns403` (проверяет статус 403 и наличие "DENY"/"invalid origin header" в логе), `TestAbsentOriginNotRejected`.
 SR-17: 429 per-key/per-IP — `TestRateLimitPerKeyReturns429`, `TestRateLimitPerIPReturns429`.
 SR-18: mutex + no race — `TestRateLimiterConcurrency` (под `-race`).
 SR-19: audit fields — `TestAuditHasFingerprintField`.
@@ -122,7 +126,7 @@ SR-20: FAIL/RATE audit — `TestAuditFailRecorded`, `TestAuditRateRecorded`.
 SR-21: нет секретов в логе — `TestAuditHasNoKeyBody`.
 SR-22: health после auth — `TestValidKeyReachesHealth`, `TestHealthReturnsPoong`.
 SR-23: 501 dispatch — `TestDispatchReturns501`.
-SR-24: Shutdown → FlushUsage, deadline — `TestGracefulShutdown`.
+SR-24: Shutdown → FlushUsage, deadline — `TestGracefulShutdown` (дедлайн) + `TestGracefulShutdownOrder` (порядок через SetAfterShutdownHook seam).
 SR-25: таймауты — code inspection (server.go httpSrv fields).
 SR-26: Docker vendor — CI прогон подтверждён.
 
@@ -154,7 +158,7 @@ ok  github.com/vladimirvkhs/raxd/internal/server  0.647s (go test -v)
 ok  github.com/vladimirvkhs/raxd/internal/server  1.899s (CGO_ENABLED=1 -race)
 ```
 
-Все 25 тестов server + 50+ cli/config/keystore/banner/version тестов PASS.
+Все 28 тестов server (добавлены TestErrCorruptReturns403, TestGracefulShutdownOrder + расширены TestInvalidHostReturns403/TestInvalidOriginReturns403) + 50+ cli/config/keystore/banner/version тестов PASS.
 Нет `t.Skip`, нет закомментированных проверок.
 
 ## Безопасность
