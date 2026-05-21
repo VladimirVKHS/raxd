@@ -31,15 +31,20 @@ Advisory flock через `syscall.Flock`:
 ### `internal/keystore/keystore.go`
 Тип `Store`. Реализованы все контракты из plan.md:
 - `Open(path)`: проверяет corruption только для непустых файлов; пустой/отсутствующий = пустая база (SR-22).
+  Используется `json.Unmarshal` (reviewer bonus-fix) — согласовано с `readDB`, обнаруживает trailing garbage.
 - `Create(label)`: эксклюзивный flock + генерация + hashKey + Fingerprint + атомарная запись.
+  Проверка длины label через `utf8.RuneCountInString` (reviewer Issue 2) — корректно для Unicode.
   Возвращает `(PlainKey, Record, error)` (SR-1..9, SR-19..21, SR-25).
 - `List()`: shared flock; активные записи без hash/salt (SR-12, SR-16).
 - `Revoke(id)`: эксклюзивный flock; soft-revoke + RevokedAt; `ErrNotFound`/`ErrAlreadyRevoked` (SR-16, SR-18).
 - `Verify(presented)`: shared flock; pure read; constant-time `subtle.ConstantTimeCompare` каждой записи;
-  LastUsed буферизуется в памяти (SR-9, SR-10, SR-16, SR-17).
-- `FlushUsage()`: эксклюзивный flock; перечитывает файл; мерджит LastUsed поверх актуального состояния;
-  revoked-записи не трогает (SR-17).
+  LastUsed буферизуется в памяти под `mu` (reviewer Issue 1 — data race fix) (SR-9, SR-10, SR-16, SR-17).
+- `FlushUsage()`: эксклюзивный flock; snapshot под `mu` перед file I/O; мерджит LastUsed поверх актуального;
+  revoked-записи не трогает; snapshot восстанавливается при ошибке (reviewer Issue 1) (SR-17).
 - `writeDB(db)`: temp (тот же каталог) → chmod 0600 → sync → close → rename → fsync каталога (SR-20, SR-21).
+
+Store теперь потокобезопасен: поле `mu sync.Mutex` защищает `usageBuf` от data race
+при конкурентных вызовах `Verify`/`FlushUsage`.
 
 ### `internal/cli/key.go`
 Заглушки заменены рабочими обработчиками по ux-spec:
@@ -84,6 +89,26 @@ create/delete, но умалчивают, как его получить при 
 
 - ISSUE-1: `log.New(os.Stderr)` → `log.New(cmd.ErrOrStderr())` в `runKeyDelete`. Импорт `"os"` удалён.
 - ISSUE-4: удалена неиспользуемая функция `formatDate`. Импорт `"time"` удалён.
+
+### Правки reviewer (Round 3)
+
+**Issue 1 (MAJOR — data race):** `sync.Mutex mu` добавлен в `Store`. Все доступы к `usageBuf`
+защищены: `Verify` захватывает `mu` при записи в буфер, `FlushUsage` снимает snapshot под `mu`,
+освобождает `mu` до file I/O, восстанавливает записи при ошибке. Тесты: `TestConcurrentVerifyNoRace`,
+`TestConcurrentVerifyAndFlush` — оба проходят под `go test -race ./internal/keystore/...`.
+
+**Issue 2 (MINOR — Unicode label):** `len(label) > 64` заменено на `utf8.RuneCountInString(label) > 64`.
+Тесты: `TestLabelMultibyteExact64` (64 кириллических руны = 128 байт — должно приниматься),
+`TestLabelMultibyteTooLong` (65 рун — должно отклоняться с `ErrLabelTooLong`).
+
+**Issue 3 (MINOR — мёртвый код):** `printStoreError` задействована во всех error-ветках `runKeyCreate`,
+`runKeyList`, `runKeyDelete` (4 дублированных блока заменены на вызовы `printStoreError`).
+`friendlyErr` удалена. Добавлен hint для `ErrNotFound` в `printStoreError` (требовался существующим
+тестом `TestKeyDeleteNotFoundCLI`).
+
+**Bonus fix (унификация detektion corruption):** `Open` теперь использует `os.ReadFile` +
+`json.Unmarshal` вместо `json.NewDecoder(f).Decode()`. Поведение согласовано с `readDB`:
+корректный JSON с trailing garbage теперь правильно детектируется как corrupt.
 
 ### Примечания без отклонений
 
@@ -130,6 +155,27 @@ ok  github.com/vladimirvkhs/raxd/internal/version  0.001s
 - `TestWrappedErrCorruptFromOpen` (ISSUE-3)
 - `TestWrappedErrCorruptFromReadDB` (ISSUE-3)
 - `TestCorruptDBGivesSpecificMessage` (ISSUE-3, CLI end-to-end)
+
+### Результат после правок reviewer (Round 3): все тесты + race detector
+
+```
+# go test ./...
+ok  github.com/vladimirvkhs/raxd                   0.004s
+ok  github.com/vladimirvkhs/raxd/internal/banner   0.001s
+ok  github.com/vladimirvkhs/raxd/internal/cli      0.046s
+ok  github.com/vladimirvkhs/raxd/internal/config   0.003s
+ok  github.com/vladimirvkhs/raxd/internal/keystore 0.125s
+ok  github.com/vladimirvkhs/raxd/internal/version  0.001s
+
+# go test -race ./internal/keystore/...
+ok  github.com/vladimirvkhs/raxd/internal/keystore 1.135s  (race detector: 0 races)
+```
+
+Добавлено 4 новых теста (было 83, стало 87):
+- `TestLabelMultibyteExact64` (reviewer Issue 2 — Unicode label)
+- `TestLabelMultibyteTooLong` (reviewer Issue 2)
+- `TestConcurrentVerifyNoRace` (reviewer Issue 1 — data race, проверяется `-race`)
+- `TestConcurrentVerifyAndFlush` (reviewer Issue 1 — concurrent Verify+FlushUsage)
 
 ### Покрытые Acceptance Criteria
 
