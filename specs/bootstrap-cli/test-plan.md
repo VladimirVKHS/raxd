@@ -42,7 +42,7 @@
 | AC-9: баннер содержит `Vladimir Kovalev, OEM TECH`                      | unit        | `banner_test.go::TestRenderContainsAuthor`                       | green  |
 | AC-9: баннер содержит название продукта `raxd`                          | unit        | `banner_test.go::TestRenderContainsProductName`                  | green  |
 | AC-9: баннер содержит build-метаданные                                   | unit        | `banner_test.go::TestRenderContainsBuildInfo`                    | green  |
-| AC-9: баннер не загрязняет stdout машиночитаемых команд                 | integration | `cli_gaps_test.go::TestBannerNotOnStdout`                        | green  |
+| AC-9: баннер не загрязняет stdout машиночитаемых команд                 | integration | `cli_gaps_test.go::TestBannerChannelSplit`                        | green  |
 | AC-10: нет секретов в выводе (version/status/banner)                    | integration | `cli_test.go::TestStatusNoSecrets`, `banner_test.go::TestRenderNoSecrets`, `cli_gaps_test.go::TestVersionOutputNoSecretPatterns`, `TestBannerNoSecretPatterns` | green |
 | AC-11: есть `Dockerfile`, внутри проходят `go build` и `go test`       | build       | `docker build --target build` + `--target test` (см. раздел «Как запускать») | green |
 | AC-12: unit-тесты покрывают регистрацию команд, exit-коды, XDG         | unit/integ  | весь набор `*_test.go` — зелёный в Docker (см. раздел «Как запускать») | green |
@@ -147,7 +147,7 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 - `go vet ./...` — ноль предупреждений.
 - `go test ./...` — все тесты PASS, ни одного FAIL или SKIP.
 - Exit code прогона = 0.
-- Количество тестов: **49** (20 исходных + 29 добавленных).
+- Количество тестов: **50** (20 исходных + 30 добавленных).
 
 ---
 
@@ -157,16 +157,16 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 |---------------------------------------------------------------------------|-------------|--------|
 | `security_static_test.go`                                                 | `raxd_test` | 5      |
 | `internal/banner/banner_test.go`                                          | `banner_test` | 5    |
-| `internal/cli/cli_test.go`                                                | `cli_test`  | 13     |
+| `internal/cli/cli_test.go`                                                | `cli_test`  | 14     |
 | `internal/cli/cli_gaps_test.go` *(новый)*                                 | `cli_test`  | 9      |
 | `internal/cli/security_test.go` *(новый)*                                 | `cli_test`  | 3      |
 | `internal/config/paths_test.go`                                           | `config_test` | 6   |
 | `internal/config/security_test.go` *(новый)*                              | `config_test` | 3   |
 | `internal/version/version_test.go`                                        | `version_test` | 3  |
 | `internal/version/version_gaps_test.go` *(новый)*                        | `version_test` | 2  |
-| **Итого**                                                                 |             | **49** |
+| **Итого**                                                                 |             | **50** |
 
-*Примечание: `go test -v` выводит каждый `t.Run` sub-test отдельно; базовый счёт — 49 функций верхнего уровня.*
+*Примечание: `go test -v` выводит каждый `t.Run` sub-test отдельно; базовый счёт — 50 функций верхнего уровня.*
 
 ---
 
