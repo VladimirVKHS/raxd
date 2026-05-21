@@ -45,6 +45,8 @@ Matrix: `GOOS={linux,darwin} × GOARCH={amd64,arm64}` → 4 binaries
 `raxd_{linux,darwin}_{amd64,arm64}` + archives (`.tar.gz`) + `SHA256SUMS`.
 `CGO_ENABLED=0` (static build, simple distribution).
 
+**Dependencies are vendored** (`go mod vendor` → `vendor/` is committed to git): the Docker environment has no access to `proxy.golang.org`, and baseline §6 requires reproducible hermetic builds inside the container. Builds/tests run with `-mod=vendor`, without networked `go mod download`; integrity via `go.sum`/`go mod verify`. Any dependency change requires `go mod vendor` + committing `vendor/`. Details and alternatives — `specs/key-management/decisions/ADR-002-vendoring-offline-builds.md`. goreleaser/CI (distribution task) build from `vendor/`.
+
 ## Install (`curl | sh`)
 
 Script: detect `uname -s`→{linux,darwin}, `uname -m`→{amd64,arm64}; download the right
