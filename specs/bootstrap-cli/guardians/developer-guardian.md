@@ -47,5 +47,16 @@ Docker: go vet чисто, go build OK, go test 20/20 PASS, 0 SKIP. Постор
 
 Рекомендация (не блокер, выполнено дирижёром через architect): синхронизировать `plan.md` до `config.Paths() (PathSet, error)`.
 
+## Verdict (rev.2)
+pass
+
+---
+
+## Повторная проверка (rev.3) — фикс BUG-001
+
+BUG-001 (найден qa): баннер в PersistentPreRun писался в `os.Stderr` напрямую. Исправлено: `fmt.Fprintln(cmd.ErrOrStderr(), banner.Render())`; импорт `"os"` удалён.
+- (а) баннер идёт через `cmd.ErrOrStderr()`; (б) поведение сохранено (ErrOrStderr() = os.Stderr по умолчанию), тесты теперь перехватывают баннер через SetErr — улучшение тестируемости; (в) нет неиспользуемых импортов; (г) изменение точечное (только root.go + impl-notes).
+- Docker: go vet чисто, build OK, go test 49/49 PASS.
+
 ## Verdict (финал)
 pass
