@@ -9,10 +9,12 @@ build metadata is injected. It targets contributors working on the codebase.
 dangerous tool (like SSH). For that reason the security baseline (§6) requires that **all builds,
 tests, and any execution of `raxd` happen inside a Docker container — never on the host machine.**
 
-Most of the dangerous functionality (TLS transport, command execution, the `serve` daemon) does not
-exist yet, but the Docker-only workflow is established from the start so it is already in place when
-those features arrive. The key-management code that exists today writes a `keys.db` file under the
-state directory — running it in a container keeps that file inside the container, off the host.
+This now applies in a very concrete way: `raxd serve` opens a TLS listener and authenticates network
+connections, so running it (and its tests) belongs inside a container. The features that run *behind*
+that listener — command execution, the MCP server, file upload — do not exist yet, but the
+Docker-only workflow is established from the start so it is already in place when those features
+arrive. The state that `raxd` writes (`keys.db`, the TLS certificate under the state directory) stays
+inside the container, off the host.
 
 ## Build and test in Docker
 
@@ -44,6 +46,23 @@ The keystore tests include data-race checks; run them with the race detector:
 docker run --rm -v "$PWD":/src -w /src golang:1.25 \
   sh -c "go test -race ./internal/keystore/..."
 ```
+
+### Testing the TLS server (`internal/server`)
+
+The network server lives in `internal/server` and is exercised end-to-end with `httptest`'s TLS
+helpers — there is no need to bind a real privileged port. The rate limiter uses goroutines and a
+shared map, so the server tests must be run **with the race detector** (which requires
+`CGO_ENABLED=1`). Inside the container:
+
+```sh
+# Server tests with the race detector:
+docker run --rm raxd-test \
+  sh -c "CGO_ENABLED=1 go test -race -v -count=1 ./internal/server/..."
+```
+
+`go vet ./...` and the full suite run from the default `test` image step above; they also cover
+`internal/server` and `internal/cli` (the `serve` command). As with everything else, do not run the
+server on the host — keep it in the container.
 
 ### Build only
 
@@ -86,10 +105,18 @@ surface intentionally empty at this stage.
 │   │   ├── root.go          Root command, sub-command registration, banner via PersistentPreRun
 │   │   ├── key.go           "key" group: create / list / delete (working)
 │   │   ├── config.go        "config" group: port (stub)
-│   │   ├── serve.go         "serve" honest stub
+│   │   ├── serve.go         "serve" command: foreground TLS server (working)
 │   │   ├── version.go       "version" command (working)
 │   │   ├── status.go        "status" command (working)
 │   │   └── stub.go          Shared not-implemented-yet helper for stub commands
+│   ├── server/              TLS HTTP transport (the "serve" backend)
+│   │   ├── server.go        Server type: http.Server + tls.Config, Run / graceful shutdown
+│   │   ├── tls.go           Load or generate the self-signed ECDSA P-256 cert (0600/0644)
+│   │   ├── auth.go          Bearer extraction + keystore.Verify; success-audit middleware
+│   │   ├── middleware.go    Host/Origin, body-limit, recover, rate-limit middlewares
+│   │   ├── ratelimit.go     Per-key/per-IP token-bucket limiters with TTL GC
+│   │   ├── audit.go         AuditRecord + structured key=value audit logging
+│   │   └── handlers.go      healthHandler (pong) and dispatchHandler (501 catch-all)
 │   ├── keystore/            API key generation, storage, verification, revocation
 │   │   ├── keystore.go      Store: Open / Create / List / Revoke / Verify / FlushUsage
 │   │   ├── crypto.go        Key body / salt / id generation, hashing, fingerprint (crypto/rand)
@@ -98,7 +125,7 @@ surface intentionally empty at this stage.
 │   │   └── errors.go        Sentinel errors (ErrNotFound, ErrAlreadyRevoked, ErrCorrupt, ErrLabelTooLong)
 │   ├── config/
 │   │   ├── paths.go         XDG path resolution (PathSet, Paths, EnsureDirs)
-│   │   └── config.go        config.yaml loading via viper (Config, Load)
+│   │   └── config.go        config.yaml loading via viper (Config, Load — incl. networking fields)
 │   ├── version/
 │   │   └── version.go       Build metadata storage (Set, Info)
 │   └── banner/
@@ -120,11 +147,20 @@ surface intentionally empty at this stage.
 - `internal/cli/key.go` implements the `key` group on top of `internal/keystore`: it opens the
   store at the `KeysDB` path, calls `Create` / `List` / `Revoke`, and renders output per the UX
   contract (key body on stdout, decoration on stderr).
+- `internal/cli/serve.go` resolves paths and config, opens the keystore, builds a `server.Server`
+  (which loads or generates the TLS certificate), registers an `OnListen` hook that prints the
+  startup block only after a successful bind (via `srv.SetOnListen`, fired from inside `srv.Run`),
+  and runs the server until `SIGINT` / `SIGTERM`. The API key is never read from argv or the
+  environment.
+- `internal/server` owns the transport: it wraps a TCP listener in TLS 1.3, runs the fixed
+  middleware chain (body-limit → recover → Host/Origin → auth → rate-limit), routes `GET /healthz`
+  to `pong` and everything else to a `501` catch-all, and on shutdown calls `Store.FlushUsage` after
+  `http.Server.Shutdown`.
 - `internal/keystore` owns all secret handling: `crypto/rand` generation, `sha256(key‖salt)`
-  hashing, constant-time `Verify`, atomic `0600` writes, and advisory flock. The plaintext key
-  never leaves the caller's stack (`PlainKey`); it is not stored in any `Store` field.
-- Stub commands (`config port`, `serve`) return a sentinel error from their `RunE`, which cobra
-  turns into a non-zero exit.
+  hashing, constant-time `Verify`, atomic `0600` writes, and advisory flock. The server consumes it
+  read-only via `Verify` and `Fingerprint`; the plaintext key never leaves the caller's stack.
+- The stub command (`config port`) returns a sentinel error from its `RunE`, which cobra turns into
+  a non-zero exit.
 - `version`, `status` print to stdout and return `nil` (exit `0`).
 
 ## Build metadata via ldflags
@@ -171,7 +207,11 @@ the direct dependencies (the `require` block in `go.mod`) are:
 | `github.com/spf13/cobra` | CLI and sub-commands |
 | `github.com/spf13/viper` | `config.yaml` loading |
 | `github.com/olekukonko/tablewriter` | `key list` table rendering |
-| `github.com/charmbracelet/log` | structured audit logging for `key create` / `key delete` |
+| `github.com/charmbracelet/log` | structured audit logging (`key create` / `key delete` and the `serve` audit stream) |
+| `golang.org/x/time/rate` | per-key / per-IP token-bucket rate limiting in `internal/server` |
+
+The TLS transport itself uses only the standard library (`net/http`, `crypto/tls`, `crypto/x509`,
+`crypto/ecdsa`); no third-party HTTP or TLS framework is added.
 
 Two notes on libraries that are present but not used directly:
 
@@ -188,5 +228,8 @@ Two notes on libraries that are present but not used directly:
 ## Related documents
 
 - [`commands.md`](commands.md) — what each command does and outputs.
-- [`configuration.md`](configuration.md) — paths, the `keys.db` database, and the `config.yaml` format.
+- [`configuration.md`](configuration.md) — paths, the `keys.db` database, the TLS directory, and the
+  `config.yaml` format.
+- [`troubleshooting.md`](troubleshooting.md) — common problems with `serve`, the TLS certificate,
+  and the config file.
 - The repository root [`README.md`](../README.md) — overview and quick start.

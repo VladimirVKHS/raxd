@@ -92,15 +92,25 @@ func TestStaticNoExecCommand(t *testing.T) {
 	}
 }
 
-// TestStaticNoNetListen verifies that no production source file opens a network
-// listener — the serve stub must not call net.Listen or http.ListenAndServe.
-// Security requirement: "заглушка serve не открывает сетевой порт, не вызывает net.Listen"
-// baseline §3/§6, AC D4.
+// TestStaticNoNetListen verifies that network listener calls are only in the
+// server transport package (internal/server), not in CLI or cmd code.
+//
+// Before tls-transport: serve was an honest stub — no net.Listen anywhere.
+// After tls-transport: internal/server legitimately uses net.Listen (it IS
+// the transport layer). CLI/cmd must still not open listeners directly.
+//
+// Security requirement: "CLI-заглушки и cmd не открывают сетевые порты напрямую;
+// сетевой транспорт инкапсулирован в internal/server"
+// baseline §3/§6.
 func TestStaticNoNetListen(t *testing.T) {
-	files := append(
-		goSourceFiles(t, "internal"),
-		goSourceFiles(t, "cmd")...,
-	)
+	// internal/server IS the transport — net.Listen is allowed there.
+	// All other packages (cli, cmd, config, keystore, banner, version) must not
+	// open listeners directly.
+	var files []string
+	for _, dir := range []string{"internal/cli", "internal/config", "internal/keystore",
+		"internal/banner", "internal/version", "cmd"} {
+		files = append(files, goSourceFiles(t, dir)...)
+	}
 
 	forbiddenPatterns := []string{
 		`net.Listen`,
@@ -111,7 +121,7 @@ func TestStaticNoNetListen(t *testing.T) {
 
 	for _, pat := range forbiddenPatterns {
 		if matches := grepFiles(t, files, pat); len(matches) > 0 {
-			t.Errorf("SECURITY: forbidden networking pattern %q found in production sources:\n  %s",
+			t.Errorf("SECURITY: forbidden networking pattern %q found outside internal/server:\n  %s",
 				pat, strings.Join(matches, "\n  "))
 		}
 	}

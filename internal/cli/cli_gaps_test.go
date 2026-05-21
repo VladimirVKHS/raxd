@@ -4,12 +4,13 @@ package cli_test
 // Each test corresponds to a specific AC or security requirement from spec.md / security-requirements.md.
 
 import (
+	"net"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/vladimirvkhs/raxd/internal/version"
 )
+
 
 // --- AC: version output goes to stdout, banner goes to stderr ---
 
@@ -119,8 +120,8 @@ func TestVersionDefaultValues(t *testing.T) {
 // --- AC: stub error messages contain the correct command name ---
 
 // TestRemainingStubErrorMessageContainsCommandName verifies that remaining stubs
-// (config port, serve) output "error: <cmd>: not implemented yet".
-// Key commands are now implemented and have their own error messages.
+// (config port) output "error: <cmd>: not implemented yet".
+// Note: "serve" is NO LONGER a stub (tls-transport task implemented it).
 // AC: "оставшиеся заглушки завершаются с понятным сообщением вида <команда>: not implemented yet".
 func TestRemainingStubErrorMessageContainsCommandName(t *testing.T) {
 	cases := []struct {
@@ -128,7 +129,7 @@ func TestRemainingStubErrorMessageContainsCommandName(t *testing.T) {
 		wantCmd string
 	}{
 		{[]string{"config", "port", "8080"}, "config port"},
-		{[]string{"serve"}, "serve"},
+		// "serve" removed: no longer a stub after tls-transport.
 	}
 
 	for _, tc := range cases {
@@ -144,26 +145,45 @@ func TestRemainingStubErrorMessageContainsCommandName(t *testing.T) {
 	}
 }
 
-// --- SECURITY: serve does not block (honest stub, D4) ---
+// --- SECURITY: serve is a real server (not a blocking stub without exit) ---
 
-// TestServeDoesNotBlock verifies that "serve" completes within a short deadline.
-// Security requirement: "заглушка serve не запускает блокирующего процесса".
-// AC (D4): "честная заглушка: печатает сообщение и завершается с ненулевым кодом".
-func TestServeDoesNotBlock(t *testing.T) {
-	done := make(chan error, 1)
-	go func() {
-		_, _, err := executeCmd("serve")
-		done <- err
-	}()
+// TestServeStartsRealServer verifies that "serve" is a real TLS server,
+// not the old honest stub. It checks that:
+// 1. serve output does NOT contain "not implemented yet"
+// 2. serve output DOES contain "tls" or "listening" (startup block)
+//
+// Note: serve blocks waiting for SIGINT/SIGTERM in real use. In the CLI unit
+// test environment we only check startup output by running with an occupied
+// port (so it fails fast with a bind error).
+func TestServeStartsRealServer(t *testing.T) {
+	// Use temp state dir + pre-occupy port 7822 to force fast bind-error exit.
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
 
-	select {
-	case err := <-done:
-		if err == nil {
-			t.Error("serve must return non-zero (non-nil error)")
-		}
-		// Good: completed quickly, non-zero exit.
-	case <-time.After(2 * time.Second):
-		t.Fatal("serve blocked for > 2s — must be an honest non-blocking stub (D4)")
+	// Try to occupy port 7822 so serve fails fast.
+	ln, err := net.Listen("tcp", "127.0.0.1:7822")
+	if err != nil {
+		// Port may already be in use — still valid for the test.
+		ln = nil
+	}
+	if ln != nil {
+		defer ln.Close()
+	}
+
+	_, stderr, _ := executeCmd("serve")
+
+	// Must not be the old stub message.
+	if strings.Contains(stderr, "not implemented yet") {
+		t.Errorf("serve must not be a stub; got 'not implemented yet' in stderr=%q", stderr)
+	}
+	// Should contain something from the real server (TLS info or bind error).
+	hasServerOutput := strings.Contains(stderr, "tls") ||
+		strings.Contains(stderr, "listening") ||
+		strings.Contains(stderr, "cannot bind") ||
+		strings.Contains(stderr, "address already in use") ||
+		strings.Contains(stderr, "cert") ||
+		strings.Contains(stderr, "TLS")
+	if !hasServerOutput {
+		t.Errorf("serve should produce server output; stderr=%q", stderr)
 	}
 }
 
@@ -234,5 +254,70 @@ func TestStatusStateNotRunning(t *testing.T) {
 
 	if !strings.Contains(stdout, "not running") {
 		t.Errorf("status stdout must contain 'not running'; got:\n%s", stdout)
+	}
+}
+
+// ============================================================================
+// D-1 / ux-spec §5: startup block must NOT appear on bind error
+// ============================================================================
+
+// TestServePortInUseNoStartupBlock verifies ux-spec §5: when the port is already in use,
+// the startup block ("listening", "cert", "tls", "press Ctrl+C") must NOT be printed.
+// Only "error:" and "hint:" must appear on stderr, and the command must exit non-zero.
+// Regression: previously serve.go printed the startup block BEFORE srv.Run(), so a bind
+// error still showed "listening on https://..." — a false positive (D-1).
+func TestServePortInUseNoStartupBlock(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	// Occupy port 7822 so serve fails fast at bind.
+	ln, err := net.Listen("tcp", "127.0.0.1:7822")
+	if err != nil {
+		t.Skip("port 7822 unavailable for test setup")
+	}
+	defer ln.Close()
+
+	_, stderr, cmdErr := executeCmd("serve")
+
+	// Command must exit non-zero (bind error → exit 1).
+	if cmdErr == nil {
+		t.Error("D-1/ux-spec §5: serve with occupied port must exit non-zero, got nil error")
+	}
+
+	// "listening" must NOT appear — the server never bound.
+	if strings.Contains(stderr, "listening") {
+		t.Errorf("D-1/ux-spec §5: startup block 'listening' must not appear on bind error; stderr=%q", stderr)
+	}
+
+	// "press Ctrl+C" must NOT appear.
+	if strings.Contains(stderr, "press Ctrl+C") {
+		t.Errorf("D-1/ux-spec §5: startup block 'press Ctrl+C' must not appear on bind error; stderr=%q", stderr)
+	}
+
+	// "error:" must appear on stderr (ux-spec §5.1).
+	if !strings.Contains(stderr, "error:") {
+		t.Errorf("D-1/ux-spec §5: 'error:' must appear on bind error; stderr=%q", stderr)
+	}
+}
+
+// TestServePortInUseNoShutdownBlock verifies ux-spec §5: when the port is already in use,
+// the shutdown block ("shutting down", "draining", "flushing", "stopped") must NOT appear.
+// The server never started, so there is nothing to shut down.
+func TestServePortInUseNoShutdownBlock(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+
+	ln, err := net.Listen("tcp", "127.0.0.1:7822")
+	if err != nil {
+		t.Skip("port 7822 unavailable for test setup")
+	}
+	defer ln.Close()
+
+	_, stderr, _ := executeCmd("serve")
+
+	shutdownPhrases := []string{"shutting down", "draining", "flushing", "stopped"}
+	for _, phrase := range shutdownPhrases {
+		if strings.Contains(stderr, phrase) {
+			t.Errorf("D-1/ux-spec §5: shutdown block phrase %q must not appear on bind error; stderr=%q",
+				phrase, stderr)
+		}
 	}
 }

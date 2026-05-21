@@ -13,13 +13,14 @@ import (
 	"testing"
 )
 
-// TestRemainingStubsErrorPrefix verifies remaining stubs (config port, serve) use the
+// TestRemainingStubsErrorPrefix verifies remaining stubs (config port) use the
 // canonical "error:" prefix. Key commands are now implemented; they have their own error format.
-// Security requirement: "заглушки config/serve возвращают ошибку not implemented yet".
+// Note: "serve" is no longer a stub (tls-transport task); it starts a real TLS server.
+// Security requirement: "заглушки config возвращают ошибку not implemented yet".
 func TestRemainingStubsErrorPrefix(t *testing.T) {
 	cases := [][]string{
 		{"config", "port", "9999"},
-		{"serve"},
+		// "serve" removed: no longer a stub after tls-transport implementation.
 	}
 	for _, args := range cases {
 		_, stderr, err := executeCmd(args...)

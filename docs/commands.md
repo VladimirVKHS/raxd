@@ -1,15 +1,17 @@
 # Command reference
 
 This document describes every command in the `raxd` command tree **as it exists in the code
-today**. The service commands (`version`, `status`) and the API-key commands
-(`key create`, `key list`, `key delete`) are fully working. The remaining feature commands
-(`config port`, `serve`) are present as honest stubs that report `not implemented yet`.
+today**. The service commands (`version`, `status`), the API-key commands
+(`key create`, `key list`, `key delete`), and the network server (`serve`) are fully working. The
+one remaining feature command, `config port`, is present as an honest stub that reports
+`not implemented yet`.
 
 All CLI text (usage strings, messages, the banner, errors) is in English.
 
 > Where to run these commands: per the security baseline, `raxd` is built and run **inside Docker
-> only**. Examples below show the command and its output; for how to actually invoke them in a
-> container, see [`development.md`](development.md).
+> only**. This applies in particular to `raxd serve`, which opens a TLS listener. Examples below
+> show the command and its output; for how to actually invoke them in a container, see
+> [`development.md`](development.md).
 
 ## Command tree
 
@@ -23,7 +25,7 @@ raxd
 │   └── delete         Revoke an API key                   (working)
 ├── config             Manage configuration
 │   └── port           Set the listening port              (stub)
-└── serve              Start the raxd daemon                (stub)
+└── serve              Start the raxd TLS server           (working)
 ```
 
 `raxd --help` lists the root command and all sub-commands. Each command also responds to
@@ -65,6 +67,10 @@ predictably:
 - **stderr** carries the banner, all human-facing decoration (warnings, metadata, confirmations),
   and every `error:` / `hint:` message.
 
+`raxd serve` is a special case: it is a long-running process and writes **everything** — the startup
+block, the audit stream, the shutdown block, and any startup error — to **stderr**. Its **stdout is
+always empty**. See [`raxd serve`](#raxd-serve) below.
+
 The practical consequence for key management:
 
 ```
@@ -84,7 +90,9 @@ stay on the terminal because they go to stderr.
 | `key delete` succeeds | `0` |
 | `key create` validation/store error (e.g. label too long, corrupt store) | `1` |
 | `key delete` with an unknown id, an already-revoked id, or a missing id argument | `1` |
-| Any stub command (`config port`, `serve`) | `1` |
+| `serve` shuts down gracefully (SIGINT / SIGTERM) | `0` |
+| `serve` startup error (port in use, no TLS-dir permission, corrupt cert, corrupt `keys.db`, invalid bind address, invalid `config.yaml`) | `1` |
+| Stub command (`config port`) | `1` |
 | `status` cannot determine `$HOME` | non-zero (error) |
 | Unknown command or flag (cobra default) | non-zero |
 
@@ -153,8 +161,9 @@ storage, and TLS certificates.
 - **Output channel:** stdout
 - **Exit code:** `0`
 
-The daemon is never running on the current build, so `state` is always `not running`. The fields are
-printed as aligned `key   value` lines:
+The `state` field reports `not running`. `raxd status` reports the on-disk paths only; it does not
+probe a running `serve` process, so the state is shown as `not running` even while a `raxd serve`
+process is listening. The fields are printed as aligned `key   value` lines:
 
 ```
 $ raxd status
@@ -184,8 +193,9 @@ an error, and the exit code remains `0`:
 ```
 
 The `keys` line shows the **path** to the key database (`keys.db`). It never prints the contents of
-that file. `status` also never prints TLS contents, the configured port, or any other secret — only
-the state string and the resolved paths.
+that file. The `tls` line shows the **path** to the TLS directory (`tls/`), where `raxd serve`
+stores the certificate and private key. `status` never prints TLS contents, the configured port, or
+any other secret — only the state string and the resolved paths.
 
 **Error case — `$HOME` cannot be determined.** If the home directory cannot be resolved, `status`
 prints an error with a hint to stderr and exits with a non-zero code:
@@ -206,11 +216,12 @@ alone prints the group's help.
 - **Short:** `Manage API keys`
 - **Long:** Create, list, and delete API keys used to authenticate remote access.
 
-> **Scope note.** This release implements local key management only: generation, listing,
-> revocation, and secure storage on disk. There is **no network layer yet** — keys are not
-> presented over a connection, and there is no TLS server or MCP server to present them to. Those
-> arrive in later tasks (see the README's "Coming next"). Today the keys you create are stored and
-> can be revoked; what consumes them over the network does not exist yet.
+> **Scope note.** Keys created here are now consumed over the network: `raxd serve` authenticates
+> every connection against the same `keys.db`. A client presents the full key in the HTTP
+> `Authorization: Bearer <key>` header (see [`raxd serve`](#raxd-serve)). What is still missing is
+> what runs *behind* authentication — command execution, the MCP server, and file upload are not
+> implemented yet (the server answers any route other than the health check with `501 Not
+> Implemented`). See the README's "Coming next".
 
 ### How a key is stored (security model)
 
@@ -269,7 +280,8 @@ When `--name` is not provided, the label is shown as `-`:
 
 **Key format.** The key body is `rax_live_` followed by a base64url-encoded random value with no
 padding. The random part is 32 bytes (256 bits) of cryptographically secure randomness, so the full
-key is roughly 52 characters long (`rax_live_` plus 43 base64url characters).
+key is roughly 52 characters long (`rax_live_` plus 43 base64url characters). This is the exact
+string a network client sends to `raxd serve` as `Authorization: Bearer rax_live_…`.
 
 **Capturing only the key (scripts/CI).** Because the key body is the only thing on stdout, you can
 redirect it to a file or capture it in a variable. The banner, warning, and metadata are on stderr:
@@ -339,8 +351,10 @@ Column rules:
 - **LABEL** is truncated to 20 characters with a trailing `…` if longer; a key without a label shows
   `-`.
 - **CREATED** is `YYYY-MM-DD`.
-- **LAST USED** is `YYYY-MM-DD`, or `never` if the key has not been used. On the current build keys
-  show `never`, because there is no network layer yet to record usage.
+- **LAST USED** is `YYYY-MM-DD`, or `never` if the key has not been used. Today keys typically show
+  `never`: the network server records authentication in its audit stream (see [`raxd serve`](#raxd-serve)),
+  but the per-key last-used timestamp is only persisted by `FlushUsage` on a graceful shutdown, and
+  the health check is the only request that reaches a handler.
 
 **Revoked keys are not shown.** A key that has been revoked with `key delete` disappears from this
 list. There is no flag to include revoked keys; the record is retained only for audit purposes.
@@ -381,6 +395,10 @@ $ raxd key delete d7bc3a34da19d94e
 Pass the **full** 16-character id shown by either `raxd key create` or `raxd key list` — both show
 the full id, so you can copy it straight from the `key list` table. The id is a random identifier,
 not derived from the key body, so it is safe to show in confirmations, errors, and the table.
+
+> **Revocation takes effect immediately on the network.** A running `raxd serve` verifies every
+> connection against the live `keys.db`, and `Verify` only considers active records. A key that you
+> revoke stops authenticating on its very next request — there is no cache or restart delay.
 
 > **Audit line (stderr).** Like `key create`, a successful `key delete` also writes a single audit
 > record to **stderr** via `charmbracelet/log`, for example
@@ -423,10 +441,353 @@ error: key delete requires an id argument
 
 ---
 
+## `raxd serve`
+
+Start `raxd` as a **foreground TLS server**.
+
+- **Usage:** `raxd serve`
+- **Output channel:** stderr only (the startup block, the audit stream, the shutdown block, and any
+  error). **stdout is always empty.**
+- **Exit code:** `0` on graceful shutdown (SIGINT / SIGTERM); `1` on a startup error.
+- **Help text:**
+
+  ```
+  Start raxd as a foreground TLS server.
+
+  The server listens on the configured address (default: 127.0.0.1:7822)
+  with TLS 1.3. Every connection is authenticated with an API key before
+  any request is processed.
+
+  Configuration is read from ~/.config/raxd/config.yaml.
+  For production use, register raxd as a system service instead.
+  ```
+
+`raxd serve` is a long-running process: it blocks after the startup block and keeps running until it
+receives `SIGINT` (Ctrl+C) or `SIGTERM`. It takes **no flags or positional arguments** other than
+`-h` / `--help`; everything is configured through `config.yaml` (see
+[`configuration.md`](configuration.md#networking-and-serve-fields)).
+
+> **Run it in Docker.** Like all of `raxd`, `serve` is built and run inside a container only
+> (security baseline §6). It opens a network listener, so running it on the host is out of scope.
+> See [`development.md`](development.md).
+
+### What `serve` does (scope)
+
+This is the first networked piece of `raxd`. In its current form `serve` provides exactly two
+things: a **secure transport** and **per-connection authentication**.
+
+- **TLS 1.3 transport.** The TCP listener is wrapped in `crypto/tls` with `MinVersion =
+  tls.VersionTLS13`. A client that offers only TLS 1.2 or lower fails the handshake. TLS 1.3
+  cipher suites are not configurable and are intentionally left at the Go defaults.
+- **Self-signed certificate.** On the first run, `serve` generates a self-signed ECDSA P-256
+  certificate (with SAN `127.0.0.1` and `localhost`) in the TLS directory
+  (`~/.local/state/raxd/tls/`). The private key `key.pem` is written with `0600` permissions and
+  the certificate `cert.pem` with `0644`. On later runs the existing pair is **reused** and never
+  regenerated. There is no built-in trust anchor: clients must trust this self-signed certificate
+  explicitly (or skip verification in a controlled local setup).
+- **API-key authentication on every connection.** Every request is authenticated **before** any
+  routing or handling. The client presents its key in the HTTP `Authorization: Bearer <key>`
+  header — for example `Authorization: Bearer rax_live_…`. The key is checked against `keys.db` via
+  the keystore's constant-time `Verify`. The key is **never** taken from a command-line argument or
+  an environment variable.
+- **Host / Origin checks, rate limiting, and an audit log** run as part of the same fixed
+  middleware chain (described below).
+- **One real operation: a health check.** After successful authentication, the only route that does
+  real work is `GET /healthz`, which returns `pong`. Every other path returns `501 Not Implemented`.
+
+**Out of scope for `serve` today (not implemented):**
+
+- Command execution over the network (no shell, no `exec`).
+- The MCP server and its tools/resources.
+- File upload.
+- mTLS / client certificates.
+- Registering `raxd` as a systemd/launchd service (`serve` is foreground only — there is no
+  `--daemon` mode and `raxd` does not install a service).
+
+These are future tasks. The catch-all route exists precisely as the extension point where they will
+attach; until then it answers `501`.
+
+### The request pipeline
+
+Every request passes through a fixed chain before it can reach a handler. A request is rejected at
+the first stage it fails:
+
+```
+TLS 1.3 handshake
+  → body-size limit (http.MaxBytesReader)
+  → recover (panics → 500, server stays up)
+  → Host / Origin validation        → 403 if rejected
+  → authentication (Bearer → Verify) → 401 / 403 if rejected
+  → rate limit (per-key + per-IP)    → 429 if exceeded
+  → router:  GET /healthz → 200 pong
+             anything else → 501 not implemented
+```
+
+The audit stream records exactly **one** record per request that reaches the audit-aware chain
+(Host/Origin, auth, rate-limit, or the success path). The outermost layer — the body-size limit — is
+the one exception: a `413` produced there is **not** audited (see the response-codes note below).
+
+### Response codes
+
+| Condition | HTTP status |
+|-----------|-------------|
+| No `Authorization` header / not `Bearer` / empty token | `401 Unauthorized` |
+| Unknown, revoked, or otherwise unverifiable key (`Verify` returns "not found") | `401 Unauthorized` |
+| Key store unreadable/corrupt at request time (`Verify` errors) | `403 Forbidden` |
+| `Host` header not in the host allowlist | `403 Forbidden` |
+| `Origin` header present and not in the origin allowlist | `403 Forbidden` |
+| Per-key or per-IP rate limit exceeded | `429 Too Many Requests` |
+| Request body larger than `max_body_bytes` | `413` (via `http.MaxBytesReader`) |
+| Authenticated `GET /healthz` | `200 OK` (body `pong`) |
+| Authenticated request to any other route | `501 Not Implemented` (body `not implemented`) |
+
+> **The `413` from the body limit is not audited.** The body-size limit
+> (`bodyLimitMiddleware`) is the **outermost** layer in the chain — it runs before the auth and
+> audit middlewares. When a body exceeds `max_body_bytes`, the `413` is produced by the standard
+> library's `http.MaxBytesReader` and the request never reaches the audit-aware chain, so **no**
+> audit record (no `FAIL` / `DENY` / `RATE` line) is written for it. This is unlike `401`
+> (`FAIL`), `403` (`DENY`), and `429` (`RATE`), which always emit exactly one audit line. In short:
+> a `413` is silent in the audit stream — confirm an oversized request another way (for example by
+> observing the `413` on the client) rather than by grepping the audit log.
+
+For security, error responses carry an **empty body**: the server does not tell the client *why* a
+request was rejected (whether a key is unknown vs. revoked, for instance). The reason is recorded
+only in the server's own audit stream (below), and — as noted — the `413` case is not even recorded
+there. See [`configuration.md`](configuration.md#networking-and-serve-fields) for the allowlists,
+rate-limit, and body-size settings.
+
+### Startup output
+
+The startup block is printed **only after the TCP listener is successfully bound** — it is emitted
+from an `OnListen` hook that `serve` registers in `internal/server`. If the start fails before the
+bind succeeds (see [Startup errors](#startup-errors-exit-1) below), this block is **not** printed at
+all.
+
+On the **first run** (no certificate yet), `serve` generates the pair and prints, on stderr:
+
+```
+  cert      generated  /home/user/.local/state/raxd/tls/cert.pem
+  key       generated  /home/user/.local/state/raxd/tls/key.pem  (0600)
+  tls       TLS 1.3 only
+  listening https://127.0.0.1:7822
+  press Ctrl+C to stop
+
+```
+
+On **later runs** the existing certificate is loaded (`generated` becomes `loaded`, and the `(0600)`
+note is omitted because the permissions are already set):
+
+```
+  cert      loaded  /home/user/.local/state/raxd/tls/cert.pem
+  key       loaded  /home/user/.local/state/raxd/tls/key.pem
+  tls       TLS 1.3 only
+  listening https://127.0.0.1:7822
+  press Ctrl+C to stop
+
+```
+
+If there are **no API keys** in `keys.db`, the server still starts (an empty store is a valid state),
+but it warns that every connection will be rejected with `401`:
+
+```
+  cert      loaded  /home/user/.local/state/raxd/tls/cert.pem
+  key       loaded  /home/user/.local/state/raxd/tls/key.pem
+  tls       TLS 1.3 only
+  listening https://127.0.0.1:7822
+  warning   no API keys found — all connections will be rejected
+  hint      create a key with "raxd key create --name <label>"
+  press Ctrl+C to stop
+
+```
+
+### Audit stream
+
+Once running, `serve` writes **one structured line per request** to stderr, using
+`charmbracelet/log` in `key=value` form. Silence means health: there are no heartbeat lines. The
+format is:
+
+```
+time=<UTC ISO-8601> level=<INFO|WARN> msg=<AUTH|FAIL|DENY|RATE> fp=<fingerprint> remote=<IP:port> [reason="<text>"]
+```
+
+- `fp` is the 12-hex-character key fingerprint (`keystore.Fingerprint`), or `-` when no key was
+  identified. The **key body is never logged** — only the fingerprint.
+- `remote` is the client `IP:port` (no DNS resolution).
+- `reason` appears only on non-success lines.
+
+| `msg` | level | When |
+|-------|-------|------|
+| `AUTH` | `INFO` | Request authenticated and passed all gates (reached a handler) |
+| `FAIL` | `WARN` | No / invalid / unknown / revoked key (the `401` cases) |
+| `DENY` | `WARN` | Corrupt key store (`403`), bad `Host` (`403`), or bad `Origin` (`403`) |
+| `RATE` | `WARN` | Rate limit exceeded (`429`), per-key or per-IP |
+
+> **The body-size `413` has no audit line.** The `413` returned when a request body exceeds
+> `max_body_bytes` is generated by the outermost `http.MaxBytesReader` layer, which sits **before**
+> the audit-aware middlewares. Unlike the `401` / `403` / `429` cases above, it does **not** produce
+> a `FAIL`, `DENY`, or `RATE` record — there is no `msg` value for it. Do not expect an oversized
+> request to show up in the audit stream.
+
+Examples:
+
+```
+time=2026-05-21T14:32:01Z level=INFO msg=AUTH fp=a3f9c1d2e847 remote=127.0.0.1:54312
+time=2026-05-21T14:32:05Z level=WARN msg=FAIL fp=- remote=127.0.0.1:54401 reason="no authorization header"
+time=2026-05-21T14:32:07Z level=WARN msg=FAIL fp=b7d2a0c19f3e remote=127.0.0.1:54402 reason="authentication failed"
+time=2026-05-21T14:32:09Z level=WARN msg=DENY fp=- remote=127.0.0.1:54403 reason="key store unavailable"
+time=2026-05-21T14:32:11Z level=WARN msg=DENY fp=- remote=127.0.0.1:54404 reason="invalid host header"
+time=2026-05-21T14:32:13Z level=WARN msg=DENY fp=- remote=127.0.0.1:54405 reason="invalid origin header"
+time=2026-05-21T14:32:15Z level=WARN msg=RATE fp=a3f9c1d2e847 remote=127.0.0.1:54312 reason="rate limit exceeded (key)"
+time=2026-05-21T14:32:16Z level=WARN msg=RATE fp=- remote=127.0.0.1:54500 reason="rate limit exceeded (ip)"
+```
+
+Because everything is on stderr, filtering works as expected:
+
+```sh
+# Capture all server output to a file (stdout stays empty):
+raxd serve 2>server.log
+
+# Watch only failures:
+raxd serve 2>&1 | grep -E "FAIL|DENY|RATE"
+```
+
+### Calling the health check
+
+The health check is the only working endpoint. It requires a valid key. Because the certificate is
+self-signed, a client must trust it or skip verification — the example below uses `curl -k` for a
+controlled local test:
+
+```sh
+# From inside the container running `raxd serve`, with KEY set to a created key:
+curl -k -H "Authorization: Bearer $KEY" https://127.0.0.1:7822/healthz
+# → pong
+```
+
+- Without the header you get `401` (and a `FAIL` audit line); the body is empty.
+- With a valid key, `/healthz` returns `200` and the body `pong`.
+- Any other path (for example `/exec`, `/mcp`) returns `501` with the body `not implemented`.
+
+### Graceful shutdown
+
+Press Ctrl+C (or send `SIGTERM`). `serve` stops accepting new connections, drains active ones,
+flushes buffered key-usage data, and exits `0`:
+
+```
+^C
+  shutting down  signal received
+  draining       waiting for active connections to finish
+  flushing       usage data flushed
+  stopped
+
+```
+
+(The leading `^C` is printed by the terminal, not by `raxd`. Under `SIGTERM` it is absent and the
+block begins with `shutting down`.)
+
+The shutdown block is printed **only if the server actually started** — that is, only if the startup
+block was printed after a successful bind. A run that failed to start (see below) prints neither the
+startup nor the shutdown block.
+
+### Startup errors (exit 1)
+
+A startup error is printed in the standard `error:` / `hint:` format on stderr and the process exits
+with code `1`.
+
+> **No startup block on a failed start.** The startup block (`cert` / `key` / `tls` /
+> `listening …` / `press Ctrl+C`) is printed **only after the TCP listener is successfully bound**,
+> via an `OnListen` hook in `internal/server`. If the start fails for any reason — port already in
+> use, no permission to create the TLS directory, a corrupt certificate, a corrupt `keys.db`, or a
+> bad `config.yaml` — `serve` prints **only** the `error:` / `hint:` lines to stderr and exits `1`.
+> Neither the startup block nor the shutdown block appears, so there is never a misleading
+> `listening …` line for a server that did not start. This behaviour matches the cert/permission
+> errors too: they are detected before the bind, so the startup block is never reached. See
+> [`troubleshooting.md`](troubleshooting.md#raxd-serve) for the per-error details.
+
+Port already in use:
+
+```
+error: cannot bind to 127.0.0.1:7822: address already in use
+  hint: check what is using port 7822 with "lsof -i :7822" and stop it, or change the port with "raxd config port <PORT>"
+```
+
+> Note: `raxd config port` is still a stub and does not actually persist the port yet (see below).
+> To change the port today, edit `port:` in `config.yaml` directly.
+
+Cannot create the TLS directory (no write permission):
+
+```
+error: cannot create TLS directory: permission denied
+  hint: check that the current user has write access to ~/.local/state/raxd/
+```
+
+Certificate generation failed (disk full / no write permission):
+
+```
+error: failed to generate TLS certificate
+  hint: check available disk space and write permissions for /home/user/.local/state/raxd/tls/
+```
+
+Existing certificate or key is corrupt / unreadable (it is **never** overwritten automatically):
+
+```
+error: TLS certificate or key is corrupted or unreadable
+  hint: remove the files in /home/user/.local/state/raxd/tls/ and run "raxd serve" again to regenerate
+```
+
+`keys.db` is corrupt or unreadable at startup:
+
+```
+error: key store is corrupted or unreadable
+  hint: check file permissions on the keys.db path shown in "raxd status"
+  hint: do not attempt to repair the file manually — contact support if data recovery is needed
+```
+
+**Configuration load failure (invalid bind address *or* invalid `config.yaml`).** Both kinds of
+config-load failure are handled by a **single** error path in `serve`, and that path prints **one
+generic hint** that references `bind_addr` / `config.yaml`. The `error:` line still reports what
+actually went wrong (it carries the underlying message from `config.Load`), but the `hint:` line is
+**not specialised per cause** — it always points you at the bind address in `config.yaml`.
+
+For an invalid bind address the pair reads naturally, because the cause and the hint line up:
+
+```
+error: invalid bind address "0.0.0.256": not a valid IP address
+  hint: set a valid address in config.yaml (field: bind_addr), for example "127.0.0.1" or "0.0.0.0"
+```
+
+For a malformed `config.yaml` you get the same generic hint even though the real problem is YAML
+syntax, not the bind address — so **treat the hint as "fix your `config.yaml`", not literally "fix
+`bind_addr`"**:
+
+```
+error: config file is not valid YAML: <parser detail>
+  hint: set a valid address in config.yaml (field: bind_addr), for example "127.0.0.1" or "0.0.0.0"
+```
+
+In this YAML case the `bind_addr` reference is incidental: the actionable part is the `error:` line
+(`config file is not valid YAML`), and the fix is to correct the YAML syntax in
+`config.yaml`. See [`troubleshooting.md`](troubleshooting.md#error-config-file-is-not-valid-yaml).
+
+### Security summary for `serve`
+
+- TLS 1.3 is mandatory; TLS 1.2 and lower are rejected at the handshake.
+- The private TLS key is `0600`; the certificate `0644`; the TLS directory `0700`.
+- An existing certificate is reused and never silently overwritten.
+- The default bind address is `127.0.0.1` (loopback only).
+- Every connection is authenticated before any handler runs; the key is taken only from the
+  `Authorization: Bearer` header, never from argv or the environment.
+- Rejections return an empty body; the reason lives only in the audit stream (except the body-limit
+  `413`, which is not audited at all).
+- The audit stream logs the fingerprint, never the key body or the raw `Authorization` header.
+- Rate limiting applies per-key and per-IP.
+- The only operation behind authentication is the health check; everything else is `501`.
+
+---
+
 ## Stub commands
 
-The following commands are part of the tree and have correct usage strings and help text, but their
-logic is **not implemented yet**. Each prints `error: <command>: not implemented yet` to **stderr**
+The following command is part of the tree and has correct usage strings and help text, but its
+logic is **not implemented yet**. It prints `error: <command>: not implemented yet` to **stderr**
 and exits with code `1`.
 
 ### `raxd config`
@@ -451,24 +812,9 @@ error: config port: not implemented yet
 ```
 
 > The help text notes that the default port is `7822`. This command does **not** write anything to
-> `config.yaml` yet — actually persisting the port is planned (see the README's "Coming next"). The
-> default `7822` currently exists only as a viper default used by the config loader.
-
-### `raxd serve`
-
-Start the raxd daemon.
-
-- **Usage:** `raxd serve`
-- **Status:** stub — exit `1`.
-
-```
-$ raxd serve
-error: serve: not implemented yet
-```
-
-> `serve` is an **honest stub** (decision D4): it prints the message and exits with a non-zero code
-> **without** starting a blocking process, opening a port, or calling `net.Listen`. It is safe to
-> run. The real foreground daemon and system-service registration arrive in a later task.
+> `config.yaml` yet — actually persisting the port is planned (see the README's "Coming next"). To
+> change the port today, edit the `port:` key in `config.yaml` by hand; `raxd serve` reads it on the
+> next start.
 
 ---
 
@@ -482,8 +828,9 @@ error: serve: not implemented yet
 | `raxd key create` | stdout (key) + stderr (decor) | yes | validation / store error | working |
 | `raxd key list` | stdout | yes (incl. empty store) | — | working |
 | `raxd key delete` | stderr | yes | not found / already revoked / missing id | working |
+| `raxd serve` | stderr | graceful shutdown | startup error (port/cert/db/bind/config) | working |
 | `raxd config port` | stderr | — | yes | stub |
-| `raxd serve` | stderr | — | yes | stub |
 
-See also: [`configuration.md`](configuration.md) for paths, `keys.db`, and `config.yaml`,
-[`development.md`](development.md) for building and testing in Docker.
+See also: [`configuration.md`](configuration.md) for paths, `keys.db`, `config.yaml`, and the
+networking/`serve` fields; [`development.md`](development.md) for building and testing in Docker;
+[`troubleshooting.md`](troubleshooting.md) for common `serve` problems.
