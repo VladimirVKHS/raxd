@@ -2,6 +2,7 @@ package cli_test
 
 import (
 	"bytes"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -151,13 +152,26 @@ func TestStubConfigPort(t *testing.T) {
 	}
 }
 
-func TestStubServe(t *testing.T) {
-	_, stderr, err := executeCmd("serve")
-	if err == nil {
-		t.Error("serve must return non-nil error (honest stub)")
+// TestServeIsNoLongerStub verifies that "serve" is no longer an honest stub.
+// It occupies port 7822 so serve fails fast with a bind error (no blocking).
+// After tls-transport: serve starts the real TLS server; it does NOT print
+// "not implemented yet".
+func TestServeIsNoLongerStub(t *testing.T) {
+	t.Setenv("XDG_STATE_HOME", t.TempDir())
+	// Occupy port 7822 so serve returns quickly with bind error.
+	ln, err := net.Listen("tcp", "127.0.0.1:7822")
+	if err != nil {
+		// Port may already be in use — still good for the test.
+		ln = nil
 	}
-	if !strings.Contains(stderr, "not implemented yet") {
-		t.Errorf("stderr = %q", stderr)
+	if ln != nil {
+		defer ln.Close()
+	}
+	_, stderr, _ := executeCmd("serve")
+	// serve returns non-nil error (port in use) — that is expected.
+	// The important invariant: it no longer prints "not implemented yet".
+	if strings.Contains(stderr, "not implemented yet") {
+		t.Errorf("serve must no longer be a stub; stderr = %q", stderr)
 	}
 }
 
@@ -225,12 +239,13 @@ func TestStatusNoSecrets(t *testing.T) {
 
 // --- SECURITY: Non-key stubs must not produce stdout (machine-readable channel) ---
 
-// TestNonKeyStubsProduceNoStdout verifies that remaining stubs (config port, serve)
+// TestNonKeyStubsProduceNoStdout verifies that remaining stubs (config port)
 // do not write to stdout. Key commands are now implemented and have defined stdout behaviour.
+// Note: "serve" is now a real server and is tested separately in TestServeIsNoLongerStub.
 func TestNonKeyStubsProduceNoStdout(t *testing.T) {
 	cases := [][]string{
 		{"config", "port", "8080"},
-		{"serve"},
+		// "serve" removed: it is now a real server that blocks; tested separately.
 	}
 	for _, args := range cases {
 		stdout, _, _ := executeCmd(args...)

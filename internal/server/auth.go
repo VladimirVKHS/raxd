@@ -99,6 +99,14 @@ func authMiddleware(store *keystore.Store, auditFn AuditFn) func(http.Handler) h
 			}
 			ctx := context.WithValue(r.Context(), ctxKeyFingerprint, fp)
 			ctx = context.WithValue(ctx, ctxKeyKeyID, rec.ID)
+
+			// SR-19/SR-20: write AUTH audit record on successful authentication.
+			auditFn(AuditRecord{
+				Fingerprint: fp,
+				RemoteAddr:  remote,
+				Result:      "success",
+			})
+
 			next.ServeHTTP(w, r.WithContext(ctx))
 		})
 	}
