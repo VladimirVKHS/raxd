@@ -5,9 +5,11 @@ to act as a system service, a CLI utility, a network server (TCP + TLS), and an 
 agents, all at once.
 
 > **Project status: early.** The command tree, configuration/path resolution, build metadata, a
-> product banner, a reproducible Docker dev/test environment, and **API key management**
-> (`key create` / `key list` / `key delete`) are in place and working. The networked parts of the
-> product — TLS transport, command execution, the MCP server, the `serve` daemon, and `curl | sh`
+> product banner, a reproducible Docker dev/test environment, **API key management**
+> (`key create` / `key list` / `key delete`), and now the **TLS network server** (`raxd serve`) are
+> in place and working. The server provides a TLS 1.3 transport with per-connection API-key
+> authentication, rate limiting, and an audit log. The features that run *behind* that transport —
+> command execution, the MCP server, registering `raxd` as a system service, and `curl | sh`
 > installation — are **not implemented yet**; see [Coming next](#coming-next).
 
 Author: **Vladimir Kovalev, OEM TECH**.
@@ -26,10 +28,11 @@ server. The end product is a single binary that is simultaneously:
 
 Target platforms: **macOS and Linux**, architectures **amd64 and arm64**. Windows is out of scope.
 
-At this stage the binary already provides a stable command tree, three working service commands
-(`version`, `status`, and the `key` group), and the local foundation that the networked features
-will build on: API keys are issued and stored securely so that later tasks (TLS transport, the MCP
-server, command execution) can authenticate against them.
+At this stage the binary provides a stable command tree, the local foundation (API keys stored
+securely on disk), and the first networked piece: `raxd serve` opens a TLS 1.3 listener and
+authenticates every connection against those keys. What is still missing is the work that happens
+*after* authentication — running commands, the MCP tools, file upload — which later tasks will attach
+to the server's extension point.
 
 ## What works today
 
@@ -41,24 +44,35 @@ server, command execution) can authenticate against them.
 | `raxd key list` — list active API keys (no secrets) | **Working** |
 | `raxd key delete` — revoke an API key | **Working** |
 | Secure key storage in `keys.db` (salted SHA-256 hash, `0600` file) | **Working** |
+| `raxd serve` — foreground TLS 1.3 server | **Working** |
+| TLS 1.3 transport with a self-signed ECDSA P-256 certificate (auto-generated, reused) | **Working** |
+| Per-connection API-key authentication over the network (`Authorization: Bearer`) | **Working** |
+| Rate limiting (per key and per IP) and DNS-rebinding `Host`/`Origin` checks | **Working** |
+| Structured audit log of every connection (fingerprint only, never the key) | **Working** |
+| Authenticated health check (`GET /healthz` → `pong`) | **Working** |
 | `raxd --help` and the full command tree | **Working** |
 | Product banner with author (printed to stderr) | **Working** |
 | XDG-based config/state path resolution (`~/.config/raxd`, `XDG_*` overrides) | **Working** |
 | Directory creation with `0700` permissions | **Working** |
-| `config.yaml` loading via viper (defaults, missing-file tolerance) | **Working (library; not yet wired into commands)** |
+| `config.yaml` loading via viper (networking fields read by `serve`) | **Working** |
+| Command execution over the network | **Not implemented** (every non-health route → `501`) |
+| MCP server (tools/resources) | **Not implemented** |
+| File upload | **Not implemented** |
 | `raxd config port` | **Stub** (`not implemented yet`) |
-| `raxd serve` | **Stub** (honest — prints and exits, does **not** open a port) |
+| `curl \| sh` installer | **Not implemented** |
+| Running as a registered system service (systemd/launchd) | **Not implemented** (`serve` is foreground only) |
 
 Everything in the [Coming next](#coming-next) section is **not implemented yet**. In particular,
-there is no network layer: the keys you create are stored and revocable, but nothing yet presents
-them over a connection.
+once a connection is authenticated, the only operation the server performs is the health check;
+every other route returns `501 Not Implemented`.
 
 ## Requirements
 
 - [Go 1.25](https://go.dev/dl/) (module declares `go 1.25`).
 - [Docker](https://www.docker.com/) — **all builds, tests, and any execution of `raxd` happen
-  inside a container, never on the host.** `raxd` is designed to execute commands over the network,
-  so its place is an isolated container (see the security baseline §6 and `docs/development.md`).
+  inside a container, never on the host.** `raxd` is designed to execute commands over the network
+  and `raxd serve` opens a TLS listener, so its place is an isolated container (see the security
+  baseline §6 and `docs/development.md`).
 
 ## Quick start (Docker)
 
@@ -90,8 +104,8 @@ metadata, and why the workflow is Docker-only.
 
 ## Commands
 
-`raxd` exposes the following command tree. The service commands and the `key` group are working;
-`config port` and `serve` are honest stubs.
+`raxd` exposes the following command tree. The service commands, the `key` group, and `serve` are
+working; `config port` is an honest stub.
 
 ```
 raxd
@@ -103,7 +117,7 @@ raxd
 │   └── delete         revoke an API key                   (working)
 ├── config             manage configuration
 │   └── port           set the listening port              (stub)
-└── serve              start the raxd daemon                (stub)
+└── serve              start the raxd TLS server           (working)
 ```
 
 A full reference with usage strings, exit codes, and output examples is in
@@ -154,6 +168,45 @@ salted SHA-256 hash and the salt, never the plaintext key. See
 [`docs/commands.md`](docs/commands.md#api-keys-raxd-key) for the complete reference and
 [`docs/configuration.md`](docs/configuration.md#the-keysdb-key-database) for the storage details.
 
+### Example: `raxd serve`
+
+Start the TLS server. It runs in the foreground and writes everything to **stderr** (its stdout is
+empty). On the first run it generates the self-signed certificate; on later runs it reuses it:
+
+```
+$ raxd serve
+  cert      generated  /home/user/.local/state/raxd/tls/cert.pem
+  key       generated  /home/user/.local/state/raxd/tls/key.pem  (0600)
+  tls       TLS 1.3 only
+  listening https://127.0.0.1:7822
+  press Ctrl+C to stop
+
+```
+
+After this block the server blocks and writes one structured audit line per connection. A successful
+authenticated request looks like this (only the key fingerprint is logged, never the key):
+
+```
+time=2026-05-21T14:32:01Z level=INFO msg=AUTH fp=a3f9c1d2e847 remote=127.0.0.1:54312
+```
+
+Call the health check with a created key (the certificate is self-signed, so a local client must
+trust it or skip verification — `curl -k` here is a controlled local test):
+
+```sh
+curl -k -H "Authorization: Bearer $KEY" https://127.0.0.1:7822/healthz
+# → pong
+```
+
+Press Ctrl+C for a graceful shutdown (exit code `0`). For the full startup/audit/shutdown reference,
+response codes, and configuration fields, see [`docs/commands.md`](docs/commands.md#raxd-serve) and
+[`docs/configuration.md`](docs/configuration.md#networking-and-serve-fields).
+
+> **Scope:** `serve` today provides only the secure transport and authentication. Once a connection
+> is authenticated, the only working route is the health check; command execution, the MCP server,
+> and file upload are not implemented (every other route returns `501`). `serve` is foreground only
+> and does **not** register itself as a system service.
+
 ### Example: `raxd version`
 
 Prints a single line to **stdout** and exits with code `0`. On a build without ldflags
@@ -172,7 +225,8 @@ raxd 1.0.0 (commit abc1234, built 2025-06-01)
 ### Example: `raxd status`
 
 Prints the daemon state and the resolved filesystem paths to **stdout** and exits with code `0`.
-The state is always `not running` on the current build:
+`status` reports on-disk paths only and does not probe a running `serve` process, so `state` is
+shown as `not running` even while a server is listening:
 
 ```
   state    not running
@@ -213,29 +267,45 @@ config path on both Linux and macOS:
 | Config file | `~/.config/raxd/config.yaml` | follows config directory |
 | State directory | `~/.local/state/raxd` | `$XDG_STATE_HOME/raxd` |
 | Keys database | `~/.local/state/raxd/keys.db` | follows state directory |
-| TLS directory (future) | `~/.local/state/raxd/tls` | follows state directory |
+| TLS directory | `~/.local/state/raxd/tls` | follows state directory |
 
 Directories are created with `0700` permissions when `raxd` runs. The `keys.db` file is created with
-`0600` permissions the first time you run `key create`. TLS files are **not** created yet — only
-their path is reserved. Full details are in [`docs/configuration.md`](docs/configuration.md).
+`0600` permissions the first time you run `key create`. The TLS certificate (`cert.pem`, `0644`) and
+private key (`key.pem`, `0600`) are created in the TLS directory the first time you run `raxd serve`,
+and reused afterward. Full details, including the networking fields that `serve` reads from
+`config.yaml`, are in [`docs/configuration.md`](docs/configuration.md).
 
 ## Coming next
 
 The following capabilities are **planned and not implemented yet**. They are listed so you know what
 the binary is being built toward; do not treat them as available today.
 
-- **TLS transport** — self-signed certificates and a TCP/TLS network server (tls-transport task).
-  This is also what would present an API key over a connection; today keys exist locally only.
 - **Command execution** — running commands over the network with an allowlist, timeouts, and an
-  audit log (command-exec task).
-- **MCP server** — Model Context Protocol tools and transport for AI agents (mcp-server task).
-- **Real `serve` and service registration** — running as a foreground daemon and registering a
-  systemd/launchd service (service-install task).
+  audit log (command-exec task). Today the server answers any non-health route with `501`.
+- **MCP server** — Model Context Protocol tools and transport for AI agents (mcp-server task). It is
+  expected to attach to the existing TLS server's extension point (for example a `/mcp` route behind
+  the same authentication and rate limiting).
+- **File upload** — transferring files over the authenticated connection (file-upload task).
+- **System-service registration** — running `raxd` as a systemd/launchd service (`serve` is
+  foreground only today and does not install or manage a service).
+- **mTLS / client certificates** — currently out of scope; authentication is by API key only.
 - **Installation via `curl | sh`** — an `install.sh` script, goreleaser release matrix, SHA256
   verification, and macOS notarization (distribution task). *There is no installer yet — install
   by building from source in Docker as described above.*
-- **`config port`** — actually writing the listening port to `config.yaml`.
-- **Visual design** — lipgloss styling, adaptive banner width, and colored `key list` output.
+- **`config port`** — actually writing the listening port to `config.yaml` (edit the file by hand
+  for now).
+- **Visual design** — lipgloss styling, adaptive banner width, and colored output.
+
+## Documentation
+
+- [`docs/commands.md`](docs/commands.md) — full command reference (`version`, `status`, the `key`
+  group, `serve`, and the `config port` stub).
+- [`docs/configuration.md`](docs/configuration.md) — paths, `keys.db`, the TLS directory, and the
+  `config.yaml` networking fields.
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — common problems with `serve`, the TLS
+  certificate, keys, and the config file.
+- [`docs/development.md`](docs/development.md) — building and testing in Docker, project layout, and
+  build metadata.
 
 ## Author
 

@@ -1,8 +1,8 @@
 # Configuration and paths
 
 This document describes where `raxd` stores its configuration and state, how to override those
-locations, the `keys.db` key database, and the `config.yaml` format — **as implemented in the code
-today**.
+locations, the `keys.db` key database, the TLS directory, and the `config.yaml` format — **as
+implemented in the code today**.
 
 ## Path resolution
 
@@ -92,6 +92,17 @@ key is shown to you once, at creation time, and never again.
 The file is JSON with a small versioned envelope (`{"version": 1, "keys": [...]}`). Treat it as
 internal: do not edit it by hand.
 
+### How `serve` uses `keys.db`
+
+`raxd serve` opens this same `keys.db` and authenticates every connection against it (via the
+keystore's constant-time `Verify`). Two consequences worth noting:
+
+- An **empty or missing** `keys.db` is a valid state: `serve` starts but warns that every connection
+  will be rejected with `401`. Create a key first (`raxd key create`).
+- A **corrupt** `keys.db` is a startup error: `serve` reports `key store is corrupted or unreadable`
+  and exits with code `1`, without modifying the file. (If the store becomes unreadable while the
+  server is running, individual requests are answered with `403` and a `DENY` audit line.)
+
 ### Behaviour and edge cases
 
 - **Missing file is not an error.** Before you create your first key, `keys.db` does not exist.
@@ -106,38 +117,119 @@ internal: do not edit it by hand.
 
 See [`commands.md`](commands.md#api-keys-raxd-key) for the full `key` command reference.
 
+## The TLS directory (`tls/`)
+
+The TLS directory (`~/.local/state/raxd/tls` by default) holds the certificate and private key that
+`raxd serve` uses for the TLS 1.3 listener. The directory itself is created with `0700` permissions
+the first time `raxd` runs.
+
+**The files are created on the first `raxd serve`, not before.** Until you start the server for the
+first time, the directory exists (or is reserved) but contains no certificate.
+
+| File | Permissions | Created by |
+|------|-------------|------------|
+| `cert.pem` | `0644` | `raxd serve` (first run) — self-signed ECDSA P-256 certificate, SAN `127.0.0.1` + `localhost` |
+| `key.pem` | `0600` | `raxd serve` (first run) — the matching private key |
+
+Behaviour:
+
+- **First run:** `serve` generates the pair (atomic write: temp file → `chmod` → rename, so the key
+  is never momentarily world-readable).
+- **Later runs:** the existing pair is **reused** and never regenerated.
+- **Corrupt or partial state:** if the files exist but cannot be loaded — for example only one of the
+  two is present — `serve` reports `TLS certificate or key is corrupted or unreadable` and exits
+  `1`. It does **not** overwrite anything; you must remove the files manually to regenerate.
+
+> The certificate is self-signed and there is no built-in trust anchor. Clients must trust it
+> explicitly or skip verification in a controlled local setup (mTLS / client certificates are out of
+> scope for this build). See [`commands.md`](commands.md#raxd-serve) for the `serve` reference and
+> [`troubleshooting.md`](troubleshooting.md#raxd-serve) for certificate problems.
+
 ## The `config.yaml` file
 
 Configuration is read from the config file shown above (`~/.config/raxd/config.yaml` by default)
-using [viper](https://github.com/spf13/viper). The file is YAML.
+using [viper](https://github.com/spf13/viper). The file is YAML. It is read by `raxd serve` at
+startup; the other commands do not consume it yet.
 
-### Format
+### Networking and `serve` fields
 
-The current build recognises a single key:
+`raxd serve` reads the following keys from `config.yaml`. Every key has a built-in default, so a
+missing file (or a file that sets only some keys) is fine — the defaults below apply. A full example
+with the default values:
 
 ```yaml
 # ~/.config/raxd/config.yaml
+
+# Listener
 port: 7822
+bind_addr: "127.0.0.1"
+
+# Rate limiting (token bucket, applied per key AND per client IP)
+rate_limit: 10        # sustained requests per second
+rate_burst: 20        # maximum burst
+
+# DNS-rebinding protection (host part only; ports are ignored for Host)
+host_allow:   ["localhost", "127.0.0.1", "::1"]
+origin_allow: ["localhost", "127.0.0.1", "::1"]
+
+# Connection timeouts (Go duration strings)
+read_timeout:        "30s"
+read_header_timeout: "10s"
+write_timeout:       "30s"
+idle_timeout:        "120s"
+
+# Size limits
+max_header_bytes: 1048576   # 1 MiB
+max_body_bytes:   1048576   # 1 MiB
 ```
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `port` | integer | `7822` | The TCP port `raxd` is intended to listen on (used by future networking) |
+| `port` | integer | `7822` | TCP port the listener binds to |
+| `bind_addr` | string | `127.0.0.1` | Local address to bind to. Must be a valid IP. Default is loopback only |
+| `rate_limit` | number | `10` | Sustained request rate (events/second) per key and per IP |
+| `rate_burst` | integer | `20` | Maximum burst size for the token bucket |
+| `host_allow` | list of strings | `["localhost", "127.0.0.1", "::1"]` | Allowed `Host` header values (host part only). A request whose `Host` is not in this list gets `403` |
+| `origin_allow` | list of strings | `["localhost", "127.0.0.1", "::1"]` | Allowed `Origin` hostnames. If `Origin` is present and its hostname is not in this list, the request gets `403`. A request with **no** `Origin` is allowed (typical for non-browser clients) |
+| `read_timeout` | duration | `30s` | Maximum time to read the full request (incl. body) — Slowloris protection |
+| `read_header_timeout` | duration | `10s` | Maximum time to read request headers |
+| `write_timeout` | duration | `30s` | Maximum time to write the response |
+| `idle_timeout` | duration | `120s` | Maximum idle time for a keep-alive connection |
+| `max_header_bytes` | integer | `1048576` (1 MiB) | Maximum size of request headers |
+| `max_body_bytes` | integer | `1048576` (1 MiB) | Maximum size of the request body (enforced via `http.MaxBytesReader`; exceeding it yields `413`) |
 
-### Behaviour
+Notes on the values:
 
-- **Missing file is not an error.** If `config.yaml` does not exist, the defaults are applied
-  (`port: 7822`). `raxd status` shows the file path with the suffix `(not found, defaults
-  applied)` and exits with code `0`.
+- **`bind_addr` is validated as an IP.** An invalid value (for example `0.0.0.256`) makes `serve`
+  fail at startup with `invalid bind address "…": not a valid IP address` and exit `1`. The default
+  binds to loopback only; binding to a non-loopback address (such as `0.0.0.0`) exposes the server
+  beyond the host and is the operator's responsibility.
+- **Durations** are Go duration strings (`"30s"`, `"2m"`, `"500ms"`). Plain numbers are interpreted
+  as nanoseconds, so prefer the string form.
+- **Origin matching is strict.** Only the hostname part of the `Origin` URL is compared, and it must
+  match an allowlist entry exactly (case-insensitive). Prefix tricks such as
+  `https://localhost.evil.com` do **not** match `localhost`.
+- **`host_allow` / `origin_allow` lists** are compared case-insensitively; the `Host` comparison
+  uses only the host part (any port is stripped).
+- **Rate-limiter cleanup** is not configurable: idle per-key/per-IP limiters are garbage-collected
+  after a fixed 10-minute TTL.
+
+### General behaviour
+
+- **Missing file is not an error.** If `config.yaml` does not exist, every default above is applied.
+  `raxd status` shows the file path with the suffix `(not found, defaults applied)` and exits with
+  code `0`.
 - **Malformed YAML is an error.** If the file exists but is not valid YAML, the config loader
-  returns an explicit error (`config file is not valid YAML`).
-
-> Important scope note: the config loader exists as a library, but the CLI commands do **not** yet
-> act on the loaded values. In particular, `raxd config port <PORT>` is a stub and does not write
-> the port to `config.yaml`, and no command currently changes its behaviour based on the `port`
-> value. Wiring configuration into command behaviour is planned (see the README's "Coming next").
+  returns an explicit error (`config file is not valid YAML`). For `raxd serve` this is a startup
+  error (exit `1`).
+- **`config port` does not write the file yet.** `raxd config port <PORT>` is still a stub. To
+  change the port (or any other field) today, edit `config.yaml` directly; `raxd serve` reads it on
+  the next start.
 
 ## Related documents
 
-- [`commands.md`](commands.md) — full command reference, including `raxd status` and `raxd key`.
+- [`commands.md`](commands.md) — full command reference, including `raxd status`, `raxd key`, and
+  `raxd serve`.
+- [`troubleshooting.md`](troubleshooting.md) — common problems with `serve`, the TLS certificate,
+  and the config file.
 - [`development.md`](development.md) — building and testing in Docker.
