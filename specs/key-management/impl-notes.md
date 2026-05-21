@@ -201,6 +201,33 @@ error: key "<id>" is already revoked
 
 После правки: `go test ./...` — 87 тестов, 0 skip; `go test -race ./internal/keystore/...` — OK.
 
+### UX-баг Q5: полный ID в key list (tech-writer)
+
+**Проблема:** `runKeyList` усекал ID до 12 символов (`truncate(r.ID, 12)`), а `runKeyDelete`
+сравнивает аргумент со стандартным 16-hex ID. Workflow `key create → key list → key delete <id>`
+был сломан: ID из таблицы не совпадал с реальным ID, delete возвращал `ErrNotFound`.
+
+**Решение:** `idDisplay := "  " + r.ID` — показываем полный ID без усечения. Функция `truncate`
+(без эллипсиса, только для ID-колонки) удалена как мёртвый код. `truncateEllipsis` (для
+LABEL-колонки, 20 рун + "…") сохранена.
+
+**Тест:** `TestKeyListIDUsableWithDelete` — создаёт ключ, считывает полный ID из `create`-stderr,
+проверяет наличие этого ID в `key list`-stdout, затем вызывает `key delete <id>` — должно завершиться
+с exit 0.
+
+**Реальный вывод `key list`** (снято в Docker после Q5-фикса):
+```
+┌──────────────────┬────────────────┬────────────┬───────────┐
+│ ID               │ LABEL          │ CREATED    │ LAST USED │
+├──────────────────┼────────────────┼────────────┼───────────┤
+│ a18c3815047d9240 │ production-key │ 2026-05-21 │ never     │
+│ 309b5f7c39e13b6f │ staging        │ 2026-05-21 │ never     │
+└──────────────────┴────────────────┴────────────┴───────────┘
+```
+ID-колонка: 16 hex-символов, без отсечения. Совместим с `key delete <id>` напрямую.
+
+После правки: `go test ./...` — 88 тестов, 0 skip; `go test -race ./internal/keystore/...` — OK.
+
 ### Покрытые Acceptance Criteria
 
 | AC | Тест | Статус |
@@ -252,11 +279,12 @@ error: key "<id>" is already revoked
 
 ## Что осталось qa
 
-- Интеграционные тесты CLI: create → list (assert new key in table) → delete → list (assert gone).
+- ~~Интеграционный тест create → list (assert new key in table) → delete~~ — покрыт `TestKeyListIDUsableWithDelete` (Q5).
+- Тест: create → delete → list → assert key gone (полный цикл с проверкой исчезновения из таблицы).
 - Тест параллельных операций (concurrent Create + List, SR-23 поведенческий).
 - Тест `key list` с несколькими ключами (таблица с данными, ширина колонок).
 - Тест channel-split для `key list` (вывод только на stdout, баннер на stderr).
 - Проверка audit-записи: что charmbracelet/log включает fingerprint, не тело ключа.
-- Тест `key delete <id>` на несуществующий id через CLI (end-to-end).
+- Тест `key delete <id>` на несуществующий id через CLI (end-to-end) — покрыт `TestKeyDeleteNotFoundCLI`.
 
 *Автор продукта: Vladimir Kovalev, OEM TECH.*
