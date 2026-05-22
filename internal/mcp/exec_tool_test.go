@@ -202,7 +202,8 @@ func TestExecNoShellInjectionViaMCP(t *testing.T) {
 
 // TestExecExtraFieldRejected — лишнее поле env → isError, команда не запущена.
 func TestExecExtraFieldRejected(t *testing.T) {
-	baseURL, _, client, _ := startMCPServerWithExecCfg(t, defaultExecCfg())
+	baseURL, _, client, auditBuf := startMCPServerWithExecCfg(t, defaultExecCfg())
+	auditBuf.Reset()
 
 	body, _ := callExecuteCommand(t, client, baseURL, map[string]interface{}{
 		"command": "echo",
@@ -215,6 +216,11 @@ func TestExecExtraFieldRejected(t *testing.T) {
 	if result == nil {
 		// Возможно protocol error — тоже допустимо.
 		if envelope["error"] != nil {
+			// F-3: убеждаемся что команда не была запущена.
+			log := auditBuf.String()
+			if strings.Contains(log, "tool=execute_command") && strings.Contains(log, "result=ok") {
+				t.Errorf("AC3/SR-51: execute_command запустился несмотря на лишнее поле; log=%s", log)
+			}
 			return // SDK вернул protocol error — команда не запущена
 		}
 		t.Fatalf("AC3/SR-51: no result and no error; body=%s", body)
@@ -223,11 +229,20 @@ func TestExecExtraFieldRejected(t *testing.T) {
 	if !isErr {
 		t.Errorf("AC3/SR-51: extra field 'env' must cause isError:true; body=%s", body)
 	}
+
+	// F-3 (qa-guardian): убеждаемся что команда не была запущена (нет exec-записи result=ok).
+	log := auditBuf.String()
+	if strings.Contains(log, "tool=execute_command") && strings.Contains(log, "result=ok") {
+		t.Errorf("AC3/SR-51: execute_command успешно выполнился при лишнем поле — команда должна была быть отклонена; log=%s", log)
+	} else {
+		t.Logf("AC3/SR-51: OK — команда не запущена при лишнем поле 'env'")
+	}
 }
 
 // TestExecUnknownFieldRejected — поле shell → isError.
 func TestExecUnknownFieldRejected(t *testing.T) {
-	baseURL, _, client, _ := startMCPServerWithExecCfg(t, defaultExecCfg())
+	baseURL, _, client, auditBuf := startMCPServerWithExecCfg(t, defaultExecCfg())
+	auditBuf.Reset()
 
 	body, _ := callExecuteCommand(t, client, baseURL, map[string]interface{}{
 		"command": "echo",
@@ -238,6 +253,11 @@ func TestExecUnknownFieldRejected(t *testing.T) {
 	result, _ := envelope["result"].(map[string]interface{})
 	if result == nil {
 		if envelope["error"] != nil {
+			// F-3: убеждаемся что команда не была запущена.
+			log := auditBuf.String()
+			if strings.Contains(log, "tool=execute_command") && strings.Contains(log, "result=ok") {
+				t.Errorf("AC3/SR-51: execute_command запустился несмотря на поле 'shell'; log=%s", log)
+			}
 			return
 		}
 		t.Fatalf("AC3/SR-51: no result and no error; body=%s", body)
@@ -245,6 +265,14 @@ func TestExecUnknownFieldRejected(t *testing.T) {
 	isErr, _ := result["isError"].(bool)
 	if !isErr {
 		t.Errorf("AC3/SR-51: extra field 'shell' must cause isError:true; body=%s", body)
+	}
+
+	// F-3 (qa-guardian): убеждаемся что команда не была запущена (нет exec-записи result=ok).
+	log := auditBuf.String()
+	if strings.Contains(log, "tool=execute_command") && strings.Contains(log, "result=ok") {
+		t.Errorf("AC3/SR-51: execute_command успешно выполнился при поле 'shell' — команда должна была быть отклонена; log=%s", log)
+	} else {
+		t.Logf("AC3/SR-51: OK — команда не запущена при поле 'shell'")
 	}
 }
 

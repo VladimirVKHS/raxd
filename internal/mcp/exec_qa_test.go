@@ -2,32 +2,142 @@ package mcp_test
 
 // exec_qa_test.go — QA-тесты для MCP-инструмента execute_command (дополнение к exec_tool_test.go).
 //
-// Закрывают пробелы, выявленные независимым QA-анализом после developer-guardian (раунд 2):
+// Закрывают пробелы, выявленные независимым QA-анализом после developer-guardian (раунд 2),
+// а также замечания qa-guardian (раунд 1):
 //
 //   - AC13/SR-57: TestExecAuditExactlyOneRecord  — ровно одна exec-запись/вызов
 //   - AC14/SR-60: TestExecAuditLogfmtParseable   — exec-запись парсится как logfmt key=value
 //   - SR-63:      TestExecAuditArgsVerbatimInSuccess — args в аудите дословно (success-ветка)
-//   - AC16/SR-42: TestExecRateLimit429BeforeCommand — 429 ДО исполнения при превышении лимита
+//   - AC16/SR-42: TestExecRateLimit429BeforeCommand — РЕАЛЬНЫЙ 429 через полный TLS-стек
 //   - AC9/SR-55:  TestRootWarnAuditRecord          — unit-тест WARN-логики writeAudit при euid==0
 //   - SR-56:      TestDenyRootUnitLogic             — deny_root=true+euid==0 через конфиг handler
 //   - SR-66:      TestExecConfigDefaults            — безопасные конфиг-дефолты применяются
+//   - AC12/SR-27: TestExecKeystoreCorruptReturns403 — corrupt keys.db → 403 ДО execute_command
+//
+// qa-guardian раунд 1 замечания закрыты:
+//   F-2: TestExecRateLimit429BeforeCommand переписан на РЕАЛЬНЫЙ 429 через startMCPServerWithRateLimit
+//   F-7: parseSimpleLogfmt исправлен для quoted-значений с пробелами (ищет до конца строки)
 //
 // Тесты запускаются только в Docker (-mod=vendor; AC18/SR-67).
 // Продуктовый код не правится — только тесты поведения.
 
 import (
 	"bytes"
-	"encoding/json"
+	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	internalmcp "github.com/vladimirvkhs/raxd/internal/mcp"
 	"github.com/vladimirvkhs/raxd/internal/cmdexec"
+	"github.com/vladimirvkhs/raxd/internal/keystore"
 	"github.com/vladimirvkhs/raxd/internal/server"
+	"github.com/vladimirvkhs/raxd/internal/version"
 )
+
+// ============================================================================
+// startMCPServerWithRateLimit — вспомогательная функция для теста реального 429
+// ============================================================================
+
+// startMCPServerWithRateLimit запускает полный TLS-стек raxd с заданными
+// параметрами rate-limit (rateLimit, rateBurst). Возвращает baseURL, ключ,
+// http.Client и auditBuf. Аналогична startMCPServer из mcp_test.go, но
+// принимает явный rate-limit — для тестирования AC16/SR-42.
+func startMCPServerWithRateLimit(t *testing.T, rateLimit float64, rateBurst int) (
+	baseURL string, keyStr string, client *http.Client, auditBuf *bytes.Buffer,
+) {
+	t.Helper()
+
+	paths := newTestPaths(t)
+	store, err := keystore.Open(paths.KeysDB)
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	plain, _, err := store.Create("ratelimit-exec-key")
+	if err != nil {
+		t.Fatalf("create key: %v", err)
+	}
+
+	auditBuf = &bytes.Buffer{}
+	logger := newTestLogger(auditBuf)
+	auditFn := server.NewAuditFnForTest(logger)
+
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg())
+	if err != nil {
+		t.Fatalf("mcp.NewHandler: %v", err)
+	}
+
+	// Выделяем свободный порт.
+	ln, lerr := net.Listen("tcp", "127.0.0.1:0")
+	if lerr != nil {
+		t.Fatalf("freePort: %v", lerr)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	cfg := newTestConfig(port)
+	cfg.RateLimit = rateLimit
+	cfg.RateBurst = rateBurst
+
+	srv, err := server.New(cfg, paths, store, logger, mcpH)
+	if err != nil {
+		t.Fatalf("server.New: %v", err)
+	}
+
+	// Строим TLS-клиент.
+	certPath := filepath.Join(paths.TLSDir, "cert.pem")
+	pool := x509.NewCertPool()
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read cert: %v", err)
+	}
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("append cert")
+	}
+	client = &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_ = srv.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+		}
+	})
+
+	// Ждём готовности сервера.
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, dialErr := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec
+		if dialErr == nil {
+			conn.Close()
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	baseURL = fmt.Sprintf("https://127.0.0.1:%d", port)
+	keyStr = string(plain)
+	return
+}
 
 // ============================================================================
 // AC13/SR-57: ровно одна exec-запись за вызов (без двойной записи)
@@ -146,10 +256,8 @@ func TestExecAuditLogfmtParseable(t *testing.T) {
 		}
 	}
 
-	// Базовая logfmt-парсимость: каждое слово вида key=value должно содержать "=".
-	// Разбиваем по пробелам и проверяем что нет "сломанных" токенов без "=".
-	// Примечание: charmbracelet/log может квотировать значения: key="value with spaces".
-	// Просто убеждаемся что строка не пустая и содержит хотя бы одно key=value.
+	// Базовая logfmt-парсимость: извлекаем пары key=value.
+	// Используем исправленный парсер, корректно обрабатывающий quoted-значения с пробелами.
 	kv := parseSimpleLogfmt(execLine)
 	if len(kv) == 0 {
 		t.Errorf("AC14/SR-60: logfmt-парсер не извлёк ни одной пары key=value из строки %q", execLine)
@@ -166,21 +274,81 @@ func TestExecAuditLogfmtParseable(t *testing.T) {
 }
 
 // parseSimpleLogfmt извлекает пары key=value из строки logfmt.
-// Понимает unquoted (key=val) и quoted (key="val with spaces") формы.
+//
+// Корректно обрабатывает:
+//   - unquoted значения: key=val
+//   - quoted значения с пробелами: key="value with spaces"
+//
+// Алгоритм:
+//  1. Для каждого токена ищем '='.
+//  2. Если значение начинается с '"' — читаем до закрывающей '"'
+//     (которая может быть в следующих "токенах" после split по пробелам).
+//  3. Иначе — значение заканчивается перед следующим пробелом.
+//
 // Не является полноценным logfmt-парсером — достаточен для проверки структуры.
 func parseSimpleLogfmt(line string) map[string]string {
 	result := make(map[string]string)
-	// Убираем временную метку (начало строки вида "2006-01-02T15:04:05Z ").
-	tokens := strings.Fields(line)
-	for _, tok := range tokens {
-		eqIdx := strings.Index(tok, "=")
-		if eqIdx <= 0 {
+	i := 0
+	// Разбиваем по пробелам, но понимаем quoted значения.
+	runes := []rune(line)
+	n := len(runes)
+
+	for i < n {
+		// Пропускаем пробелы.
+		for i < n && runes[i] == ' ' {
+			i++
+		}
+		if i >= n {
+			break
+		}
+
+		// Ищем '=' — начало пары key=value.
+		eqStart := i
+		for i < n && runes[i] != '=' && runes[i] != ' ' {
+			i++
+		}
+		if i >= n || runes[i] != '=' {
+			// Нет '=' — не key=value токен, пропускаем.
+			for i < n && runes[i] != ' ' {
+				i++
+			}
 			continue
 		}
-		key := tok[:eqIdx]
-		val := tok[eqIdx+1:]
-		// Убираем кавычки если есть.
-		val = strings.Trim(val, `"`)
+		key := string(runes[eqStart:i])
+		if key == "" {
+			i++ // пропускаем '='
+			continue
+		}
+		i++ // пропускаем '='
+
+		// Читаем значение.
+		var val string
+		if i < n && runes[i] == '"' {
+			// Quoted значение — читаем до закрывающей '"', поддерживаем экранирование.
+			i++ // пропускаем открывающую '"'
+			valStart := i
+			for i < n {
+				if runes[i] == '\\' && i+1 < n {
+					i += 2 // экранированный символ
+					continue
+				}
+				if runes[i] == '"' {
+					break
+				}
+				i++
+			}
+			val = string(runes[valStart:i])
+			if i < n {
+				i++ // пропускаем закрывающую '"'
+			}
+		} else {
+			// Unquoted значение — до пробела.
+			valStart := i
+			for i < n && runes[i] != ' ' {
+				i++
+			}
+			val = string(runes[valStart:i])
+		}
 		result[key] = val
 	}
 	return result
@@ -231,18 +399,28 @@ func TestExecAuditArgsVerbatimInSuccess(t *testing.T) {
 }
 
 // ============================================================================
-// AC16/SR-42: rate-limit 429 ДО исполнения execute_command
+// AC16/SR-42: РЕАЛЬНЫЙ rate-limit 429 ДО исполнения execute_command
 // ============================================================================
 
-// TestExecRateLimit429BeforeCommand проверяет, что при превышении rate-limit
-// возвращается 429 ДО исполнения execute_command (команда не запускается).
+// TestExecRateLimit429BeforeCommand проверяет что при превышении rate-limit
+// возвращается HTTP 429 ДО вызова execute_command (команда не запускается).
 //
-// SR-42: rate-limit per-key/per-IP→429 ДО handler. Execute_command не должен
-// исполниться. Использует полный TLS-стек через startMCPServer.
+// F-2 (qa-guardian): тест переписан на РЕАЛЬНЫЙ 429 через полный TLS-стек.
+// Использует startMCPServerWithRateLimit(t, 1, 1) — минимальный burst=1, rate=1 req/s.
+//
+// Стратегия:
+//  1. Запустить полный TLS-сервер raxd с RateLimit=1, RateBurst=1.
+//  2. Отправить initialize (потребляет 1 токен из burst=1).
+//  3. Отправить tools/call execute_command до получения HTTP 429.
+//  4. Убедиться что при 429 команда НЕ была запущена (нет exec-записи tool=execute_command).
+//
+// SR-42: rate-limit per-key/per-IP → 429 ДО handler; execute_command не исполняется.
 func TestExecRateLimit429BeforeCommand(t *testing.T) {
-	baseURL, keyStr, client, auditBuf := startMCPServer(t)
+	// RateLimit=1 req/s, RateBurst=1 — после первого запроса burst исчерпан.
+	// Второй быстрый запрос должен получить 429.
+	baseURL, keyStr, client, auditBuf := startMCPServerWithRateLimit(t, 1, 1)
 
-	// initialize (потребляет 1 запрос).
+	// Шаг 1: initialize — потребляет единственный токен из burst=1.
 	initBody := jsonrpcBody(1, "initialize", map[string]interface{}{
 		"protocolVersion": "2025-11-25",
 		"capabilities":    map[string]interface{}{},
@@ -251,62 +429,78 @@ func TestExecRateLimit429BeforeCommand(t *testing.T) {
 	initResp := postMCP(t, client, baseURL, keyStr, initBody, nil)
 	readBody(t, initResp)
 
-	// Отправляем много запросов execute_command пока не получим 429.
-	// newTestConfig имеет RateLimit=100, RateBurst=200 — достаточно высокий.
-	// Поэтому мы не можем легко исчерпать бюджет в unit-тесте.
-	// Проверяем альтернативным способом: запрос без auth → 401 (что ДО инструмента).
-	// И проверяем что execute_command без ключа → 401 (не 200/isError).
-	//
-	// Для реального 429-теста используем httptest-сервер с минимальным rate-limit.
-	// Это требует создания нового сервера с RateLimit=0 — не доступно через startMCPServer.
-	// Поэтому используем httptest + startMCPServerWithExecCfg + прямые запросы.
-	//
-	// ВАЖНО: startMCPServerWithExecCfg использует httptest (без TLS, без auth).
-	// Rate-limit в httptest-стеке НЕ применяется (нет rateLimitMiddleware без полного TLS-сервера).
-	// Тест через startMCPServer проверяет только 401 (auth до инструмента).
-
-	auditBuf.Reset()
-
-	// Запрос без Bearer → 401 ДО execute_command.
+	// Шаг 2: отправляем execute_command пока не получим 429.
+	// Так как burst=1 и rate=1 req/s, а мы отправляем быстро — 429 должен прийти
+	// в течение нескольких запросов (обычно 2-й или 3-й).
 	callBody := jsonrpcBody(2, "tools/call", map[string]interface{}{
 		"name":      "execute_command",
 		"arguments": map[string]interface{}{"command": "echo", "args": []string{"rate-test"}},
 	})
-	noAuthReq, _ := http.NewRequest(http.MethodPost, baseURL+"/mcp", strings.NewReader(callBody))
-	noAuthReq.Header.Set("Content-Type", "application/json")
-	noAuthReq.Header.Set("Accept", "application/json, text/event-stream")
-	noAuthReq.Header.Set("MCP-Protocol-Version", "2025-11-25")
-	// Нет Authorization.
 
-	noAuthResp, err := client.Do(noAuthReq)
-	if err != nil {
-		t.Fatalf("AC16/SR-42: execute_command без auth: %v", err)
-	}
-	defer noAuthResp.Body.Close()
-
-	if noAuthResp.StatusCode != http.StatusUnauthorized {
-		t.Errorf("AC16/SR-42: execute_command без auth → want 401, got %d", noAuthResp.StatusCode)
-	}
-
-	// Убеждаемся что execute_command не был вызван (нет exec-записи в аудите).
-	log := auditBuf.String()
-	if strings.Contains(log, "tool=execute_command") {
-		t.Errorf("AC16/SR-42: PRODUCT BUG: execute_command вызван без аутентификации!\n"+
-			"SR-41/SR-42 требует auth ДО инструмента. Эскалируй к developer.\nlog=%s", log)
-	}
-
-	// Подтверждаем что с валидным ключом — работает.
+	got429 := false
 	auditBuf.Reset()
-	validResp := postMCP(t, client, baseURL, keyStr, callBody, map[string]string{
-		"MCP-Protocol-Version": "2025-11-25",
-	})
-	validBody := readBody(t, validResp)
 
-	if validResp.StatusCode != http.StatusOK {
-		t.Errorf("AC16/SR-42: execute_command с валидным ключом → want 200, got %d; body=%s",
-			validResp.StatusCode, validBody)
+	const maxAttempts = 15
+	for i := 0; i < maxAttempts; i++ {
+		req, err := http.NewRequest(http.MethodPost, baseURL+"/mcp", strings.NewReader(callBody))
+		if err != nil {
+			t.Fatalf("AC16/SR-42: new request: %v", err)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		req.Header.Set("Authorization", "Bearer "+keyStr)
+		req.Header.Set("MCP-Protocol-Version", "2025-11-25")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("AC16/SR-42: execute_command request %d: %v", i+1, err)
+		}
+		code := resp.StatusCode
+		readBody(t, resp)
+
+		if code == http.StatusTooManyRequests {
+			got429 = true
+			t.Logf("AC16/SR-42: получен 429 на попытке %d", i+1)
+			break
+		}
 	}
-	t.Logf("AC16/SR-42: OK — 401 без auth (ДО инструмента), 200 с валидным ключом")
+
+	if !got429 {
+		t.Fatalf("AC16/SR-42: PRODUCT BUG: за %d запросов с burst=1, rate=1 не получен 429.\n"+
+			"Rate-limit middleware не срабатывает для execute_command.\n"+
+			"Эскалируй к developer.", maxAttempts)
+	}
+
+	// Шаг 3: убеждаемся что при 429 команда НЕ была запущена.
+	// exec-запись с tool=execute_command И result=ok (успех) не должна присутствовать
+	// в момент 429-ответа: rate-limit срабатывает ДО MCP-handler.
+	log := auditBuf.String()
+
+	// При 429 аудит должен содержать RATE, но NOT "tool=execute_command" с result=ok.
+	// Примечание: RATE-записи пишет rateLimitMiddleware ДО вызова execHandler.
+	rateLimitedExecSuccess := false
+	for _, line := range strings.Split(log, "\n") {
+		// Ищем успешную exec-запись (result=ok) после того как мы уже сбросили буфер.
+		// Любая такая запись ПОСЛЕ auditBuf.Reset означала бы что rate-limited запрос
+		// достиг execHandler — это баг.
+		if strings.Contains(line, "tool=execute_command") && strings.Contains(line, "result=ok") {
+			rateLimitedExecSuccess = true
+		}
+	}
+
+	if rateLimitedExecSuccess {
+		t.Errorf("AC16/SR-42: PRODUCT BUG: execute_command успешно выполнился несмотря на 429.\n"+
+			"SR-42 требует: rate-limit срабатывает ДО execHandler. Эскалируй к developer.\nlog=%s", log)
+	} else {
+		t.Logf("AC16/SR-42: OK — реальный 429 получен; execute_command не вызван после сброса буфера")
+	}
+
+	// RATE должен быть в аудите.
+	if !strings.Contains(log, "RATE") {
+		t.Errorf("AC16/SR-42: RATE-запись отсутствует в аудите при 429; log=%s", log)
+	} else {
+		t.Logf("AC16/SR-42: OK — RATE-запись присутствует в аудите")
+	}
 }
 
 // ============================================================================
@@ -320,14 +514,17 @@ func TestExecRateLimit429BeforeCommand(t *testing.T) {
 // Этот тест симулирует ту же запись напрямую через server.NewAuditFnForTest,
 // проверяя что writeAudit корректно обрабатывает Result:"warn" с exec-полями.
 //
-// Если euid тест-процесса == 0 (запуск в Docker от root) — дополнительно
-// проверяем что реальный вызов execute_command порождает WARN-запись.
+// F-4 (qa-guardian): уточнение в описании:
+//   - Этот тест покрывает writeAudit НАПРЯМУЮ (unit-уровень).
+//   - Путь euid==0 через execHandler покрывается только при запуске от root.
+//   - В Docker тесты запускаются от root (euid==0) → ветка euid==0 тоже выполняется.
 func TestRootWarnAuditRecord(t *testing.T) {
 	auditBuf := &bytes.Buffer{}
 	logger := newTestLogger(auditBuf)
 	auditFn := server.NewAuditFnForTest(logger)
 
 	// Симулируем WARN-запись которую execHandler пишет при euid==0 (SR-55).
+	// Тест покрывает логику writeAudit напрямую (unit-уровень).
 	auditFn(server.AuditRecord{
 		TS:          time.Now().UTC(),
 		Fingerprint: "aabbccdd1122",
@@ -361,12 +558,13 @@ func TestRootWarnAuditRecord(t *testing.T) {
 	if !strings.Contains(log, "fp=") {
 		t.Errorf("AC9/SR-55: WARN-запись должна содержать fp=; log=%q", log)
 	}
-	t.Logf("AC9/SR-55: OK — writeAudit корректно обрабатывает Result:warn: %q", log)
+	t.Logf("AC9/SR-55: OK — writeAudit корректно обрабатывает Result:warn (unit-уровень): %q", log)
 
-	// Если тест запущен от root (euid==0) — проверяем реальный путь через MCP.
-	// startMCPServerWithExecCfg возвращает свой auditBuf — используем его.
+	// Если тест запущен от root (euid==0) — проверяем реальный путь через execHandler в MCP.
+	// В Docker все тесты запускаются от root, поэтому эта ветка всегда активна.
+	// F-4: это РЕАЛЬНОЕ покрытие пути euid==0 → execHandler → WARN-запись.
 	if os.Geteuid() == 0 {
-		t.Log("AC9/SR-55: euid==0 обнаружен — проверяем реальный WARN через MCP-вызов")
+		t.Log("AC9/SR-55: euid==0 обнаружен — проверяем реальный WARN через MCP-вызов (execHandler path)")
 		mcpBaseURL, _, mcpClient, mcpAuditBuf := startMCPServerWithExecCfg(t, defaultExecCfg())
 		mcpAuditBuf.Reset()
 		_, _ = callExecuteCommand(t, mcpClient, mcpBaseURL, map[string]interface{}{
@@ -375,9 +573,9 @@ func TestRootWarnAuditRecord(t *testing.T) {
 		})
 		mcpLog := mcpAuditBuf.String()
 		if !strings.Contains(mcpLog, "running-as-root") {
-			t.Errorf("AC9/SR-55: при euid==0 нет WARN с 'running-as-root' в аудите MCP; log=%s", mcpLog)
+			t.Errorf("AC9/SR-55: при euid==0 нет WARN с 'running-as-root' в аудите MCP (execHandler path); log=%s", mcpLog)
 		} else {
-			t.Logf("AC9/SR-55: OK — WARN 'running-as-root' найден в MCP-аудите при euid==0")
+			t.Logf("AC9/SR-55: OK — WARN 'running-as-root' найден в MCP-аудите при euid==0 (execHandler path)")
 		}
 	}
 }
@@ -522,41 +720,183 @@ func TestExecConfigDefaults(t *testing.T) {
 }
 
 // ============================================================================
-// Вспомогательная функция
+// AC12/SR-27: TestExecKeystoreCorruptReturns403
 // ============================================================================
 
-// assertLogContains — вспомогательная проверка наличия подстроки в логе.
-func assertLogContains(t *testing.T, label, substring, log string) {
-	t.Helper()
-	if !strings.Contains(log, substring) {
-		t.Errorf("%s: лог не содержит %q; log=%s", label, substring, log)
-	}
-}
+// TestExecKeystoreCorruptReturns403 проверяет что при повреждённом keys.db
+// запрос tools/call execute_command получает HTTP 403 ДО инструмента.
+//
+// F-1 (qa-guardian): покрывает AC12 для execute_command (по образцу
+// TestMCPKeystoreCorruptReturns403 из mcp_security_test.go — там для ping).
+//
+// Сценарий:
+//  1. Запускаем сервер с валидной БД ключей.
+//  2. Выполняем один успешный запрос (проверяем что сервер жив).
+//  3. Повреждаем keys.db на диске.
+//  4. Отправляем tools/call execute_command.
+//  5. Ожидаем HTTP 403 (ErrCorrupt → authMiddleware → 403).
+//  6. Убеждаемся что tool=execute_command НЕ появился в аудите (MCP не достигнут).
+//  7. Убеждаемся что сервер жив после повреждения.
+//
+// SR-27/AC12: ErrCorrupt из keystore.Verify → 403, не 401 и не 200.
+// Escalate к developer если тест падает — не ослабляй ассерт.
+func TestExecKeystoreCorruptReturns403(t *testing.T) {
+	paths := newTestPaths(t)
 
-// callExecAndGetAuditLine вызывает execute_command и возвращает exec-строку аудита.
-func callExecAndGetAuditLine(t *testing.T, client *http.Client, baseURL string, args map[string]interface{}, auditBuf *bytes.Buffer) (result map[string]interface{}, execLine string) {
-	t.Helper()
-	auditBuf.Reset()
-	body, _ := callExecuteCommand(t, client, baseURL, args)
-	log := auditBuf.String()
-	envelope := parseToolResult(t, body)
-	result, _ = envelope["result"].(map[string]interface{})
-	for _, line := range strings.Split(log, "\n") {
-		if strings.Contains(line, "tool=execute_command") {
-			execLine = line
+	// Открываем БД и создаём ключ.
+	store, err := keystore.Open(paths.KeysDB)
+	if err != nil {
+		t.Fatalf("AC12/SR-27: open store: %v", err)
+	}
+	plain, _, err := store.Create("corrupt-exec-test-key")
+	if err != nil {
+		t.Fatalf("AC12/SR-27: create key: %v", err)
+	}
+	keyStr := string(plain)
+
+	auditBuf := &bytes.Buffer{}
+	logger := newTestLogger(auditBuf)
+	auditFn := server.NewAuditFnForTest(logger)
+
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg())
+	if err != nil {
+		t.Fatalf("AC12/SR-27: mcp.NewHandler: %v", err)
+	}
+
+	// Выделяем свободный порт.
+	ln, lerr := net.Listen("tcp", "127.0.0.1:0")
+	if lerr != nil {
+		t.Fatalf("AC12/SR-27: freePort: %v", lerr)
+	}
+	port := ln.Addr().(*net.TCPAddr).Port
+	ln.Close()
+
+	cfg := newTestConfig(port)
+	srv, err := server.New(cfg, paths, store, logger, mcpH)
+	if err != nil {
+		t.Fatalf("AC12/SR-27: server.New: %v", err)
+	}
+
+	// Строим TLS-клиент.
+	certPath := filepath.Join(paths.TLSDir, "cert.pem")
+	pool := x509.NewCertPool()
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("AC12/SR-27: read cert: %v", err)
+	}
+	if !pool.AppendCertsFromPEM(certPEM) {
+		t.Fatal("AC12/SR-27: append cert")
+	}
+	client := &http.Client{
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{RootCAs: pool},
+		},
+		Timeout: 10 * time.Second,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_ = srv.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case <-runDone:
+		case <-time.After(5 * time.Second):
+		}
+	})
+
+	// Ждём готовности.
+	baseURL := fmt.Sprintf("https://127.0.0.1:%d", port)
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, dialErr := tls.Dial("tcp", addr, &tls.Config{InsecureSkipVerify: true}) //nolint:gosec
+		if dialErr == nil {
+			conn.Close()
 			break
 		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	return
+
+	// Проверяем что сервер жив: initialize должен пройти.
+	initBody := jsonrpcBody(1, "initialize", map[string]interface{}{
+		"protocolVersion": "2025-11-25",
+		"capabilities":    map[string]interface{}{},
+		"clientInfo":      map[string]interface{}{"name": "corrupt-test", "version": "1"},
+	})
+	preResp := postMCP(t, client, baseURL, keyStr, initBody, nil)
+	preBody := readBody(t, preResp)
+	if preResp.StatusCode != http.StatusOK {
+		t.Fatalf("AC12/SR-27: pre-corrupt initialize failed (want 200): got %d; body=%s",
+			preResp.StatusCode, preBody)
+	}
+
+	// Повреждаем keys.db на диске — имитирует дисковую порчу в runtime.
+	if err := os.WriteFile(paths.KeysDB, []byte(`{broken json`), 0o600); err != nil {
+		t.Fatalf("AC12/SR-27: corrupt keys.db: %v", err)
+	}
+
+	auditBuf.Reset()
+
+	// Отправляем tools/call execute_command. Bearer корректного формата,
+	// но keystore.Verify вернёт ErrCorrupt → authMiddleware → HTTP 403.
+	callBody := jsonrpcBody(2, "tools/call", map[string]interface{}{
+		"name":      "execute_command",
+		"arguments": map[string]interface{}{"command": "echo", "args": []string{"corrupt-test"}},
+	})
+	resp := postMCP(t, client, baseURL, keyStr, callBody, map[string]string{
+		"MCP-Protocol-Version": "2025-11-25",
+	})
+	respBody := readBody(t, resp)
+
+	// Основной ассерт: ErrCorrupt → HTTP 403.
+	// Если получаем 401 — ErrCorrupt обрабатывается как auth-fail (баг).
+	// Если получаем 200 — corrupt keystore принят (критический баг).
+	if resp.StatusCode != http.StatusForbidden {
+		t.Errorf(
+			"AC12/SR-27 PRODUCT BUG: corrupt keys.db → want HTTP 403, got %d.\n"+
+				"ErrCorrupt должен маппиться в 403, не в %d.\n"+
+				"Эскалируй к developer — не меняй ожидаемый статус-код.\nbody=%s",
+			resp.StatusCode, resp.StatusCode, respBody,
+		)
+	} else {
+		t.Logf("AC12/SR-27: OK — corrupt keys.db → HTTP 403")
+	}
+
+	// MCP-слой не должен быть достигнут: tool=execute_command не должен появиться в аудите.
+	logOutput := auditBuf.String()
+	if strings.Contains(logOutput, "tool=execute_command") {
+		t.Errorf(
+			"AC12/SR-27: MCP-слой достигнут несмотря на corrupt keystore (найдено tool=execute_command).\n"+
+				"authMiddleware должен отклонить запрос ДО MCP-handler.\nlog=%s",
+			logOutput,
+		)
+	} else {
+		t.Logf("AC12/SR-27: OK — tool=execute_command не найден в аудите (MCP не достигнут)")
+	}
+
+	// Проверяем живость: сервер должен отвечать после повреждения.
+	livenessBody := jsonrpcBody(99, "initialize", map[string]interface{}{
+		"protocolVersion": "2025-11-25",
+		"capabilities":    map[string]interface{}{},
+		"clientInfo":      map[string]interface{}{"name": "liveness", "version": "1"},
+	})
+	livenessResp := postMCP(t, client, baseURL, keyStr, livenessBody, nil)
+	livenessResp.Body.Close()
+	// 403 ожидается — БД всё ещё повреждена. Главное — не 0 (сервер не упал).
+	if livenessResp.StatusCode == 0 {
+		t.Error("AC12/SR-27: сервер упал после повреждения keystore (status 0)")
+	} else {
+		t.Logf("AC12/SR-27: OK — сервер жив после повреждения keystore (status %d)", livenessResp.StatusCode)
+	}
 }
 
-// _ подавляет предупреждение "unused" для вспомогательных функций.
-var (
-	_ = assertLogContains
-	_ = callExecAndGetAuditLine
-	_ = fmt.Sprintf
-	_ = json.Marshal
-)
+// ============================================================================
+// Вспомогательные переменные — предотвращают "unused import" ошибки
+// ============================================================================
 
 // Ensure cmdexec import is used (defaultExecCfg returns cmdexec.Config).
 var _ cmdexec.Config = defaultExecCfg()

@@ -50,15 +50,15 @@ docker run --rm raxd-test sh -c \
 | AC9 | нет повышения привилегий; root euid==0 → WARN-аудит | unit+**QA-добавлен** | `exec_test.go::TestInheritedUID`; **`exec_qa_test.go::TestRootWarnAuditRecord`** (unit-тест логики writeAudit с Result:"warn") | green (UID) / **QA добавил WARN-аудит** |
 | AC10 | env-whitelist; cwd-валидация; DefaultCwd при пустом | unit+integration | `exec_test.go::TestEnvWhitelistBlocksDangerousVars`, `::TestEnvWhitelistOnlyContainsAllowedVars`, `::TestInvalidCwdReturnsError`, `::TestCwdIsFile`, `::TestDefaultCwdUsedWhenEmpty`; `exec_tool_test.go::TestExecEnvWhitelist`, `::TestExecInvalidCwdIsError` | green |
 | AC11 | лимиты вывода → truncated:true; лимиты входа max_args/max_arg_len | unit+integration | `exec_test.go::TestOutputTruncatedAtLimit`, `::TestOutputNotTruncatedWhenUnderLimit`, `::TestCappedWriterDoesNotOOM`; `exec_tool_test.go::TestExecOutputTruncatedViaMCP`, `::TestExecTooManyArgsIsError`, `::TestExecArgTooLongIsError` | green |
-| AC12 | auth наследуется: без Bearer → 401 до инструмента | integration | `exec_tool_test.go::TestExecRateLimitInherited` (401 без ключа) | green |
+| AC12 | auth наследуется: без Bearer → 401/403 до инструмента; ErrCorrupt → 403 ДО инструмента | integration+**QA-добавлен** | `exec_tool_test.go::TestExecRateLimitInherited` (401 без ключа); **`exec_qa_test.go::TestExecKeystoreCorruptReturns403`** (403 при corrupt keys.db) | green |
 | AC13 | аудит каждого вызова: timestamp/fp/command/args/exit_code/duration/remote/result | integration+**QA-добавлен** | `exec_tool_test.go::TestExecAuditContainsRequiredFields`, `::TestExecAuditDenyContainsCommandArgs`; **`exec_qa_test.go::TestExecAuditExactlyOneRecord`** (ровно одна запись/вызов) | green (поля) / **QA добавил счёт записей** |
 | AC14 | машиночитаемый logfmt-формат; не-exec записи не ломаются | integration+**QA-добавлен** | `exec_tool_test.go::TestExecAuditDoesNotBreakNonExecFormat`; **`exec_qa_test.go::TestExecAuditLogfmtParseable`** (парсинг logfmt-записи) | green (регрессия) / **QA добавил logfmt-тест** |
 | AC15 | ключ raxd не подстрока аудита и ответа | integration | `exec_tool_test.go::TestExecNoKeyInAuditOrResponse`; `mcp_security_test.go::TestNoSecretsInMCPResponsesAndAuditLog` | green |
-| AC16 | rate-limit 429 ДО исполнения | integration+**QA-добавлен** | `exec_tool_test.go::TestExecRateLimitInherited` (только 401); **`exec_qa_test.go::TestExecRateLimit429BeforeCommand`** (реальный 429 при превышении лимита) | green (401) / **QA добавил 429** |
+| AC16 | rate-limit 429 ДО исполнения | integration+**QA-добавлен** | `exec_tool_test.go::TestExecRateLimitInherited` (только 401); **`exec_qa_test.go::TestExecRateLimit429BeforeCommand`** (РЕАЛЬНЫЙ 429 через полный TLS-стек, RateLimit=1 RateBurst=1; RATE в аудите без tool=execute_command result=ok) | green (401) / **QA добавил реальный 429** |
 | AC17 | некорректный JSON-RPC → корректная ошибка, без паники/501; неверные параметры | integration | `mcp_security_test.go::TestInvalidJSONReturnsParseError`, `::TestUnknownToolNotExecuted` | green |
 | AC18 | зелёные в Docker, -mod=vendor, без go mod download | Docker CI | все тесты в Docker | green |
 
-**Итог по AC: покрыты все 18 AC. Пробелы (AC6, AC9, AC13, AC14, AC16) закрыты QA-тестами.**
+**Итог по AC: покрыты все 18 AC. Пробелы (AC6, AC9, AC12, AC13, AC14, AC16) закрыты QA-тестами (после qa-guardian раунда 1: AC16 — реальный 429, AC12 — добавлен TestExecKeystoreCorruptReturns403, F-3 — проверка отсутствия exec-записи при отклонении).**
 
 ## Матрица ключевых SR-40..SR-67 → тест
 
@@ -66,7 +66,7 @@ docker run --rm raxd-test sh -c \
 |---|---|---|---|
 | SR-40 | execute_command только через MCP, нет отдельного эндпоинта | `TestExecToolInToolsList`, `TestToolsListSchemas` | green |
 | SR-41 | аутентификация ДО инструмента (401 без Bearer) | `TestExecRateLimitInherited` | green |
-| SR-42 | rate-limit 429 ДО исполнения | **`TestExecRateLimit429BeforeCommand`** | **QA добавил** |
+| SR-42 | rate-limit 429 ДО исполнения | **`TestExecRateLimit429BeforeCommand`** (полный TLS-стек, startMCPServerWithRateLimit, burst=1) | **QA добавил реальный 429** |
 | SR-43 | нет sh -c; метасимволы буквально; grep нет sh в коде | `TestNoShellInjection`, `TestNoShellPipeInjection`, `TestExecNoShellInjectionViaMCP` | green |
 | SR-44 | ErrDot отвергается; PATH не от клиента | `TestRelativePathBinaryRejected` | green |
 | SR-45 | несуществующий бинарь → нейтральная ошибка, без паники | `TestNonExistentBinaryReturnsError`, `TestExecNonExistentBinary` | green |
@@ -79,7 +79,7 @@ docker run --rm raxd-test sh -c \
 | SR-52 | max_args/max_arg_len ДО запуска → isError | `TestExecTooManyArgsIsError`, `TestExecArgTooLongIsError` | green |
 | SR-53 | capped-writer: лимит вывода + truncated + дренаж | `TestOutputTruncatedAtLimit`, `TestCappedWriterDoesNotOOM`, `TestExecOutputTruncatedViaMCP` + cappedwriter_test.go | green |
 | SR-54 | Credential не задаётся; uid наследуется | `TestInheritedUID` | green |
-| SR-55 | euid==0 → WARN-аудит при КАЖДОМ вызове | **`TestRootWarnAuditRecord`** | **QA добавил** |
+| SR-55 | euid==0 → WARN-аудит при КАЖДОМ вызове | **`TestRootWarnAuditRecord`** (writeAudit напрямую = unit-уровень; при euid==0 в Docker также проверяет реальный execHandler-путь) | **QA добавил** |
 | SR-56 | deny_root=true + euid==0 → isError | `TestExecDenyRootConfigField` (негативный путь: non-root); **`TestDenyRootUnitLogic`** | **QA добавил unit** |
 | SR-57 | ровно одна exec-запись/вызов; deny тоже пишет | **`TestExecAuditExactlyOneRecord`** | **QA добавил** |
 | SR-58 | поля success: fp+command+args+exit_code+duration+remote+result | `TestExecAuditContainsRequiredFields` | green |
@@ -132,6 +132,7 @@ docker run --rm raxd-test sh -c \
 | deny_root=true + euid==0 → isError | **`TestDenyRootUnitLogic`** | SR-56 | **QA добавил** |
 | Ровно одна exec-запись/вызов | **`TestExecAuditExactlyOneRecord`** | SR-57 | **QA добавил** |
 | Ключ raxd не в аудите и не в MCP-ответе | `TestExecNoKeyInAuditOrResponse` | SR-62 | green |
+| Corrupt keys.db → 403 ДО execute_command | **`TestExecKeystoreCorruptReturns403`** | SR-27/AC12 | **QA добавил** |
 | Args в аудите дословно (success-ветка) | **`TestExecAuditArgsVerbatimInSuccess`** | SR-63 | **QA добавил** |
 | process-group kill: дочерние процессы убиты | **`TestContextCancelKillsChildren`** | SR-47 | **QA добавил** |
 | logfmt exec-запись парсируется как key=value | **`TestExecAuditLogfmtParseable`** | SR-60 | **QA добавил** |
@@ -146,10 +147,58 @@ docker run --rm raxd-test sh -c \
 - `TestExecAuditExactlyOneRecord` — AC13/SR-57: ровно одна exec-запись за вызов
 - `TestExecAuditLogfmtParseable` — AC14/SR-60: exec-запись парсится как logfmt
 - `TestExecAuditArgsVerbatimInSuccess` — SR-63: args в success-аудите дословно
-- `TestExecRateLimit429BeforeCommand` — AC16/SR-42: 429 ДО команды при превышении rate-limit
-- `TestRootWarnAuditRecord` — AC9/SR-55: unit-тест логики WARN-аудита при euid==0
+- `TestExecRateLimit429BeforeCommand` — AC16/SR-42: РЕАЛЬНЫЙ 429 через полный TLS-стек (startMCPServerWithRateLimit, burst=1, без фальш-зелёного)
+- `TestRootWarnAuditRecord` — AC9/SR-55: unit-тест логики WARN-аудита при euid==0 (writeAudit напрямую); при euid==0 (Docker) также проверяет реальный execHandler-путь
 - `TestDenyRootUnitLogic` — SR-56: deny_root=true + euid==0 через writeAudit
 - `TestExecConfigDefaults` — SR-66: конфиг-дефолты применяются
+- `TestExecKeystoreCorruptReturns403` — AC12/SR-27: corrupt keys.db → 403 ДО execute_command
+
+Файл: `internal/mcp/exec_tool_test.go` — усиления существующих тестов (F-3):
+- `TestExecExtraFieldRejected` — добавлена проверка что нет exec-записи result=ok в аудите
+- `TestExecUnknownFieldRejected` — добавлена проверка что нет exec-записи result=ok в аудите
+
+Dockerfile (F-6): добавлен `./internal/cmdexec/...` в race-цель.
+
+## Реальный результат Docker-прогона (AC18)
+
+Прогон: `docker build --target test -t raxd-test . && docker run --rm raxd-test`
+Дата: 2026-05-22. Все пакеты зелёные.
+
+```
+go vet ./...   — чист (0 ошибок)
+
+go test -v -count=1 ./...
+ok  github.com/vladimirvkhs/raxd                    0.005s
+ok  github.com/vladimirvkhs/raxd/internal/banner    0.001s
+ok  github.com/vladimirvkhs/raxd/internal/cli       0.069s
+ok  github.com/vladimirvkhs/raxd/internal/cmdexec   1.179s
+ok  github.com/vladimirvkhs/raxd/internal/config    0.003s
+ok  github.com/vladimirvkhs/raxd/internal/keystore  0.143s
+ok  github.com/vladimirvkhs/raxd/internal/mcp       1.473s
+ok  github.com/vladimirvkhs/raxd/internal/server    2.187s
+ok  github.com/vladimirvkhs/raxd/internal/version   0.001s
+
+CGO_ENABLED=1 go test -race -count=1 ./internal/cmdexec/... ./internal/keystore/... ./internal/server/... ./internal/mcp/...
+ok  github.com/vladimirvkhs/raxd/internal/cmdexec   2.174s
+ok  github.com/vladimirvkhs/raxd/internal/keystore  1.246s
+ok  github.com/vladimirvkhs/raxd/internal/server    3.922s
+ok  github.com/vladimirvkhs/raxd/internal/mcp       5.275s
+```
+
+Ключевые QA-тесты (результат в Docker от root/euid==0):
+```
+=== RUN   TestExecRateLimit429BeforeCommand
+    exec_qa_test.go:463: AC16/SR-42: получен 429 на попытке 1
+    exec_qa_test.go:495: AC16/SR-42: OK — реальный 429 получен; execute_command не вызван после сброса буфера
+    exec_qa_test.go:502: AC16/SR-42: OK — RATE-запись присутствует в аудите
+--- PASS: TestExecRateLimit429BeforeCommand (0.03s)
+=== RUN   TestExecKeystoreCorruptReturns403
+    exec_qa_test.go:866: AC12/SR-27: OK — corrupt keys.db → HTTP 403
+    exec_qa_test.go:878: AC12/SR-27: OK — tool=execute_command не найден в аудите (MCP не достигнут)
+--- PASS: TestExecKeystoreCorruptReturns403 (0.03s)
+```
+
+**AC18: ВЕРИФИЦИРОВАН.** Все тесты зелёные в Docker, `-mod=vendor`, race чист. Баги не найдены.
 
 ## Найденные пробелы до добавления тестов
 
@@ -161,11 +210,15 @@ docker run --rm raxd-test sh -c \
 
 4. **AC14/SR-60 (logfmt парсимость)** — нет теста что exec-запись является структурной logfmt (ключи извлекаются). Добавлен `TestExecAuditLogfmtParseable`.
 
-5. **AC16/SR-42 (rate-limit 429)** — `TestExecRateLimitInherited` проверяет 401 (отсутствие auth), но не 429 при превышении лимита. Добавлен `TestExecRateLimit429BeforeCommand` через полный TLS-стек с маленьким burst.
+5. **AC16/SR-42 (rate-limit 429)** — `TestExecRateLimitInherited` проверяет 401 (отсутствие auth), но не 429 при превышении лимита. Изначально добавлен `TestExecRateLimit429BeforeCommand` через httptest без rateLimitMiddleware — **фальш-зелёный (qa-guardian F-2)**. Переписан на полный TLS-стек через `startMCPServerWithRateLimit(t, 1, 1)` — РЕАЛЬНЫЙ 429 подтверждён.
 
 6. **SR-49 (LD_LIBRARY_PATH)** — `TestEnvWhitelistBlocksDangerousVars` проверяет `LD_PRELOAD`, `IFS`, `DYLD_INSERT_LIBRARIES`, но не `LD_LIBRARY_PATH`. Добавлен `TestEnvWhitelistBlocksLdLibraryPath`.
 
 7. **SR-63 (args дословно в success-аудите)** — проверялось только в deny-ветке. Добавлен `TestExecAuditArgsVerbatimInSuccess` для success-пути.
+
+8. **AC12 (ErrCorrupt → 403 ДО execute_command)** — `TestMCPKeystoreCorruptReturns403` из mcp_security_test.go проверяет только инструмент `ping`. Не было аналогичного теста для `execute_command`. Добавлен `TestExecKeystoreCorruptReturns403` (qa-guardian F-1).
+
+9. **AC3/F-3 (лишние поля → команда не запущена)** — `TestExecExtraFieldRejected`/`TestExecUnknownFieldRejected` не проверяли что execute_command не был вызван. Добавлены проверки аудита (нет exec-записи result=ok).
 
 ## Найденные баги (если есть)
 
