@@ -64,38 +64,58 @@ VERSION_LDFLAGS := -ldflags="-s -w \
 all: build-all
 
 # ── Cross-compilation (AC14, AC15, SR-96) ────────────────────────────────────
+#
+# SECURITY-BASELINE §6 docker-guard: go build выполняется ТОЛЬКО внутри Docker.
+# На хосте — fail-fast с понятной ошибкой. Вызов: docker run raxd-build make build-all.
+# Dockerfile-стадия build (RUN go build) не использует эти таргеты — она вызывает
+# go build напрямую, поэтому docker-guard здесь не мешает сборке образа.
 
-## build-all: компилировать под все 4 цели (darwin/linux × amd64/arm64)
+# Внутренний макрос docker-guard: абортируем если /.dockerenv отсутствует.
+define DOCKER_GUARD
+	@test -f /.dockerenv || { \
+		echo "ERROR: 'make $@' нельзя запускать на хосте (SECURITY-BASELINE §6)."; \
+		echo "  Запустите сборку внутри Docker:"; \
+		echo "    docker run --rm -v \"\$$(pwd)/dist:/src/dist\" -e VERSION=\$(VERSION) -w /src raxd-build make build-all release-all VERSION=\$(VERSION)"; \
+		echo "  Или используйте: make ci-local VERSION=\$(VERSION)"; \
+		exit 1; \
+	}
+endef
+
+## build-all: компилировать под все 4 цели (darwin/linux × amd64/arm64) — ТОЛЬКО в Docker
 build-all: build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-arm64
 	@echo "build-all: 4 artifacts in $(DIST_DIR)/"
 	@ls -lh $(DIST_DIR)/
 
-## build-linux-amd64: linux/amd64
+## build-linux-amd64: linux/amd64 — ТОЛЬКО в Docker (§6)
 build-linux-amd64: $(DIST_DIR)
+	$(DOCKER_GUARD)
 	$(CGO_OFF) GOOS=linux GOARCH=amd64 $(GO) build \
 		$(GOFLAGS) $(VERSION_LDFLAGS) \
 		-o $(DIST_DIR)/raxd_linux_amd64 \
 		$(CMD)
 	@echo "OK: $(DIST_DIR)/raxd_linux_amd64"
 
-## build-linux-arm64: linux/arm64
+## build-linux-arm64: linux/arm64 — ТОЛЬКО в Docker (§6)
 build-linux-arm64: $(DIST_DIR)
+	$(DOCKER_GUARD)
 	$(CGO_OFF) GOOS=linux GOARCH=arm64 $(GO) build \
 		$(GOFLAGS) $(VERSION_LDFLAGS) \
 		-o $(DIST_DIR)/raxd_linux_arm64 \
 		$(CMD)
 	@echo "OK: $(DIST_DIR)/raxd_linux_arm64"
 
-## build-darwin-amd64: darwin/amd64
+## build-darwin-amd64: darwin/amd64 — ТОЛЬКО в Docker (§6)
 build-darwin-amd64: $(DIST_DIR)
+	$(DOCKER_GUARD)
 	$(CGO_OFF) GOOS=darwin GOARCH=amd64 $(GO) build \
 		$(GOFLAGS) $(VERSION_LDFLAGS) \
 		-o $(DIST_DIR)/raxd_darwin_amd64 \
 		$(CMD)
 	@echo "OK: $(DIST_DIR)/raxd_darwin_amd64"
 
-## build-darwin-arm64: darwin/arm64 (Apple Silicon)
+## build-darwin-arm64: darwin/arm64 (Apple Silicon) — ТОЛЬКО в Docker (§6)
 build-darwin-arm64: $(DIST_DIR)
+	$(DOCKER_GUARD)
 	$(CGO_OFF) GOOS=darwin GOARCH=arm64 $(GO) build \
 		$(GOFLAGS) $(VERSION_LDFLAGS) \
 		-o $(DIST_DIR)/raxd_darwin_arm64 \
@@ -192,8 +212,11 @@ stop-service-test:
 # Использование:
 #   make release-all VERSION=v0.1.0
 
-## release: собрать 4 архива tar.gz в dist/ (требует build-all)
-release: build-all
+## release: собрать 4 архива tar.gz в dist/ (требует build-all, ТОЛЬКО в Docker §6)
+## Предусловие: build-all должен быть выполнен (бинари уже в dist/).
+## Не вызывает build-all как Make-prereq — чтобы не допустить хостовой сборки.
+release:
+	$(DOCKER_GUARD)
 	@echo "=== release: VERSION=$(VERSION) ==="
 	VERSION=$(VERSION) DIST_DIR=$(DIST_DIR) bash scripts/release.sh
 
@@ -217,7 +240,24 @@ release-all: release
 # Предусловие: make release-all VERSION=<v> должен быть выполнен.
 
 ## test-install: прогнать install-flow в чистом контейнере (AC12, baseline §6)
-test-install: release-all
+##
+## SECURITY-BASELINE §6: test-install НЕ пересобирает бинари — он ПОТРЕБЛЯЕТ
+## готовый dist/ (собранный в Docker через make ci-local или docker run raxd-build).
+## Prereq release-all УДАЛЁН намеренно: он тянул build-all → go build на хосте (баг D-1).
+##
+## Предусловие: dist/ должен содержать SHA256SUMS (выполните make ci-local или
+##   docker run --rm -v "$(pwd)/dist:/src/dist" -e VERSION=<v> -w /src raxd-build \
+##     sh -c "make build-all release-all VERSION=<v>").
+test-install:
+	@# Проверяем наличие готового dist/ — go build на хосте ЗАПРЕЩЁН (§6/SR-112, D-1).
+	@test -f $(DIST_DIR)/SHA256SUMS || { \
+		echo "ERROR: $(DIST_DIR)/SHA256SUMS не найден."; \
+		echo "  Сначала соберите артефакты в Docker (go build на хосте запрещён — §6):"; \
+		echo "    make ci-local VERSION=$(VERSION)"; \
+		echo "  Или вручную:"; \
+		echo "    docker run --rm -v \"\$$(pwd)/dist:/src/dist\" -e VERSION=$(VERSION) -w /src raxd-build sh -c \"make build-all release-all VERSION=$(VERSION)\""; \
+		exit 1; \
+	}
 	@echo "=== test-install: сборка образа $(INSTALL_TEST_IMAGE)... ==="
 	docker build -f Dockerfile.install -t $(INSTALL_TEST_IMAGE) \
 		--build-arg VERSION=$(VERSION) .
@@ -230,12 +270,17 @@ test-install: release-all
 
 # ── ci-local: полный локальный CI в Docker (AC14, baseline §6) ───────────────
 #
-# docker-guard: ci-local и входящие в него таргеты (verify-cross, test-install)
-# содержат собственный guard /.dockerenv. Ci-local запускает их через docker run.
+# SECURITY-BASELINE §6: ни один шаг не выполняет go build на хосте.
+# Фикс D-1: test-install НЕ имеет prereq release-all — он потребляет dist/,
+# заполненный шагом "docker run raxd-build make build-all release-all" выше.
 #
-# Порядок: go vet + unit-тесты → build-all (4 цели) → release-all → test-install.
+# Порядок:
+#   1. docker build + docker run raxd-test  — go vet + unit-тесты в Docker
+#   2. docker build raxd-build              — образ для кросс-компиляции
+#   3. docker run raxd-build make build-all release-all  — 4 бинари + архивы в dist/ (В DOCKER)
+#   4. make test-install                    — потребляет готовый dist/, go build НЕ вызывается
 
-## ci-local: локальный CI-гейт (go vet+test + build-all + test-install) в Docker
+## ci-local: локальный CI-гейт (go vet+test + build-all + test-install) — всё в Docker (§6)
 ci-local:
 	@echo "=== ci-local: сборка образа для unit-тестов... ==="
 	docker build --target test -t raxd-test .
@@ -243,14 +288,14 @@ ci-local:
 	docker run --rm raxd-test
 	@echo "=== ci-local: сборка образа для кросс-компиляции... ==="
 	docker build --target build -t raxd-build .
-	@echo "=== ci-local: build-all (4 цели) + release-all... ==="
+	@echo "=== ci-local: build-all (4 цели) + release-all — в Docker (§6)... ==="
 	docker run --rm \
 		-v "$(PWD)/dist:/src/dist" \
 		-e VERSION=$(VERSION) \
 		-w /src \
 		raxd-build \
 		sh -c "make build-all release-all VERSION=$(VERSION)"
-	@echo "=== ci-local: test-install... ==="
+	@echo "=== ci-local: test-install (потребляет dist/ из Docker, go build не вызывается)... ==="
 	$(MAKE) test-install VERSION=$(VERSION)
 	@echo ""
 	@echo "=== ci-local: ВСЕ ПРОВЕРКИ ПРОШЛИ ==="

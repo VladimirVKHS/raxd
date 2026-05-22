@@ -65,7 +65,7 @@
 | SR-109 | PASS | `xattr -d com.apple.quarantine || true` + инструкция в darwin-ветке |
 | SR-110 | PASS | ldflags только Version/Commit/Date; нет секретов в выводе |
 | SR-111 | PASS | error:/hint: строчными; нет сырых трасс |
-| SR-112 | PASS | test-install и ci-local — только в Docker (docker-guard /.dockerenv) |
+| SR-112 | PASS | test-install и ci-local — только в Docker; docker-guard в build-*/release + prereq-разрыв test-install←release-all устраняют host-build (фикс D-1) |
 | SR-113 | PASS | Мок-сервер `--bind 127.0.0.1`; python3 только в Dockerfile.install |
 
 ## Чеклист безопасности
@@ -120,13 +120,42 @@ PASS: бинарь НЕ установлен при несовпадении SHA
 
 **SHA256-проверка реально отвергает подмену: install.sh возвращает код 3, бинарь не устанавливается.**
 
-## Статус ci-local
+## Фикс D-1: устранение host-build leak (§6/SR-112)
+
+**Проблема (до фикса):** `test-install: release-all` → `release: build-all` образовывал цепочку
+Make-prereq, из-за которой хостовый `make test-install` (или `make ci-local` в части шага
+test-install) выполнял 4× `go build` на ХОСТЕ — нарушение SECURITY-BASELINE §6.
+
+**Исправления в `Makefile`:**
+
+1. **docker-guard (`define DOCKER_GUARD`)**: макрос `test -f /.dockerenv || { ... exit 1; }`
+   добавлен в каждый `build-linux-amd64/arm64`, `build-darwin-amd64/arm64` и `release`.
+   На хосте — fail-fast с понятной ошибкой и hint. Внутри Docker (`docker run raxd-build`) —
+   `/.dockerenv` есть, guard проходит. Dockerfile-стадии (`RUN go build` напрямую) не
+   затронуты — они не вызывают Make-таргеты.
+
+2. **`test-install` без prereq `release-all`**: prereq удалён. Вместо этого — явная проверка
+   `test -f dist/SHA256SUMS` с понятной ошибкой и hint. При standalone-запуске без готового
+   `dist/` — немедленный fail с инструкцией. При запуске из `ci-local` — `dist/` уже заполнен
+   предыдущим шагом `docker run raxd-build make build-all release-all`.
+
+3. **`release` без prereq `build-all`**: prereq удалён, добавлен `DOCKER_GUARD`. `release`
+   ожидает, что бинари уже в `dist/` (из предыдущего `make build-all` внутри того же
+   Docker-контейнера). Типичный вызов: `make build-all release-all` одной командой в Docker.
+
+**Итог**: ни одна команда Make не выполняет `go build` на хосте. Доказательство: `make -n ci-local` 
+и `make -n test-install` не содержат строк `go build`. Прямой вызов `make build-all` на хосте 
+прерывается на первом guard с кодом 1 — до выполнения `go build`.
+
+## Статус ci-local (после фикса D-1)
 
 `make ci-local` выполняет последовательно:
-1. `docker build --target test && docker run raxd-test` — unit-тесты: **PASS** (все пакеты)
-2. `docker build --target build && docker run make build-all` — 4 бинаря: **PASS**
-3. `docker run make release-all` — 4 архива + SHA256SUMS: **PASS**
-4. `make test-install` — 3 теста в debian:stable-slim: **PASS**
+1. `docker build --target test && docker run raxd-test` — unit-тесты в Docker: **PASS** (все пакеты)
+2. `docker build --target build → raxd-build` — образ для кросс-компиляции
+3. `docker run raxd-build make build-all release-all` — 4 бинари + 4 архива + SHA256SUMS **в Docker**: PASS
+4. `make test-install` — потребляет готовый `dist/`, 3 теста в debian:stable-slim: **PASS**
+
+Ни шаг 1, ни шаг 3, ни шаг 4 не выполняют `go build` на хосте.
 
 ## Остаточные пункты (для прод-релиза)
 
