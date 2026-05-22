@@ -42,7 +42,7 @@ func startMCPServerWithExecCfg(t *testing.T, execCfg cmdexec.Config) (baseURL st
 	logger := newTestLogger(auditBuf)
 	auditFn := server.NewAuditFnForTest(logger)
 
-	h, err := internalmcp.NewHandler("test-version", auditFn, execCfg)
+	h, err := internalmcp.NewHandler("test-version", auditFn, execCfg, defaultUplCfg(t))
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
