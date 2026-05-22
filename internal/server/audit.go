@@ -18,7 +18,8 @@ type AuditRecord struct {
 	Fingerprint string
 	// RemoteAddr is the client IP:port without DNS resolution.
 	RemoteAddr string
-	// Result is "success", "fail", "deny", or "rate-limited".
+	// Result is "success", "fail", "deny", "warn", or "rate-limited".
+	// "warn" используется для предупреждений (напр. root-WARN SR-55), команда при этом может продолжиться.
 	Result string
 	// Reason describes the failure; empty on success.
 	Reason string
@@ -56,6 +57,7 @@ type AuditFn func(rec AuditRecord)
 // Levels and msg labels per ux-spec §3:
 //   - success (Tool=="") → INFO / AUTH
 //   - success (Tool!="") → INFO / MCP  (SR-36: MCP-layer tool call success)
+//   - warn    → WARN / WARN  (предупреждение; напр. root-WARN при euid==0, SR-55)
 //   - fail    → WARN / FAIL
 //   - deny    → WARN / DENY
 //   - rate-limited → WARN / RATE
@@ -63,6 +65,7 @@ type AuditFn func(rec AuditRecord)
 // SR-21: this function MUST NOT log any key body, Authorization header value,
 // hash, salt, or private TLS key material.
 // SR-36: tool= is logged ONLY when rec.Tool != "" — non-MCP records are unchanged.
+// SR-55: Result:"warn" — отдельный уровень для root-WARN (семантически отличен от deny).
 // SR-59/ADR-002: exec-поля (command/args/exit_code/duration/timed_out) логируются
 // ТОЛЬКО при Tool=="execute_command" — не-exec записи не меняются.
 func writeAudit(logger *clog.Logger, rec AuditRecord) {
@@ -109,6 +112,26 @@ func writeAudit(logger *clog.Logger, rec AuditRecord) {
 			logger.Info("AUTH",
 				"fp", fp,
 				"remote", rec.RemoteAddr,
+			)
+		}
+	case "warn":
+		// Result:"warn" — предупреждение (не отказ): команда может продолжить выполнение.
+		// Используется для root-WARN (SR-55): raxd запущен с euid==0.
+		// Семантически отличен от "deny": команда ещё не отклонена/не выполнена на этом уровне.
+		if isExec {
+			logger.Warn("WARN",
+				"fp", fp,
+				"remote", rec.RemoteAddr,
+				"tool", rec.Tool,
+				"reason", rec.Reason,
+				"command", rec.Command,
+				"args", formatArgs(rec.Args),
+			)
+		} else {
+			logger.Warn("WARN",
+				"fp", fp,
+				"remote", rec.RemoteAddr,
+				"reason", rec.Reason,
 			)
 		}
 	case "fail":
