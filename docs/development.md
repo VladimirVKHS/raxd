@@ -9,12 +9,14 @@ build metadata is injected. It targets contributors working on the codebase.
 dangerous tool (like SSH). For that reason the security baseline (§6) requires that **all builds,
 tests, and any execution of `raxd` happen inside a Docker container — never on the host machine.**
 
-This now applies in a very concrete way: `raxd serve` opens a TLS listener, authenticates network
-connections, and serves an MCP endpoint on `/mcp`, so running it (and its tests) belongs inside a
-container. The features that still run *behind* that listener — command execution and file upload —
-do not exist yet, but the Docker-only workflow is established from the start so it is already in place
-when those features arrive. The state that `raxd` writes (`keys.db`, the TLS certificate under the
-state directory) stays inside the container, off the host.
+This applies in a very concrete way: `raxd serve` opens a TLS listener, authenticates network
+connections, serves an MCP endpoint on `/mcp`, and — through the MCP `execute_command` and
+`upload_file` tools — **runs commands and writes files on the host**. Those tools are implemented and
+working, which makes the Docker-only rule load-bearing, not aspirational: running `serve` (or its
+tests) outside a container would run real commands and write real files on your machine. The state
+that `raxd` writes (`keys.db`, the TLS certificate, the upload root under the state directory) stays
+inside the container, off the host. The release build, the CI gate, and the `install.sh` install-flow
+test are likewise Docker-only (a `Makefile` guard fails `go build` on the host).
 
 ## Build and test in Docker
 
@@ -52,19 +54,21 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 The network server lives in `internal/server` and is exercised end-to-end with `httptest`'s TLS
 helpers — there is no need to bind a real privileged port. The MCP layer in `internal/mcp` is tested
 both in isolation (via `httptest.NewServer` against the MCP handler) and end-to-end (through
-`server.New(..., mcpHandler)` with the full middleware chain). The rate limiter and the SDK handler
-use goroutines and shared state, so the server and MCP tests must be run **with the race detector**
-(which requires `CGO_ENABLED=1`). Inside the container:
+`server.New(..., mcpHandler)` with the full middleware chain), including the `execute_command` and
+`upload_file` tools (`internal/cmdexec` and `internal/fileupload` also have their own unit tests). The
+rate limiter and the SDK handler use goroutines and shared state, so the server and MCP tests must be
+run **with the race detector** (which requires `CGO_ENABLED=1`). Inside the container:
 
 ```sh
-# Server + MCP tests with the race detector:
+# Server + MCP + tool tests with the race detector:
 docker run --rm raxd-test \
-  sh -c "CGO_ENABLED=1 go test -race -v -count=1 ./internal/server/... ./internal/mcp/..."
+  sh -c "CGO_ENABLED=1 go test -race -v -count=1 ./internal/server/... ./internal/mcp/... ./internal/cmdexec/... ./internal/fileupload/..."
 ```
 
 `go vet ./...` and the full suite run from the default `test` image step above; they also cover
-`internal/server`, `internal/mcp`, and `internal/cli` (the `serve` command). As with everything else,
-do not run the server on the host — keep it in the container.
+`internal/server`, `internal/mcp`, `internal/cmdexec`, `internal/fileupload`, `internal/service`, and
+`internal/cli` (the `serve` and `service` commands). As with everything else, do not run the server on
+the host — keep it in the container.
 
 ### Build only
 
@@ -91,11 +95,29 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
   sh -c "CGO_ENABLED=0 go vet ./... && CGO_ENABLED=0 go test -v -count=1 ./..."
 ```
 
+### The local CI gate and release build
+
+Two `Makefile` targets bundle the whole verification flow, both Docker-only (the `Makefile`'s
+docker-guard aborts `go build` on the host):
+
+```sh
+# Full local CI gate: go vet + unit tests, cross-build all four targets,
+# produce the archives + SHA256SUMS, and run the install-flow test — all in Docker.
+make ci-local VERSION=v0.1.0
+
+# Build the four release archives + SHA256SUMS from source (run inside the raxd-build image).
+make build-all release-all VERSION=v0.1.0
+```
+
+`make ci-local` is the v1 verification gate. The release-artifact build and the `install.sh`
+install-flow test are documented in
+[`installation.md`](installation.md#building-release-artifacts-from-source).
+
 ## Project layout
 
 The project follows a single entry point plus internal packages. Putting the implementation under
 `internal/` means those packages cannot be imported from outside the module, which keeps the public
-surface intentionally empty at this stage.
+surface intentionally empty.
 
 ```
 .
@@ -106,6 +128,7 @@ surface intentionally empty at this stage.
 │   ├── cli/                 Cobra command tree
 │   │   ├── root.go          Root command, sub-command registration, banner via PersistentPreRun
 │   │   ├── key.go           "key" group: create / list / delete (working)
+│   │   ├── service.go       "service" group: install / uninstall / start / stop / status (working)
 │   │   ├── config.go        "config" group: port (stub)
 │   │   ├── serve.go         "serve" command: foreground TLS server + MCP handler (working)
 │   │   ├── version.go       "version" command (working)
@@ -117,12 +140,17 @@ surface intentionally empty at this stage.
 │   │   ├── auth.go          Bearer extraction + keystore.Verify; success-audit middleware; Fingerprint/RemoteAddrFromContext
 │   │   ├── middleware.go    Host/Origin, body-limit, recover, rate-limit middlewares
 │   │   ├── ratelimit.go     Per-key/per-IP token-bucket limiters with TTL GC
-│   │   ├── audit.go         AuditRecord (incl. Tool field) + structured key=value audit logging
+│   │   ├── audit.go         AuditRecord (incl. Tool / exec / upload fields) + structured key=value audit logging
 │   │   └── handlers.go      healthHandler (pong) and dispatchHandler (501 catch-all)
 │   ├── mcp/                 MCP server layer (official Go MCP SDK), mounted on /mcp by serve
-│   │   ├── server.go        NewHandler: builds the MCP server, registers tools, returns http.Handler
+│   │   ├── server.go        NewHandler: builds the MCP server, registers the four tools, returns http.Handler
 │   │   ├── tools.go         ping and server_info tool descriptors + handlers
-│   │   └── audit.go         withAudit decorator: one MCP audit record per tools/call
+│   │   ├── exec_tool.go     execute_command tool descriptor + handler (owns its exec-audit)
+│   │   ├── upload_tool.go   upload_file tool descriptor + handler (owns its upload-audit)
+│   │   └── audit.go         withAudit decorator: one MCP audit record per tools/call (ping/server_info)
+│   ├── cmdexec/             Command execution engine for execute_command (no shell, timeout, limits, allowlist)
+│   ├── fileupload/          File-write engine for upload_file (os.Root confinement, atomic write, mode policy)
+│   ├── service/             System-service integration (systemd unit / launchd plist generation, manager calls)
 │   ├── keystore/            API key generation, storage, verification, revocation
 │   │   ├── keystore.go      Store: Open / Create / List / Revoke / Verify / FlushUsage
 │   │   ├── crypto.go        Key body / salt / id generation, hashing, fingerprint (crypto/rand)
@@ -131,11 +159,14 @@ surface intentionally empty at this stage.
 │   │   └── errors.go        Sentinel errors (ErrNotFound, ErrAlreadyRevoked, ErrCorrupt, ErrLabelTooLong)
 │   ├── config/
 │   │   ├── paths.go         XDG path resolution (PathSet, Paths, EnsureDirs)
-│   │   └── config.go        config.yaml loading via viper (Config, Load — incl. networking fields)
+│   │   └── config.go        config.yaml loading via viper (networking, exec, and upload fields)
 │   ├── version/
 │   │   └── version.go       Build metadata storage (Set, Info)
 │   └── banner/
 │       └── banner.go        Plain-text product banner with the author line
+├── install.sh               curl | sh installer (platform detect, SHA256 verify, non-root install)
+├── scripts/                 release.sh (archives + SHA256SUMS), install-flow tests, service integration
+├── Makefile                 Docker-only build/test/release targets (build-all, release-all, ci-local, …)
 ├── vendor/                  Committed dependency tree (offline / hermetic builds, ADR-002)
 ├── Dockerfile               Two-stage (build / test) dev/test environment
 ├── go.mod                   Module github.com/vladimirvkhs/raxd, go 1.25
@@ -153,12 +184,17 @@ surface intentionally empty at this stage.
 - `internal/cli/key.go` implements the `key` group on top of `internal/keystore`: it opens the
   store at the `KeysDB` path, calls `Create` / `List` / `Revoke`, and renders output per the UX
   contract (key body on stdout, decoration on stderr).
-- `internal/cli/serve.go` resolves paths and config, opens the keystore, builds the MCP handler
-  (`internalmcp.NewHandler(version.Version, auditFn)`), builds a `server.Server` (which loads or
-  generates the TLS certificate) passing the MCP handler in, registers an `OnListen` hook that prints
-  the startup block only after a successful bind (via `srv.SetOnListen`, fired from inside `srv.Run`),
-  and runs the server until `SIGINT` / `SIGTERM`. The API key is never read from argv or the
-  environment.
+- `internal/cli/service.go` implements the `service` group on top of `internal/service`: it resolves
+  the configured port from `config.Load` (so a privileged port `< 1024` drives the
+  `CAP_NET_BIND_SERVICE` capability) and calls the platform `ServiceManager` (systemd/launchd) to
+  install / uninstall / start / stop / query the service.
+- `internal/cli/serve.go` resolves paths and config, opens the keystore, builds the `exec` and
+  `upload` configs from `config.yaml`, creates the upload root (`0700`), builds the MCP handler
+  (`internalmcp.NewHandler(version.Version, auditFn, execCfg, uplCfg)`), builds a `server.Server`
+  (which loads or generates the TLS certificate) passing the MCP handler in, registers an `OnListen`
+  hook that prints the startup block only after a successful bind (via `srv.SetOnListen`, fired from
+  inside `srv.Run`), and runs the server until `SIGINT` / `SIGTERM`. The API key is never read from
+  argv or the environment.
 - `internal/server` owns the transport: it wraps a TCP listener in TLS 1.3, runs the fixed
   middleware chain (body-limit → recover → Host/Origin → auth → rate-limit), routes `GET /healthz`
   to `pong`, mounts the MCP handler at `/mcp` (when one is supplied — `nil` falls through to `501`),
@@ -166,10 +202,22 @@ surface intentionally empty at this stage.
   `http.Server.Shutdown`. It exposes `FingerprintFromContext` / `RemoteAddrFromContext` so the MCP
   layer can read the per-request fingerprint and remote address from the context (the key body is
   never exposed).
-- `internal/mcp` owns the MCP server: `NewHandler` builds an `*mcp.Server` (via the official Go MCP
-  SDK), registers exactly `ping` and `server_info` (each wrapped by `withAudit`), and returns the
-  Streamable-HTTP `http.Handler` that `serve` mounts at `/mcp`. It does **not** import
-  `internal/keystore` — authentication is the transport's job (it runs before `/mcp`).
+- `internal/mcp` owns the MCP server: `NewHandler(ver, audit, execCfg, uplCfg)` builds an
+  `*mcp.Server` (via the official Go MCP SDK) and registers **four** tools — `ping` and `server_info`
+  (each wrapped by `withAudit`), plus `execute_command` and `upload_file` (each owning its own audit
+  path, by ADR-004) — then returns the stateless Streamable-HTTP `http.Handler` that `serve` mounts at
+  `/mcp`. It does **not** import `internal/keystore` — authentication is the transport's job (it runs
+  before `/mcp`). `execute_command` delegates to `internal/cmdexec` and `upload_file` to
+  `internal/fileupload`.
+- `internal/cmdexec` runs a command as `binary + args` without a shell, with a mandatory timeout,
+  process-group kill on timeout, an environment whitelist, output/argument limits, an optional exact
+  allowlist, and an optional `deny_root` lever.
+- `internal/fileupload` writes one regular file confined to the upload root via `os.Root`, with an
+  atomic temp-file → chmod → rename sequence, a per-file size limit, the mode policy (no
+  setuid/setgid/sticky/world-writable), and an optional `deny_root` lever.
+- `internal/service` generates the systemd unit / launchd plist from validated `text/template`
+  inputs, creates the `raxd` system user, invokes the manager (`systemctl`/`launchctl`) without a
+  shell, and reports a neutral typed status (never raw manager stderr).
 - `internal/keystore` owns all secret handling: `crypto/rand` generation, `sha256(key‖salt)`
   hashing, constant-time `Verify`, atomic `0600` writes, and advisory flock. The server consumes it
   read-only via `Verify` and `Fingerprint`; the plaintext key never leaves the caller's stack.
@@ -183,6 +231,11 @@ Version information is injected at build time using `-ldflags -X`. When the bina
 these flags (the normal development build), the defaults are `version=dev`, `commit=none`,
 `date=unknown`.
 
+> **The ldflags targets are the `main` package variables.** The release `Makefile` injects
+> `main.buildVersion` / `main.buildCommit` / `main.buildDate` (`cmd/raxd/main.go` then forwards them
+> to `version.Set`). The example below targets the `internal/version` variables directly, which is the
+> equivalent manual form.
+
 To produce a build with real metadata (run this inside Docker):
 
 ```sh
@@ -193,10 +246,11 @@ go build -ldflags "\
   ./cmd/raxd
 ```
 
-`raxd version` then prints the injected values, for example:
+`raxd version` then prints the injected values. The version is whatever was passed in (typically a
+`v`-prefixed git tag from `git describe --tags`), printed exactly as provided — for example:
 
 ```
-raxd 1.0.0 (commit abc1234, built 2025-06-01)
+raxd v0.1.0 (commit abc1234, built 2026-05-22)
 ```
 
 The same `Version` value is what the MCP `server_info` tool reports as its `version` field.
@@ -226,14 +280,16 @@ the direct dependencies (the `require` block in `go.mod`) are:
 | `github.com/spf13/cobra` | CLI and sub-commands |
 | `github.com/spf13/viper` | `config.yaml` loading |
 | `github.com/olekukonko/tablewriter` | `key list` table rendering |
-| `github.com/charmbracelet/log` | structured audit logging (`key create` / `key delete` and the `serve` / MCP audit stream) |
+| `github.com/charmbracelet/log` | structured audit logging (`key create` / `key delete`, the `serve` / MCP audit stream, and `service` audit) |
 | `golang.org/x/time/rate` | per-key / per-IP token-bucket rate limiting in `internal/server` |
 | `github.com/modelcontextprotocol/go-sdk` | the official Go MCP SDK — the MCP server in `internal/mcp` |
 
 The MCP SDK pulls in a few transitive dependencies (for example `github.com/google/jsonschema-go`
 and `github.com/yosida95/uritemplate/v3`); they are all pure-Go and permissive-licensed, vendored
 alongside the rest. The TLS transport itself uses only the standard library (`net/http`,
-`crypto/tls`, `crypto/x509`, `crypto/ecdsa`); no third-party HTTP or TLS framework is added.
+`crypto/tls`, `crypto/x509`, `crypto/ecdsa`); the command-execution, file-upload, and service layers
+use only the standard library (`os/exec`, `os.Root`, `text/template`, `os/user`); no third-party HTTP,
+TLS, or process framework is added.
 
 Two notes on libraries that are present but not used directly:
 
@@ -251,8 +307,16 @@ Two notes on libraries that are present but not used directly:
 
 - [`commands.md`](commands.md) — what each command does and outputs.
 - [`mcp.md`](mcp.md) — the MCP integration guide (the `/mcp` endpoint, tools, connection, audit).
-- [`configuration.md`](configuration.md) — paths, the `keys.db` database, the TLS directory, and the
-  `config.yaml` format.
-- [`troubleshooting.md`](troubleshooting.md) — common problems with `serve`, the TLS certificate,
-  and the config file.
+- [`configuration.md`](configuration.md) — paths, the `keys.db` database, the TLS directory, the
+  service layout, and the `config.yaml` networking, `exec`, and `upload` fields.
+- [`installation.md`](installation.md) — the `curl | sh` installer and building the release artifacts
+  from source.
+- [`service-management.md`](service-management.md) — the system-service security and operations guide.
+- [`troubleshooting.md`](troubleshooting.md) — common problems with `serve`, the service, the TLS
+  certificate, and the config file.
+- [`production-readiness.md`](production-readiness.md) — known limitations and pending pre-release items.
 - The repository root [`README.md`](../README.md) — overview and quick start.
+
+## Author
+
+**Vladimir Kovalev, OEM TECH** — author of raxd.

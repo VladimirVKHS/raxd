@@ -177,15 +177,18 @@ $ raxd version
 raxd dev (commit none, built unknown)
 ```
 
-A release build injects real values via ldflags (see [`development.md`](development.md)):
+A release build injects real values via ldflags (see [`development.md`](development.md)). The version
+is whatever was passed in `VERSION` at build time — typically a `v`-prefixed git tag from
+`git describe --tags`, for example:
 
 ```
 $ raxd version
-raxd 1.0.0 (commit abc1234, built 2025-06-01)
+raxd v0.1.0 (commit abc1234, built 2026-05-22)
 ```
 
-The version is printed exactly as provided by the build metadata (no hard-coded `v` prefix), which
-avoids producing `vdev` for development builds.
+The version is printed exactly as provided by the build metadata — raxd never adds or strips a `v`
+prefix itself (so a tag like `v0.1.0` shows as `v0.1.0`, and the default development build shows
+`dev`, never `vdev`).
 
 > The same version string is what the MCP `server_info` tool reports as its `version` field (see
 > [`mcp.md`](mcp.md#server_info)).
@@ -1446,3 +1449,7 @@ networking/`serve` fields, the `exec` / `upload` fields, and the service layout;
 [`development.md`](development.md) for building and testing in Docker;
 [`troubleshooting.md`](troubleshooting.md) for common `serve`, `service`, `execute_command`, and
 `upload_file` problems.
+
+## Author
+
+**Vladimir Kovalev, OEM TECH** — author of raxd.

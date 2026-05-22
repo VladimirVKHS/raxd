@@ -535,4 +535,9 @@ For the tool's input/output contract, error mapping, and curl examples, see
 - [`file-upload-security.md`](file-upload-security.md) — mandatory security warnings for `upload_file`.
 - [`troubleshooting.md`](troubleshooting.md) — common problems with `serve`, the service, the TLS
   certificate, the config file, `execute_command`, and `upload_file`.
+- [`production-readiness.md`](production-readiness.md) — known limitations and pending pre-release items.
 - [`development.md`](development.md) — building and testing in Docker.
+
+## Author
+
+**Vladimir Kovalev, OEM TECH** — author of raxd.

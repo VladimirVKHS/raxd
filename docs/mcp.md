@@ -119,17 +119,17 @@ The structured result is exactly:
 ```json
 {
   "name": "raxd",
-  "version": "1.0.0",
+  "version": "v0.1.0",
   "protocolVersion": "2025-11-25"
 }
 ```
 
-and the accompanying text line is `raxd 1.0.0 (MCP 2025-11-25)`.
+and the accompanying text line is `raxd v0.1.0 (MCP 2025-11-25)`.
 
 | Field | Value | Source |
 |-------|-------|--------|
 | `name` | always `"raxd"` | constant |
-| `version` | the build version, e.g. `"1.0.0"`; `"dev"` on a build without ldflags | `internal/version` |
+| `version` | the build version, e.g. `"v0.1.0"`; `"dev"` on a build without ldflags | `internal/version` |
 | `protocolVersion` | `"2025-11-25"` | protocol constant |
 
 `server_info` returns **only** these three fields. It does **not** read secrets, config, or the
@@ -707,7 +707,7 @@ The response advertises the `tools` capability and the server info:
   "result": {
     "protocolVersion": "2025-11-25",
     "capabilities": { "tools": { "listChanged": false } },
-    "serverInfo": { "name": "raxd", "version": "1.0.0" }
+    "serverInfo": { "name": "raxd", "version": "v0.1.0" }
   }
 }
 ```
@@ -740,8 +740,8 @@ curl -k https://127.0.0.1:<port>/mcp \
   "jsonrpc": "2.0",
   "id": 4,
   "result": {
-    "content": [ { "type": "text", "text": "raxd 1.0.0 (MCP 2025-11-25)" } ],
-    "structuredContent": { "name": "raxd", "version": "1.0.0", "protocolVersion": "2025-11-25" }
+    "content": [ { "type": "text", "text": "raxd v0.1.0 (MCP 2025-11-25)" } ],
+    "structuredContent": { "name": "raxd", "version": "v0.1.0", "protocolVersion": "2025-11-25" }
   }
 }
 ```
