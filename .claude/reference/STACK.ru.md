@@ -25,7 +25,7 @@
 | Стилизация вывода | `charmbracelet/lipgloss` (v2) | стабильный v2.0.x — импорт `charm.land/lipgloss/v2`; путь `github.com/charmbracelet/lipgloss/v2` — beta | https://github.com/charmbracelet/lipgloss |
 | Логи (цветные, человекочитаемые) | `charmbracelet/log` | активно | https://github.com/charmbracelet/log |
 | Таблицы (список ключей и т.п.) | `olekukonko/tablewriter` | maintained | https://github.com/olekukonko/tablewriter |
-| Сборка/релизы (build-матрица) | `goreleaser` v2 | v2.x, активно | https://goreleaser.com |
+| Сборка/релизы (build-матрица) | Ручной релизный скрипт поверх `Makefile build-all` (stdlib `go build` + `tar` + `sha256sum`) — ADR-001 distribution; БЕЗ goreleaser (офлайн в Docker неустановим: страница установки требует невышедший Go 1.26, всё через сеть). `.goreleaser.yaml` опц. «спящий» артефакт на будущее | n/a | — |
 | Пути конфигов (XDG) | ручной резолвинг через `os.Getenv` (stdlib) | `adrg/xdg` НЕ используется: его macOS-дефолт `~/Library/Application Support` конфликтует с единым `~/.config/raxd` (D3) | — |
 | Конфигурация | `spf13/viper` | maintained | https://github.com/spf13/viper |
 | TLS / сертификаты | `crypto/tls`, `crypto/x509` (stdlib) | Go 1.22+ | https://pkg.go.dev/crypto/tls |
@@ -39,20 +39,25 @@
 - **TLS**: серт `0644`, приватный ключ `0600`.
 - **Логи**: системный журнал (journald/syslog) + ротация при файловом выводе.
 
-## Кросс-компиляция (goreleaser)
+## Кросс-компиляция (ручной релизный скрипт)
 
 Матрица: `GOOS={linux,darwin} × GOARCH={amd64,arm64}` → 4 бинаря
 `raxd_{linux,darwin}_{amd64,arm64}` + архивы (`.tar.gz`) + `SHA256SUMS`.
-`CGO_ENABLED=0` (статическая сборка, простая дистрибуция).
+`CGO_ENABLED=0` (статическая сборка, простая дистрибуция). Реализация — `Makefile`
+(`build-all`/`release`/`checksums`) + `scripts/release.sh` (ADR-001 distribution), офлайн из
+`vendor/`. goreleaser НЕ используется (см. строку «Сборка/релизы» выше).
 
 **Зависимости вендорятся** (`go mod vendor` → каталог `vendor/` коммитится в git): окружение Docker не имеет доступа к `proxy.golang.org`, а baseline §6 требует воспроизводимых hermetic-сборок в контейнере. Сборки/тесты идут с `-mod=vendor`, без сетевого `go mod download`; целостность — через `go.sum`/`go mod verify`. При изменении зависимостей обязателен `go mod vendor` + коммит `vendor/`. Подробности и альтернативы — `specs/key-management/decisions/ADR-002-vendoring-offline-builds.md`. goreleaser/CI (задача distribution) собирают из `vendor/`.
 
 ## Установка (`curl | sh`)
 
-Скрипт: детект `uname -s`→{linux,darwin}, `uname -m`→{amd64,arm64}; скачивание нужного
-архива; проверка SHA256; установка в `/usr/local/bin/raxd` (`0755`); генерация и регистрация
-сервиса (systemd unit / launchd plist); на macOS — снятие `com.apple.quarantine`; печать
-красивого статус-блока (см. ux-spec) с инфо о приложении, авторе и примерами команд.
+Скрипт `install.sh` (bash, ADR distribution): детект `uname -s`→{linux,darwin}, `uname -m`→{amd64,arm64};
+скачивание нужного архива (base URL параметризуем через `RAXD_BASE_URL` — для офлайн-теста через мок-сервер);
+проверка SHA256 ДО установки (отказ при несовпадении); установка в `/usr/local/bin/raxd` (`0755`, если
+writable/sudo) ИЛИ `~/.local/bin` + PATH-hint (без лишнего root, `RAXD_PREFIX`/`--prefix`); на macOS —
+идемпотентное снятие `com.apple.quarantine`; печать статус-блока с автором/примерами. **install.sh НЕ
+регистрирует сервис** — это отдельная команда `raxd service install` (задача service-install); install.sh
+может лишь опционально подсказать её. Нотаризация macOS вне scope v1 (нет Apple Developer ID).
 
 ## CLI-команды (контракт первой итерации)
 

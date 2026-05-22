@@ -1,0 +1,50 @@
+# Dockerfile.install — тестовый образ для проверки install-flow (AC12, SR-112/SR-113)
+#
+# SECURITY-BASELINE §6: имитирует чистый Linux-сервер без Go/raxd.
+# python3 — ТОЛЬКО здесь (мок-HTTP-сервер для теста), НЕ в production Dockerfile.
+# ADR-002: мок-HTTP python3 -m http.server --bind 127.0.0.1
+#
+# Использование (из Makefile):
+#   make test-install VERSION=v0.1.0
+#
+# Вручную:
+#   docker build -f Dockerfile.install -t raxd-install-test .
+#   docker run --rm \
+#     -v $(pwd)/dist:/workspace/dist:ro \
+#     -v $(pwd)/install.sh:/workspace/install.sh:ro \
+#     -v $(pwd)/scripts/test-install.sh:/workspace/scripts/test-install.sh:ro \
+#     -e VERSION=v0.1.0 \
+#     raxd-install-test
+
+FROM debian:stable-slim
+
+# Зависимости тест-образа: curl (для install.sh) + python3 (мок-HTTP, ADR-002).
+# passwd/useradd — для TEST7 (проверка нет прав на запись, AC9/SR-106/SR-108).
+# Никакого Go, никакого raxd — имитация чистого сервера (AC12).
+RUN apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        curl \
+        ca-certificates \
+        python3 \
+        passwd \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+
+# Копируем артефакты релиза (dist/) и скрипты.
+# dist/ должен быть заполнен (make release-all) до сборки образа.
+COPY dist/ ./dist/
+COPY install.sh ./install.sh
+COPY scripts/test-install.sh ./scripts/test-install.sh
+COPY scripts/test-install-edge.sh ./scripts/test-install-edge.sh
+COPY scripts/release.sh ./scripts/release.sh
+
+# Права на исполнение скриптов
+RUN chmod +x install.sh scripts/test-install.sh scripts/test-install-edge.sh scripts/release.sh
+
+# Метаданные: образ для тестирования install-flow, не для production.
+LABEL description="raxd install-flow test image (debian, no Go, no raxd pre-installed)" \
+      purpose="AC12 install-flow verification in clean container"
+
+# Запуск: scripts/test-install.sh (docker-guard проверяет /.dockerenv, присутствует в Docker)
+CMD ["bash", "scripts/test-install.sh"]

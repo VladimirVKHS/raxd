@@ -7,6 +7,158 @@ is hypothetical. Run `raxd` inside Docker (security baseline §6) — see
 All error messages follow the project format: a lowercase `error:` line describing what happened,
 followed by one or more indented `hint:` lines describing what to do.
 
+## Installation (`install.sh`)
+
+Problems running the `curl | sh` installer. The full installation guide is in
+[`installation.md`](installation.md); this section covers the failure modes and their exit codes. The
+installer prints lowercase `error:` / `hint:` lines and exits with a specific code per failure class.
+
+> **Reminder: there is no public download host yet.** The default `RAXD_BASE_URL` in `install.sh` is a
+> placeholder (`https://releases.example.com/raxd`), so the canonical `curl … | sh` against the default
+> URL will fail at the download step (exit `5`) until a real host is configured. Point the installer at
+> a source you control with `RAXD_BASE_URL`, or install manually — see
+> [`installation.md`](installation.md#quick-install-curl--sh).
+
+### `error: unsupported platform` / `unsupported architecture` (exit `2`)
+
+The installer detected an OS or architecture it does not build for. It supports `linux` / `darwin` and
+`amd64` / `arm64` only; Windows, other OSes, and 32-bit architectures (for example `i686`) are rejected,
+and no binary is installed.
+
+```
+error: unsupported platform: <uname -s>
+  hint: only linux and darwin (macOS) are supported
+```
+
+```
+error: unsupported architecture: <uname -m>
+  hint: only amd64 (x86_64) and arm64 (aarch64) are supported
+```
+
+There is nothing to fix on a genuinely unsupported platform — `raxd` is macOS/Linux, amd64/arm64 only.
+If you are on a supported platform but `uname` reports an unexpected value, install
+[manually](installation.md#manual-installation) and pick the archive for your real platform.
+
+### `error: SHA256 mismatch` (exit `3`)
+
+The downloaded archive failed its integrity check against `SHA256SUMS`. The check runs **before** the
+binary is placed, so on this error **no binary is installed** and the temporary files are removed.
+
+```
+error: SHA256 mismatch — archive is corrupted or tampered
+  hint: try reinstalling; if the error persists, report it to the maintainers
+```
+
+Two distinct causes share this exit code:
+
+- **The archive is corrupted or was substituted** (the hash does not match). Re-run the install; if it
+  keeps failing, the source is unreliable — do not force it past the check. Recall the
+  [trust model](installation.md#trust-model-v1): the hash protects against a corrupted or substituted
+  *single* file, not a coordinated tampered source.
+- **No matching `SHA256SUMS` entry** for the requested archive (a different message, same exit `3`):
+
+  ```
+  error: no entry for '<archive>' in SHA256SUMS
+    hint: make sure RAXD_VERSION='<version>' matches a published release
+  ```
+
+  The `RAXD_VERSION` you asked for is not present in that `SHA256SUMS`. Confirm `RAXD_VERSION` matches a
+  published release on that source.
+
+Never bypass this check. If you are verifying a download by hand, see
+[Integrity verification](installation.md#integrity-verification-sha256).
+
+### `error: no write permission …` / no `sudo` (exit `4`)
+
+The chosen install directory is not writable and `sudo` is unavailable, so the binary could not be
+placed.
+
+```
+error: no write permission to /usr/local/bin and sudo is unavailable
+  hint: run as root or specify a different directory with --prefix ~/.local/bin
+```
+
+If `sudo` is present but the privileged install still fails, you get the related message:
+
+```
+error: failed to install binary with sudo to /usr/local/bin
+  hint: use --prefix to choose a directory that does not require root
+```
+
+Fix it one of these ways:
+
+- Install into a user directory you can write to: add `--prefix ~/.local/bin` (or set
+  `RAXD_PREFIX=~/.local/bin`).
+- Run as root, or on a host with `sudo` the installer will use it for the system directory and tell you
+  so explicitly.
+
+After a successful install into `~/.local/bin`, if that directory is not on `PATH` the installer prints
+a `PATH` hint rather than failing silently:
+
+```
+hint: raxd is installed but /home/user/.local/bin is not in $PATH
+hint: add to ~/.bashrc or ~/.zshrc:
+  export PATH="/home/user/.local/bin:$PATH"
+```
+
+Add that line to your shell profile and reopen the shell (or `source` it) so `raxd` resolves on `PATH`.
+
+### `error: download failed …` (exit `5`)
+
+The installer could not download the archive or `SHA256SUMS`.
+
+```
+error: download failed: <url>
+  hint: check your network connection and verify RAXD_BASE_URL/RAXD_VERSION
+```
+
+```
+error: download failed: <sums_url>
+  hint: check availability of <base-url>/SHA256SUMS
+```
+
+Most common causes:
+
+- **You used the default `RAXD_BASE_URL`** — it is a placeholder host that does not serve artifacts.
+  Set `RAXD_BASE_URL` to a real source (see [`installation.md`](installation.md#pointing-the-installer-at-an-artifact-source)).
+- **Wrong `RAXD_VERSION`** — the archive name built from the version does not exist on the source.
+- **Network / host unreachable** — check connectivity and that `<base-url>/SHA256SUMS` and the archive
+  are actually served over HTTPS.
+
+### `error: no SHA256 utility found` (exit `1`)
+
+Neither `sha256sum` nor `shasum` is on the host, so integrity cannot be verified.
+
+```
+error: no SHA256 utility found (sha256sum or shasum)
+  hint: install coreutils (linux) or use macOS 10.13+
+```
+
+Install GNU coreutils (Linux — provides `sha256sum`) or use a macOS version that ships `shasum`, then
+re-run.
+
+### macOS: "raxd is damaged" / Gatekeeper blocks it
+
+Without Apple notarization (out of scope in v1), Gatekeeper may block the binary on first run. The
+installer already strips the quarantine attribute on macOS and prints a hint:
+
+```
+hint: if macOS Gatekeeper blocks raxd, run:
+  xattr -d com.apple.quarantine /usr/local/bin/raxd
+  or: System Settings → Privacy & Security → allow '/usr/local/bin/raxd'
+hint: for a notarized build with full Gatekeeper approval, request notarization via Apple Developer Program
+```
+
+If you obtained the binary another way (browser/AirDrop, or a manual install), clear it yourself:
+
+```sh
+xattr -d com.apple.quarantine /usr/local/bin/raxd
+```
+
+Or approve it under **System Settings → Privacy & Security**. See
+[macOS Gatekeeper / quarantine](installation.md#macos-gatekeeper--quarantine) for the full context (and
+why the real Gatekeeper flow is verified on a live macOS host, not in Docker).
+
 ## `raxd serve`
 
 ### The server starts but every connection is rejected with 401
@@ -765,6 +917,8 @@ sure the user running `raxd` has a home directory set.
 
 ## Related documents
 
+- [`installation.md`](installation.md) — installation guide (`curl | sh`, manual install, integrity
+  verification, the trust model, macOS quarantine, exit codes).
 - [`commands.md`](commands.md) — full command reference, including all `serve` and `service` error
   cases.
 - [`service-management.md`](service-management.md) — the system-service security and operations guide
@@ -778,4 +932,3 @@ sure the user running `raxd` has a home directory set.
 - [`configuration.md`](configuration.md) — paths, the service layout, `keys.db`, the TLS directory,
   and the `config.yaml` networking, `exec`, and `upload` fields.
 - [`development.md`](development.md) — building and testing in Docker.
-</content>

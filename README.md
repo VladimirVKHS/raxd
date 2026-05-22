@@ -11,8 +11,11 @@ agents, all at once.
 > `execute_command` tool), and **file upload over MCP** (the `upload_file` tool) — all on the `/mcp`
 > route — are in place and working. **Registering `raxd` as a managed system service**
 > (`raxd service install` / `start` / `stop` / `status` / `uninstall`, systemd on Linux, launchd on
-> macOS) is now in place too, running the daemon under an unprivileged `raxd` user. The remaining
-> piece, `curl | sh` installation, is **not implemented yet**; see [Coming next](#coming-next).
+> macOS) is now in place too, running the daemon under an unprivileged `raxd` user. The latest piece,
+> the **`curl | sh` installer** (`install.sh` — platform detection, SHA256 verification, non-root
+> install), is now implemented and verified end-to-end in Docker; what remains is publishing the
+> release artifacts to a public HTTPS host (the default download URL is still a placeholder). See
+> [Installation](#installation) and [`docs/installation.md`](docs/installation.md).
 
 Author: **Vladimir Kovalev, OEM TECH**.
 
@@ -67,6 +70,11 @@ on failure, and a graceful stop — running the daemon as the unprivileged `raxd
 | Directory creation with `0700` permissions | **Working** |
 | `config.yaml` loading via viper (networking, `exec`, and `upload` fields read by `serve`) | **Working** |
 | Cross-compilation to darwin/linux × amd64/arm64 (static `CGO_ENABLED=0` binaries) | **Working** |
+| **`curl \| sh` installer** (`install.sh`: platform detect, SHA256 verify, non-root install, macOS quarantine) | **Working** (verified in Docker; public artifact host pending) |
+| **Reproducible release artifacts** (4 archives + `SHA256SUMS` via `make release-all`, offline in Docker) | **Working** |
+| Public release host serving the artifacts over HTTPS (real `RAXD_BASE_URL`) | **Not configured yet** (default URL is a placeholder) |
+| GPG/minisign signature of `SHA256SUMS`; macOS Apple-Developer-ID notarization | **Not implemented** (v1 trust = TLS + SHA256) |
+| Package managers (Homebrew/apt/rpm/AUR); self-update / uninstall script | **Not implemented** |
 | File **download** / host filesystem read / file deletion over MCP | **Not implemented** |
 | MCP tools beyond `ping` / `server_info` / `execute_command` / `upload_file`; MCP Resources / Prompts | **Not implemented** |
 | Interactive / PTY command sessions and real-time output streaming | **Not implemented** |
@@ -74,7 +82,6 @@ on failure, and a graceful stop — running the daemon as the unprivileged `raxd
 | Command sandboxing (cgroups/rlimits/seccomp/namespaces) | **Not implemented** (isolation via non-root + container) |
 | mTLS / client certificates | **Not implemented** (API-key auth only) |
 | `raxd config port` | **Stub** (`not implemented yet`) |
-| `curl \| sh` installer | **Not implemented** |
 
 Behind authentication, the working routes today are the health check (`GET /healthz`) and the MCP
 server (`/mcp`, with `ping`, `server_info`, `execute_command`, and `upload_file`). Every other route
@@ -101,7 +108,32 @@ implemented yet**.
   systemd-in-Docker container; the macOS launchd path is verified on a real macOS host (see
   [`docs/service-management.md`](docs/service-management.md#5-the-macos-path-is-not-tested-in-docker)).
 
-## Quick start (Docker)
+## Installation
+
+Once a public release host serves the artifacts over HTTPS, installation is a single command:
+
+```sh
+curl -fsSL https://<base-url>/install.sh | bash
+```
+
+`install.sh` detects your OS/architecture, downloads the matching archive, **verifies its SHA256
+before placing anything**, installs the `raxd` binary to `/usr/local/bin` (or `~/.local/bin` without
+`sudo`), and on macOS clears the Gatekeeper quarantine attribute. It installs **only the binary** — to
+register the system service afterwards, run `raxd service install`.
+
+> **The public download host is not configured yet.** The default download URL baked into `install.sh`
+> is a placeholder (`https://releases.example.com/raxd`), so the command above will not fetch real
+> artifacts until a host is set up. Until then you can: point the installer at a source you control
+> with `RAXD_BASE_URL`, install manually from a release archive (with SHA256 verification), or build
+> the artifacts from source in Docker (`make release-all`). The trust model (v1 relies on TLS + SHA256
+> with **no** GPG signature yet) and every option are documented in full in
+> [`docs/installation.md`](docs/installation.md).
+
+To build everything yourself and verify the install-flow locally, see
+[`docs/installation.md`](docs/installation.md#building-release-artifacts-from-source) and
+[`docs/development.md`](docs/development.md).
+
+## Quick start (Docker, from source)
 
 Clone the repository, then build and run the test suite inside Docker:
 
@@ -124,12 +156,8 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
 ```
 
 See [`docs/development.md`](docs/development.md) for the project layout, how to inject build
-metadata, and why the workflow is Docker-only.
-
-> There is **no installer yet**. Installation via `curl | sh` is planned (see
-> [Coming next](#coming-next)) but does not exist — build from source in Docker as shown above. Once
-> a binary is in place, register it as a service with `raxd service install` (see
-> [the service guide](docs/service-management.md)).
+metadata, and why the workflow is Docker-only. To build the four release archives + `SHA256SUMS` from
+source, see [`docs/installation.md`](docs/installation.md#building-release-artifacts-from-source).
 
 ## Commands
 
@@ -461,6 +489,16 @@ are in [`docs/configuration.md`](docs/configuration.md).
 The following capabilities are **planned and not implemented yet**. They are listed so you know what
 the binary is being built toward; do not treat them as available today.
 
+- **Public release host + signed artifacts** — the `install.sh` installer and the reproducible release
+  matrix (4 archives + `SHA256SUMS`) exist and are verified in Docker, but the artifacts are not yet
+  published to a public HTTPS host (the default download URL is a placeholder). Still to come before a
+  public release: a real download host (a concrete `RAXD_BASE_URL`), a **GPG/minisign signature** of
+  `SHA256SUMS` (v1 trust rests on TLS + SHA256 only), and **macOS Apple-Developer-ID notarization**
+  (v1 only strips the quarantine attribute). See [`docs/installation.md`](docs/installation.md).
+- **Package managers** — Homebrew/apt/rpm/AUR as install methods (out of scope for v1; gated on a
+  public host and a tap repo).
+- **Self-update / uninstall script / downgrade** — there is no auto-update or uninstall script yet;
+  remove the binary by hand (see [`docs/installation.md`](docs/installation.md#uninstall)).
 - **File download / read / delete** — `upload_file` is upload-only; reading or deleting host files
   over MCP is a separate task.
 - **More MCP tools and resources** — the MCP server today exposes `ping`, `server_info`,
@@ -473,15 +511,16 @@ the binary is being built toward; do not treat them as available today.
   arranges); the tool already kills the whole process tree on timeout, caps output, and limits
   argument count/length.
 - **mTLS / client certificates** — currently out of scope; authentication is by API key only.
-- **Installation via `curl | sh`** — an `install.sh` script, goreleaser release matrix, SHA256
-  verification, and macOS notarization (distribution task). *There is no installer yet — install
-  by building from source in Docker, then `raxd service install` to register the service.*
 - **`config port`** — actually writing the listening port to `config.yaml` (edit the file by hand
   for now).
 - **Visual design** — lipgloss styling, adaptive banner width, and colored output.
 
 ## Documentation
 
+- [`docs/installation.md`](docs/installation.md) — installation guide: `curl | sh` flow, pointing the
+  installer at an artifact source, the install path/privilege rules, SHA256 integrity verification, the
+  v1 trust model (TLS + SHA256, no GPG yet), manual install, macOS Gatekeeper/quarantine, building the
+  release artifacts from source, exit codes, and uninstall.
 - [`docs/commands.md`](docs/commands.md) — full command reference (`version`, `status`, the `key`
   group, the `service` group, `serve`, and the `config port` stub).
 - [`docs/service-management.md`](docs/service-management.md) — the system-service security and
@@ -498,8 +537,8 @@ the binary is being built toward; do not treat them as available today.
   policy, no disk quota, residual risks).
 - [`docs/configuration.md`](docs/configuration.md) — paths, the service layout, `keys.db`, the TLS
   directory, and the `config.yaml` networking, `exec`, and `upload` fields.
-- [`docs/troubleshooting.md`](docs/troubleshooting.md) — common problems with `serve`, the service,
-  the TLS certificate, keys, the config file, `execute_command`, and `upload_file`.
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — common problems with installation, `serve`,
+  the service, the TLS certificate, keys, the config file, `execute_command`, and `upload_file`.
 - [`docs/development.md`](docs/development.md) — building and testing in Docker, project layout, and
   build metadata.
 
@@ -511,4 +550,3 @@ of this README.
 ## License
 
 No license file is present in the repository yet; licensing terms are not defined at this stage.
-</content>
