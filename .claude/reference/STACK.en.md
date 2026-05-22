@@ -21,7 +21,7 @@ Author: **Vladimir Kovalev, OEM TECH**.
 | Purpose | Choice | Status / version | URL |
 |---|---|---|---|
 | CLI + subcommands | `spf13/cobra` | v1.10.x, active | https://github.com/spf13/cobra |
-| Cross-platform service | `kardianos/service` (+ unit/plist generation) | maintained | https://github.com/kardianos/service |
+| Cross-platform service | NOT used (manual unit/plist generation via stdlib `text/template`, ADR-001 service-install — no new dependency/vendoring); `kardianos/service` evaluated and rejected | n/a | — |
 | Output styling | `charmbracelet/lipgloss` (v2) | stable v2.0.x — import `charm.land/lipgloss/v2`; path `github.com/charmbracelet/lipgloss/v2` is beta | https://github.com/charmbracelet/lipgloss |
 | Logging (color, human) | `charmbracelet/log` | active | https://github.com/charmbracelet/log |
 | Tables (key list, etc.) | `olekukonko/tablewriter` | maintained | https://github.com/olekukonko/tablewriter |

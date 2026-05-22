@@ -1,2 +1,7 @@
 .local/
 .idea
+
+# Build artefacts (cross-build matrix, goreleaser)
+/dist/
+# Stray scratch files
+*.tmp1

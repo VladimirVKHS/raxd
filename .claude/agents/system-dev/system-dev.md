@@ -22,8 +22,8 @@ stop/restart, авто-рестарт) и работа с привилегиям
 - `specs/<task-id>/plan.md` — выбранная архитектура и модули (контракт сверху, источник истины №1).
 - `specs/<task-id>/security-requirements.md` — требования безопасности (non-root, capabilities,
   авто-рестарт), которые ты обязан выполнить.
-- `.claude/reference/STACK.ru.md` — стек (`kardianos/service` + генерация unit/plist, goreleaser,
-  build-матрица, `CGO_ENABLED=0`), пути на диске.
+- `.claude/reference/STACK.ru.md` — стек (РУЧНАЯ генерация unit/plist через stdlib `text/template`,
+  БЕЗ `kardianos/service` — ADR-001 service-install; goreleaser, build-матрица, `CGO_ENABLED=0`), пути на диске.
 - `guides/GIT-FLOW-GUIDE.ru.md` — правила именования ветки (бери имя отсюда, не хардкодь).
 - Существующий код/доки репозитория — через Read/Grep/Glob.
 
@@ -31,7 +31,8 @@ stop/restart, авто-рестарт) и работа с привилегиям
 
 1. Прочитай `plan.md` и `security-requirements.md` целиком. Сформулируй в одно предложение:
    что именно нужно сделать для интеграции `raxd` с ОС.
-2. Сверься со `STACK.ru.md`: стек сервиса (`kardianos/service`), build-матрица, пути на диске.
+2. Сверься со `STACK.ru.md`: стек сервиса (ручная генерация unit/plist через `text/template`, без внешней
+   service-библиотеки — ADR-001), build-матрица, пути на диске.
 3. Создай ветку по `guides/GIT-FLOW-GUIDE.ru.md` (формат `<тип>/<описание>`, kebab-case,
    латиница; имя бери из гайда — не придумывай произвольно).
 4. Напиши `specs/<task-id>/service-design.md` по шаблону `templates/service-design.template.md`:
@@ -57,8 +58,9 @@ stop/restart, авто-рестарт) и работа с привилегиям
 
 - Демон работает **НЕ от root**: выделенный системный пользователь; при необходимости порта <1024
   — Linux **capabilities** (`CAP_NET_BIND_SERVICE`), а **НЕ setuid root**.
-- Стек сервиса = **`kardianos/service`** + генерация unit/plist (из `STACK.ru.md`). Не вводи
-  другой механизм сервиса без обоснования в `plan.md` (Trade-offs).
+- Стек сервиса = **ручная генерация unit/plist через stdlib `text/template`** (ADR-001 service-install,
+  из `STACK.ru.md`), БЕЗ внешней service-библиотеки. Не вводи новую зависимость без обоснования в
+  `plan.md` (Trade-offs) и без вендоринга на хосте.
 - Имя ветки бери из `guides/GIT-FLOW-GUIDE.ru.md` — **не хардкодь** произвольное имя.
 - НЕ отклоняйся от `plan.md` молча: любое расхождение — через эскалацию пользователю и фиксацию.
 - Запуск/проверка `raxd` — только в Docker (`SECURITY-BASELINE.ru.md` §6); на хост-машину

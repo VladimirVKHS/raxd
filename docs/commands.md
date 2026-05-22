@@ -2,7 +2,8 @@
 
 This document describes every command in the `raxd` command tree **as it exists in the code
 today**. The service commands (`version`, `status`), the API-key commands
-(`key create`, `key list`, `key delete`), and the network server (`serve`) are fully working. The
+(`key create`, `key list`, `key delete`), the network server (`serve`), and the system-service group
+(`service install` / `uninstall` / `start` / `stop` / `status`) are fully working. The
 one remaining feature command, `config port`, is present as an honest stub that reports
 `not implemented yet`.
 
@@ -10,8 +11,11 @@ All CLI text (usage strings, messages, the banner, errors) is in English.
 
 > Where to run these commands: per the security baseline, `raxd` is built and run **inside Docker
 > only**. This applies in particular to `raxd serve`, which opens a TLS listener and (through the MCP
-> `execute_command` and `upload_file` tools) runs commands and writes files on the host. Examples
-> below show the command and its output; for how to actually invoke them in a container, see
+> `execute_command` and `upload_file` tools) runs commands and writes files on the host. The
+> `raxd service` integration is likewise exercised inside Docker (a privileged systemd container);
+> the macOS launchd path is verified on a real macOS host, not in a container (see
+> [`service-management.md`](service-management.md#5-the-macos-path-is-not-tested-in-docker)).
+> Examples below show the command and its output; for how to actually invoke them in a container, see
 > [`development.md`](development.md).
 
 ## Command tree
@@ -24,6 +28,12 @@ raxd
 │   ├── create         Create a new API key                (working)
 │   ├── list           List all API keys                   (working)
 │   └── delete         Revoke an API key                   (working)
+├── service            Manage raxd as a system service
+│   ├── install        Register the service + autostart    (working)
+│   ├── uninstall      Remove the service registration     (working)
+│   ├── start          Start the service                   (working)
+│   ├── stop           Stop the service                    (working)
+│   └── status         Show the system-service status      (working)
 ├── config             Manage configuration
 │   └── port           Set the listening port              (stub)
 └── serve              Start the raxd TLS server           (working)
@@ -31,6 +41,11 @@ raxd
 
 `raxd --help` lists the root command and all sub-commands. Each command also responds to
 `raxd <command> --help` with its own usage and description.
+
+> **`raxd status` and `raxd service status` are different commands.** `raxd status` shows the on-disk
+> paths and the foreground daemon state; `raxd service status` shows whether the daemon is registered
+> and running as a **system service** (installed, active, PID, EUID, autostart, unit path). See
+> [`raxd status`](#raxd-status) and [`raxd service status`](#raxd-service-status).
 
 > **MCP is not a CLI command.** The MCP server is not a separate command — it is hosted by
 > `raxd serve` on the `/mcp` route. To use it, run `raxd serve` and connect an MCP client to
@@ -70,9 +85,11 @@ The banner is a plain-text Unicode box and always contains the author line. On a
 predictably:
 
 - **stdout** carries the machine-readable result: the `version` line, the `status` fields, the
-  **key body** printed by `key create`, and the `key list` table.
+  **key body** printed by `key create`, the `key list` table, and the `raxd service status` block
+  (including its `--json` form).
 - **stderr** carries the banner, all human-facing decoration (warnings, metadata, confirmations),
-  and every `error:` / `hint:` message.
+  and every `error:` / `hint:` message. The mutating service commands
+  (`service install` / `uninstall` / `start` / `stop`) write their success blocks to **stderr** too.
 
 `raxd serve` is a special case: it is a long-running process and writes **everything** — the startup
 block, the audit stream, the shutdown block, and any startup error — to **stderr**. Its **stdout is
@@ -97,11 +114,22 @@ stay on the terminal because they go to stderr.
 | `key delete` succeeds | `0` |
 | `key create` validation/store error (e.g. label too long, corrupt store) | `1` |
 | `key delete` with an unknown id, an already-revoked id, or a missing id argument | `1` |
+| `service install` succeeds, or the service is **already installed** | `0` |
+| `service uninstall` succeeds, or the service is **not installed** | `0` |
+| `service start` / `stop` succeed | `0` |
+| `service status` (any state, including not installed) | `0` |
+| `service install` / `uninstall` / `start` / `stop` without root, or the manager is unavailable/unsupported | `1` |
+| `service start` / `stop` when the service is **not installed** | `1` |
 | `serve` shuts down gracefully (SIGINT / SIGTERM) | `0` |
 | `serve` startup error (port in use, no TLS-dir permission, corrupt cert, corrupt `keys.db`, invalid bind address, invalid `config.yaml`, cannot create upload root) | `1` |
 | Stub command (`config port`) | `1` |
 | `status` cannot determine `$HOME` | non-zero (error) |
 | Unknown command or flag (cobra default) | non-zero |
+
+> **`service` idempotency: the same "not present" sentinel maps to different exit codes by command.**
+> Re-installing an installed service, or uninstalling an absent one, is a **success** (exit `0`) — the
+> requested end state already holds. But starting or stopping an **absent** service is an error
+> (exit `1`) — there is nothing to act on. See the per-command sections below.
 
 ### Error format
 
@@ -207,6 +235,12 @@ that file. The `tls` line shows the **path** to the TLS directory (`tls/`), wher
 stores the certificate and private key. `status` never prints TLS contents, the configured port, or
 any other secret — only the state string and the resolved paths. (The upload root, default
 `<state directory>/uploads`, is created by `raxd serve`, not listed by `status`.)
+
+> `raxd status` reports the **interactive** paths (`~/.config/raxd`, `~/.local/state/raxd`) for the
+> current user. When `raxd` runs as a registered **system service**, the daemon uses system paths
+> instead (`/etc/raxd`, `/var/lib/raxd` on Linux), set through the unit/plist environment — see
+> [`raxd service status`](#raxd-service-status) and
+> [`configuration.md`](configuration.md#service-layout-system-service).
 
 **Error case — `$HOME` cannot be determined.** If the home directory cannot be resolved, `status`
 prints an error with a hint to stderr and exits with a non-zero code:
@@ -454,6 +488,358 @@ error: key delete requires an id argument
 
 ---
 
+## System service (`raxd service`)
+
+`raxd service` is a command group for registering and managing `raxd` as a **managed OS service** —
+a systemd unit on Linux, a launchd daemon on macOS. It has no action of its own; run one of its five
+sub-commands. Running `raxd service` alone prints the group's help.
+
+- **Short:** `Manage raxd as a system service`
+- **Long:**
+
+  ```
+  Register, start, stop, and monitor raxd as a managed OS service.
+
+  On Linux, raxd uses systemd. On macOS, it uses launchd.
+  The service runs under the unprivileged user "raxd" (not root).
+
+  Installation requires root/sudo. The daemon itself always runs as a non-root user.
+  ```
+
+The five sub-commands are **install**, **uninstall**, **start**, **stop**, and **status**. The
+contract is the same on both platforms — the platform-specific details (systemd vs launchd, the unit
+vs the plist) are hidden inside.
+
+> **Install needs root; the daemon does not.** `install`, `uninstall`, `start`, and `stop` write to
+> system directories and call the service manager, so they require root (run them with `sudo`). They
+> do **not** silently fall back to anything if you lack privileges — they print
+> `insufficient privileges` and exit `1`. The **running daemon**, however, is configured with
+> `User=raxd` (Linux) / `UserName=raxd` (macOS), so it runs as the unprivileged `raxd` user. `status`
+> does not require root.
+
+> **Read the [service management guide](service-management.md) before installing on a real host.** It
+> covers the non-root model, the privileged-port capability, what `uninstall` keeps, log rotation,
+> the restart policy, and the macOS verification limitation. The on-disk layout (paths, permissions)
+> is in [`configuration.md`](configuration.md#service-layout-system-service).
+
+### What `install` sets up
+
+`raxd service install` (root required) creates the full service registration. On Linux it:
+
+- creates the system user `raxd` if it does not exist
+  (`useradd --system --no-create-home --shell /usr/sbin/nologin`; an already-existing user is reused);
+- writes the systemd unit `/etc/systemd/system/raxd.service` (`root:root`, `0644`) with
+  `User=raxd`, `Restart=on-failure`, an explicit `StateDirectoryMode=0700` /
+  `ConfigurationDirectoryMode=0700`, and the journal output;
+- writes a journald drop-in `/etc/systemd/journald.conf.d/raxd.conf` that caps the journal size;
+- runs `systemctl daemon-reload` and `systemctl enable raxd` (autostart at boot).
+
+On macOS it writes the plist `/Library/LaunchDaemons/tech.oem.raxd.plist`, creates the state/log/config
+directories (`0700`, owned by `raxd`), and `launchctl bootstrap` + `enable`s the job.
+
+`install` does **not** start the service — start it with `raxd service start` afterwards. The default
+listening port is `7822`, which is unprivileged, so no special capability is needed; for a privileged
+port (`< 1024`) the unit gains `CAP_NET_BIND_SERVICE` only (see
+[`service-management.md`](service-management.md#2-privileged-ports--1024-and-the-network-capability)).
+
+### `raxd service install`
+
+Register `raxd` with the OS service manager and enable autostart.
+
+- **Usage:** `sudo raxd service install`
+- **Output channel:** stderr (success block or `error:` / `hint:`)
+- **Exit code:** `0` on success **or** when the service is already installed; `1` on error.
+
+On success it prints the success block to stderr (Linux):
+
+```
+  installed     raxd service
+  unit          /etc/systemd/system/raxd.service
+  drop-in       /etc/systemd/journald.conf.d/raxd.conf
+  user          raxd  [not root]
+  port          7822
+  autostart     enabled
+  hint: start the service now with "raxd service start"
+```
+
+On macOS the block omits the `drop-in` line and shows the plist path:
+
+```
+  installed     raxd service
+  unit          /Library/LaunchDaemons/tech.oem.raxd.plist
+  user          raxd  [not root]
+  port          7822
+  autostart     enabled
+  hint: start the service now with "raxd service start"
+```
+
+The `port` line reflects the port resolved from `config.yaml` (the same value `serve` would bind);
+with no config file it shows the default `7822`. After the block, an audit line is written to stderr
+(`level=info msg="service installed" action=install platform=… unit=… user=raxd port=…`).
+
+**Already installed (exit 0).** Re-running `install` on an installed service does **not** create a
+duplicate and does **not** error — it reports the state and exits `0`:
+
+```
+  already installed   raxd service
+  hint: use "raxd service status" to check the current state
+```
+
+**Errors** (exit `1`). Without root:
+
+```
+error: insufficient privileges to install the service
+  hint: run as root or with sudo: sudo raxd service install
+  hint: installation requires root to write system service files
+```
+
+When the service manager cannot be reached (no `systemctl` / `launchctl`):
+
+```
+error: service manager is not available
+  hint: ensure systemd (Linux) or launchd (macOS) is running
+```
+
+On any other registration failure the partially created files are rolled back (the unit/drop-in
+created in that run are removed; the `raxd` user is intentionally kept), and a neutral error is
+printed — never a raw `systemctl` trace and never a secret. The exact wording depends on the failing
+step, but it always follows the `error:` / `hint:` shape and exits `1`.
+
+### `raxd service uninstall`
+
+Remove the service registration and disable autostart.
+
+- **Usage:** `sudo raxd service uninstall`
+- **Output channel:** stderr (success block or `error:` / `hint:`)
+- **Exit code:** `0` on success **or** when the service is not installed; `1` on error.
+
+On success it stops and disables the service, removes the unit (and, on Linux, the journald drop-in),
+and prints (Linux):
+
+```
+  uninstalled   raxd service
+  removed       unit file and autostart registration
+  removed       journal size limit drop-in
+  kept          system user "raxd" (no shell, no home, not running)
+  hint: to also remove the user: sudo userdel raxd
+  hint: data in /var/lib/raxd is preserved — remove manually if no longer needed
+```
+
+On macOS the block has no `drop-in` line, the user-removal hint uses `dscl`, and the data hint shows
+the macOS state directory:
+
+```
+  uninstalled   raxd service
+  removed       plist file and autostart registration
+  kept          system user "raxd" (no shell, no home, not running)
+  hint: to also remove the user: sudo dscl . -delete /Users/raxd
+  hint: data in /usr/local/var/raxd is preserved — remove manually if no longer needed
+```
+
+The `kept` line is deliberate: the `raxd` user (no login shell, no home, no longer running) is
+**intentionally not deleted**, because removing a system user is riskier than keeping an inert one
+(UID-reuse). Remove it yourself only if you need a zero-footprint cleanup — see
+[`service-management.md`](service-management.md#3-the-raxd-user-is-kept-after-uninstall).
+
+> **The data hint shows the real, platform-specific state directory.** The `data in … is preserved`
+> hint prints the actual state directory for the current platform — `/var/lib/raxd` on Linux,
+> `/usr/local/var/raxd` on macOS. The state directory (and `keys.db` inside it) is **not** removed by
+> `uninstall` on either platform.
+
+**Not installed (exit 0).** Uninstalling an absent service is a no-op success, not an error:
+
+```
+  not installed   raxd service
+  hint: use "raxd service install" to set up the service
+```
+
+**Errors** (exit `1`). Without root, the same `insufficient privileges` error as `install`. If the
+manager is unavailable, the `service manager is not available` error.
+
+### `raxd service start`
+
+Start the registered service.
+
+- **Usage:** `sudo raxd service start`
+- **Output channel:** stderr (success block or `error:` / `hint:`)
+- **Exit code:** `0` on success; `1` if the service is not installed or the start fails.
+
+On success it prints (the `pid` line appears once the manager reports a main PID):
+
+```
+  started       raxd service
+  pid           1234
+  hint: check status with "raxd service status"
+```
+
+**Not installed (exit 1).** Unlike `uninstall`, starting an **absent** service is an error — there is
+nothing to start:
+
+```
+error: raxd service is not installed
+  hint: install it first with "raxd service install"
+```
+
+Without root you get the `insufficient privileges` error; if the manager is unavailable, the
+`service manager is not available` error. A start that the manager rejects produces a neutral failure
+(no raw manager output) and exits `1`.
+
+### `raxd service stop`
+
+Stop the running service. The stop sends `SIGTERM`, which `raxd serve` handles as a **graceful
+shutdown** (drain connections, flush usage, exit `0`). Because that is a clean exit, the manager does
+**not** restart the service — it stays stopped until you start it again.
+
+- **Usage:** `sudo raxd service stop`
+- **Output channel:** stderr (success block or `error:` / `hint:`)
+- **Exit code:** `0` on success; `1` if the service is not installed or the stop fails.
+
+On success:
+
+```
+  stopped       raxd service
+  hint: start again with "raxd service start"
+```
+
+**Not installed (exit 1).** Like `start`, stopping an absent service is an error:
+
+```
+error: raxd service is not installed
+  hint: install it first with "raxd service install"
+```
+
+Without root you get the `insufficient privileges` error; an unavailable manager gives the
+`service manager is not available` error.
+
+> **Restart on failure vs. stop.** `Restart=on-failure` (Linux) / `KeepAlive.SuccessfulExit=false`
+> (macOS) means the service is brought back up after a **crash** (non-zero exit / `kill -9`) but
+> **not** after a graceful `stop`. See
+> [`service-management.md`](service-management.md#6-restart-on-failure-vs-graceful-stop).
+
+### `raxd service status`
+
+Show whether the service is installed and running.
+
+- **Usage:** `raxd service status` (add `--json` for machine-readable output)
+- **Flag:** `--json` — print the status as JSON instead of the human-readable block.
+- **Output channel:** **stdout** (the status block and the JSON form). The banner and any
+  `error:` / `hint:` lines still go to stderr.
+- **Exit code:** `0` — always, including when the service is not installed (a status query is not an
+  error).
+
+`status` is a query: it does **not** require root and does not mutate anything. Its output goes to
+**stdout** so it can be piped, mirroring `raxd status`.
+
+Installed and running (Linux):
+
+```
+$ raxd service status
+  installed    yes
+  running      yes
+  pid          1234
+  euid         999
+  user         raxd  [not root]
+  port         7822
+  autostart    enabled
+  unit         /etc/systemd/system/raxd.service
+  manager      systemd
+  state        active (running)
+```
+
+The `euid` line is read from `/proc/<pid>/status` of the running daemon (Linux) and proves the
+non-root guarantee: a non-zero `euid` (here `999`) means the daemon is **not** root.
+
+> **macOS: no `euid` line.** The effective UID is not readable without `/proc`, so on macOS the
+> `euid` field is `0` and the line is omitted (it is printed only when `euid > 0`). The non-root
+> guarantee on macOS rests on `UserName=raxd` in the plist; verify it on a real macOS host (see
+> [`service-management.md`](service-management.md#5-the-macos-path-is-not-tested-in-docker)).
+
+Installed but stopped (the `pid` shows `-`, the `euid` line is absent, and a `hint:` to start is
+printed as part of the stdout block):
+
+```
+  installed    yes
+  running      no
+  pid          -
+  user         raxd  [not root]
+  port         7822
+  autostart    enabled
+  unit         /etc/systemd/system/raxd.service
+  manager      systemd
+  state        inactive (dead)
+  hint: start with "raxd service start"
+```
+
+Not installed (still exit `0`):
+
+```
+  installed    no
+  hint: install with "raxd service install"
+```
+
+#### `raxd service status --json`
+
+With `--json`, the status is printed as JSON to **stdout** (the human block is not printed). The
+banner still goes to stderr and does not pollute the parsed output.
+
+```json
+{
+  "installed": true,
+  "active": true,
+  "pid": 1234,
+  "euid": 999,
+  "user": "raxd",
+  "port": 7822,
+  "autostart": "enabled",
+  "unit_path": "/etc/systemd/system/raxd.service",
+  "state": "active (running)",
+  "manager": "systemd"
+}
+```
+
+When not installed, the boolean fields are `false`, `user` is empty, `autostart` is `disabled`, and
+the numeric fields are `0`:
+
+```json
+{
+  "installed": false,
+  "active": false,
+  "pid": 0,
+  "euid": 0,
+  "user": "",
+  "port": 0,
+  "autostart": "disabled",
+  "unit_path": "/etc/systemd/system/raxd.service",
+  "state": "not installed",
+  "manager": "systemd"
+}
+```
+
+> `unit_path` and `manager` reflect the current platform (the systemd unit path / `systemd` on Linux,
+> the plist path / `launchd` on macOS) regardless of installation state — they describe where the
+> registration *would* live.
+
+### Security summary for the service
+
+- The daemon runs as the unprivileged `raxd` user (`euid != 0`); only `install` / `uninstall` /
+  `start` / `stop` need root, and they fail cleanly without it (never a silent root daemon).
+- The default port `7822` needs no capability; a privileged port (`< 1024`) grants only
+  `CAP_NET_BIND_SERVICE`, never full root or setuid-root.
+- The unit/plist/drop-in are `root:root` (`root:wheel` on macOS) `0644` — the `raxd` user cannot
+  rewrite its own service definition.
+- The audit log is capped via a journald drop-in (`SystemMaxUse` / `SystemMaxFileSize`); the cap is
+  per-host, with logrotate as a documented fallback.
+- `uninstall` removes the registration, autostart, capability, and drop-in, but **keeps** the inert
+  `raxd` user and the state directory.
+- `status` never prints a secret — only the state, paths, PID, EUID, port, and user name.
+- Template inputs are validated before render and the manager is invoked without a shell; raw manager
+  stderr is never shown to the user.
+
+See [`service-management.md`](service-management.md) for the full security model and
+[`configuration.md`](configuration.md#service-layout-system-service) for the paths and permissions.
+
+---
+
 ## `raxd serve`
 
 Start `raxd` as a **foreground TLS server**.
@@ -484,6 +870,11 @@ receives `SIGINT` (Ctrl+C) or `SIGTERM`. It takes **no flags or positional argum
 > (security baseline §6). It opens a network listener **and** can run commands and write files on the
 > host via the MCP `execute_command` and `upload_file` tools, so running it on the host is out of
 > scope. See [`development.md`](development.md).
+
+> **For production, register it as a service.** `serve` is foreground only — it has no `--daemon`
+> mode. To run `raxd` as a managed service with autostart and restart-on-failure, use
+> [`raxd service install`](#raxd-service-install) (which sets `raxd serve` as its `ExecStart` /
+> `ProgramArguments`), then `raxd service start`.
 
 ### What `serve` does (scope)
 
@@ -541,8 +932,12 @@ Every **other** path still returns `501 Not Implemented`.
 - Command sandboxing (cgroups/rlimits/seccomp/namespaces) — isolation relies on a non-root user
   inside a container.
 - mTLS / client certificates.
-- Registering `raxd` as a systemd/launchd service (`serve` is foreground only — there is no
-  `--daemon` mode and `raxd` does not install a service).
+
+> **Registering `raxd` as a service is a separate command, not a `serve` flag.** `serve` itself is
+> foreground only and has no `--daemon` mode. Service registration (systemd/launchd) is done by the
+> [`raxd service`](#system-service-raxd-service) group, which wraps `raxd serve` as the service's
+> command. The `serve` process and the `service` commands cooperate: the unit/plist runs
+> `raxd serve`, and `raxd service stop` signals it for a graceful shutdown.
 
 The catch-all route remains an extension point for future tools; until then any route other than
 `/healthz` and `/mcp` answers `501`.
@@ -735,6 +1130,11 @@ So one authenticated `tools/call` produces **two** lines (the `AUTH` connection 
 record) — or three when the daemon is root (the extra `WARN`). See [`mcp.md`](mcp.md#audit) for the
 MCP audit details.
 
+> **Audit-log rotation under the service.** This audit stream is on stderr. When `raxd` runs as a
+> registered **system service** on Linux, that stderr goes to journald and its growth is capped by the
+> journald drop-in `install` writes (`SystemMaxUse` / `SystemMaxFileSize`). See
+> [`service-management.md`](service-management.md#4-audit-log-rotation).
+
 > **The body-size `413`/`400` has no audit line.** The rejection returned when a request body exceeds
 > `max_body_bytes` is generated by the outermost `http.MaxBytesReader` layer, which sits **before**
 > the audit-aware middlewares. Unlike the `401` / `403` / `429` cases above, it does **not** produce
@@ -859,6 +1259,10 @@ The shutdown block is printed **only if the server actually started** — that i
 block was printed after a successful bind. A run that failed to start (see below) prints neither the
 startup nor the shutdown block.
 
+> **This is also how `raxd service stop` works.** Stopping the service sends `SIGTERM`, which triggers
+> exactly this graceful shutdown. The clean exit (code `0`) is why the service is **not** restarted
+> after a normal stop — see [`service-management.md`](service-management.md#6-restart-on-failure-vs-graceful-stop).
+
 ### Startup errors (exit 1)
 
 A startup error is printed in the standard `error:` / `hint:` format on stderr and the process exits
@@ -969,9 +1373,11 @@ In this YAML case the `bind_addr` reference is incidental: the actionable part i
   output/argument limits, and a controlled `cwd`/environment. `upload_file` writes a single regular
   file confined to the upload root (`os.Root`), size-limited, with a controlled mode (no
   setuid/setgid/sticky/world-writable). Neither tool elevates privileges (they inherit the daemon's
-  UID/GID); run `raxd` as a non-root user. See
-  [`execute-command-security.md`](execute-command-security.md) and
-  [`file-upload-security.md`](file-upload-security.md).
+  UID/GID); run `raxd` as a non-root user — the [`raxd service`](#system-service-raxd-service) layout
+  does this for you by running the daemon as the `raxd` user. See
+  [`execute-command-security.md`](execute-command-security.md),
+  [`file-upload-security.md`](file-upload-security.md), and
+  [`service-management.md`](service-management.md).
 
 ---
 
@@ -1019,6 +1425,11 @@ error: config port: not implemented yet
 | `raxd key create` | stdout (key) + stderr (decor) | yes | validation / store error | working |
 | `raxd key list` | stdout | yes (incl. empty store) | — | working |
 | `raxd key delete` | stderr | yes | not found / already revoked / missing id | working |
+| `raxd service install` | stderr | yes (incl. already installed) | no root / manager unavailable / register failure | working |
+| `raxd service uninstall` | stderr | yes (incl. not installed) | no root / manager unavailable / removal failure | working |
+| `raxd service start` | stderr | yes | not installed / no root / start failure | working |
+| `raxd service stop` | stderr | yes | not installed / no root / stop failure | working |
+| `raxd service status` | stdout | yes (any state) | manager error | working |
 | `raxd serve` | stderr | graceful shutdown | startup error (port/cert/db/bind/config/upload-root) | working |
 | `raxd config port` | stderr | — | yes | stub |
 
@@ -1026,11 +1437,13 @@ error: config port: not implemented yet
 > `server_info`, `execute_command`, and `upload_file` — see [`mcp.md`](mcp.md). Command execution and
 > file upload are the MCP `execute_command` / `upload_file` tools, not CLI sub-commands.
 
-See also: [`mcp.md`](mcp.md) for the MCP integration guide (including `execute_command` and
+See also: [`service-management.md`](service-management.md) for the system-service security and
+operations guide; [`mcp.md`](mcp.md) for the MCP integration guide (including `execute_command` and
 `upload_file`); [`execute-command-security.md`](execute-command-security.md) and
 [`file-upload-security.md`](file-upload-security.md) for the command-execution and file-upload
 security warnings; [`configuration.md`](configuration.md) for paths, `keys.db`, `config.yaml`, the
-networking/`serve` fields, and the `exec` / `upload` fields; [`development.md`](development.md) for
-building and testing in Docker; [`troubleshooting.md`](troubleshooting.md) for common `serve`,
-`execute_command`, and `upload_file` problems.
+networking/`serve` fields, the `exec` / `upload` fields, and the service layout;
+[`development.md`](development.md) for building and testing in Docker;
+[`troubleshooting.md`](troubleshooting.md) for common `serve`, `service`, `execute_command`, and
+`upload_file` problems.
 </content>
