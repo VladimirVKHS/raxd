@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -158,8 +159,14 @@ func TestExecToolInToolsList(t *testing.T) {
 // ============================================================================
 
 // TestExecNoShellInjectionViaMCP — shell-метасимволы в args — литеральные аргументы.
+// SR-43: вектор "echo" + args=["a; touch <marker>"] НЕ создаёт marker-файл.
+// При корректной реализации (exec.Command без shell) аргумент "a; touch /tmp/..." передаётся
+// как один строковый аргумент в echo, shell не интерпретирует точку с запятой.
 func TestExecNoShellInjectionViaMCP(t *testing.T) {
 	marker := fmt.Sprintf("/tmp/mcp_pwned_%d", time.Now().UnixNano())
+	// Убеждаемся, что файл не существует до теста.
+	_ = os.Remove(marker)
+
 	baseURL, _, client, _ := startMCPServerWithExecCfg(t, defaultExecCfg())
 
 	body, _ := callExecuteCommand(t, client, baseURL, map[string]interface{}{
@@ -167,22 +174,25 @@ func TestExecNoShellInjectionViaMCP(t *testing.T) {
 		"args":    []string{"a; touch " + marker},
 	})
 
-	// Файл НЕ должен появиться.
-	// Проверяем что команда отработала (нет isError по этой причине).
+	// Команда должна завершиться без ошибки (echo с одним арг).
 	envelope := parseToolResult(t, body)
 	if errObj := envelope["error"]; errObj != nil {
-		t.Fatalf("AC2: unexpected protocol error: %v; body=%s", errObj, body)
+		t.Fatalf("AC2/SR-43: unexpected protocol error: %v; body=%s", errObj, body)
 	}
-
-	// Если файл создан — shell был задействован (баг).
-	// Нет возможности проверить через MCP ответ — проверяем что в stdout нет shell-признаков.
 	result, _ := envelope["result"].(map[string]interface{})
 	if result == nil {
-		t.Fatalf("AC2: no result in response; body=%s", body)
+		t.Fatalf("AC2/SR-43: no result in response; body=%s", body)
 	}
 	isErr, _ := result["isError"].(bool)
 	if isErr {
-		t.Fatalf("AC2: isError=true for echo command; body=%s", body)
+		t.Fatalf("AC2/SR-43: isError=true for echo command; body=%s", body)
+	}
+
+	// КЛЮЧЕВАЯ проверка SR-43: маркер-файл НЕ должен быть создан.
+	// Если он появился — shell был задействован (критическая уязвимость).
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Errorf("SR-43: shell injection succeeded via MCP — marker file was created: %s", marker)
+		_ = os.Remove(marker)
 	}
 }
 
@@ -695,6 +705,11 @@ func TestExecAuditContainsRequiredFields(t *testing.T) {
 	// timed_out.
 	if !strings.Contains(execLine, "timed_out=") {
 		t.Errorf("AC13/SR-58: exec audit missing timed_out; line=%q", execLine)
+	}
+	// remote= (SR-58): в тестовой среде RemoteAddrFromContext может вернуть "-" или реальный адрес;
+	// ключ remote= обязан присутствовать в любом случае.
+	if !strings.Contains(execLine, "remote=") {
+		t.Errorf("SR-58: exec audit missing remote= field; line=%q", execLine)
 	}
 }
 
