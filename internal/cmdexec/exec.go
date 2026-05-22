@@ -190,21 +190,9 @@ func validateCwd(path string) error {
 // Устанавливает PATH из env-whitelist (SR-44).
 // Отвергает ErrDot (относительный путь из cwd; SR-44).
 // Отвергает ErrNotFound (нет бинаря; SR-45).
-func lookupBinary(command string, envWhitelist []string) (string, error) {
-	// Строим путь из env демона по whitelist.
-	pathVal := ""
-	for _, key := range envWhitelist {
-		if strings.EqualFold(key, "PATH") {
-			pathVal = os.Getenv("PATH")
-			break
-		}
-	}
-
-	// Используем exec.LookPath (использует текущий PATH); если нужен конкретный PATH,
-	// используем exec.LookPathError через ручной поиск в разделённом PATH.
-	// Для простоты и надёжности: временно устанавливаем PATH демона и вызываем LookPath.
-	// Поскольку тест запускается в контролируемой среде, это безопасно.
-	// Примечание: PATH клиента не передаётся — используется PATH демона из env.
+func lookupBinary(command string, _ []string) (string, error) {
+	// envWhitelist не используется напрямую: exec.LookPath уже обращается к PATH
+	// текущего процесса (демона), что соответствует SR-44 — PATH клиента не передаётся.
 
 	// Если передан абсолютный путь — используем как есть (но не через shell).
 	if strings.HasPrefix(command, "/") {
@@ -216,7 +204,7 @@ func lookupBinary(command string, envWhitelist []string) (string, error) {
 	}
 
 	// LookPath — использует PATH текущего процесса (демона).
-	// Это правильно: PATH берётся из env демона (не от клиента).
+	// PATH клиента не передаётся (SR-44): buildEnv в exec.go строит Cmd.Env из whitelist.
 	bin, err := exec.LookPath(command)
 	if err != nil {
 		if errors.Is(err, exec.ErrDot) {
@@ -228,12 +216,6 @@ func lookupBinary(command string, envWhitelist []string) (string, error) {
 	// Дополнительная проверка ErrDot: если результат не абсолютный путь.
 	if !strings.HasPrefix(bin, "/") {
 		return "", fmt.Errorf("command not found: relative path not allowed")
-	}
-
-	// Если PATH в whitelist задан, проверяем что бинарь в нём.
-	if pathVal != "" {
-		// Дополнительная верификация не нужна — LookPath уже использует PATH демона.
-		_ = pathVal
 	}
 
 	return bin, nil
