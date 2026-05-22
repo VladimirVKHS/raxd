@@ -48,6 +48,30 @@
 требовал обновления, т.к. был написан до появления cmdexec. Изменение сохраняет смысл
 теста (никакой несанкционированный пакет не использует os/exec) и соответствует spec AC2.
 
+## Правки по developer-guardian (второй раунд)
+
+Четыре находки developer-guardian устранены:
+
+**#1 (HIGH) — фальш-зелёный SR-43 тест.** `TestExecNoShellInjectionViaMCP` проверял только
+`isError==false`, что пропускало реальную shell-инъекцию. Добавлена проверка
+`os.Stat(marker) == nil → t.Errorf(...)` — теперь тест реально детектирует инъекцию.
+Добавлен `os` в импорты и pre-cleanup `os.Remove(marker)`.
+
+**#2 (MEDIUM) — root-WARN с Result:"deny".** Разделено на два семантически разных случая:
+- `Result:"warn"` — при euid==0 всегда; writeAudit эмитирует уровень WARN/WARN (новый case);
+  команда продолжается если `deny_root=false`.
+- `Result:"deny"` — только при `deny_root=true`; команда не выполняется (реальный deny).
+Обновлён `writeAudit` в audit.go: добавлен `case "warn"` с exec/non-exec ветками.
+Обновлён комментарий `AuditRecord.Result` — добавлено значение `"warn"`.
+
+**#3 (LOW) — отсутствие assert `remote=` в TestExecAuditContainsRequiredFields.** Добавлен.
+В тестовой среде `RemoteAddrFromContext` может вернуть `"-"` — это ок, ключ `remote=`
+обязан присутствовать в любом случае (SR-58).
+
+**#4 (INFO) — dead code `pathVal` в `lookupBinary`.** Удалён: блок вычисления `pathVal`
+и отброс `_ = pathVal`. `exec.LookPath` использует PATH демона напрямую (SR-44 compliance).
+Параметр `envWhitelist` заменён на `_` (blank identifier).
+
 ## Тесты
 
 Покрытые acceptance criteria:
@@ -75,18 +99,18 @@
 
     docker build --target test -t raxd-test . && docker run --rm raxd-test
 
-Подтверждение: все тесты зелёные, без skip/t.Skip. Вывод:
+Подтверждение: все тесты зелёные, без skip/t.Skip. Вывод после guardian-правок:
 
     ok  github.com/vladimirvkhs/raxd                        0.006s
     ok  github.com/vladimirvkhs/raxd/internal/banner        0.001s
     ok  github.com/vladimirvkhs/raxd/internal/cli           0.071s
-    ok  github.com/vladimirvkhs/raxd/internal/cmdexec       0.626s
+    ok  github.com/vladimirvkhs/raxd/internal/cmdexec       0.627s
     ok  github.com/vladimirvkhs/raxd/internal/config        0.004s
     ok  github.com/vladimirvkhs/raxd/internal/keystore      0.155s
-    ok  github.com/vladimirvkhs/raxd/internal/mcp           3.668s
-    ok  github.com/vladimirvkhs/raxd/internal/server        2.202s
-    ok  github.com/vladimirvkhs/raxd/internal/version       0.002s
-    (+ -race прогон: keystore, server, mcp — зелёные)
+    ok  github.com/vladimirvkhs/raxd/internal/mcp           3.619s
+    ok  github.com/vladimirvkhs/raxd/internal/server        2.265s
+    ok  github.com/vladimirvkhs/raxd/internal/version       0.001s
+    (+ -race прогон: keystore 1.235s, server 4.066s, mcp 2.884s — зелёные)
 
 ## Безопасность
 
