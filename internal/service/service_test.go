@@ -63,7 +63,8 @@ func TestErrorIs(t *testing.T) {
 
 // ─── Config defaults ──────────────────────────────────────────────────────────
 
-// TestDefaultConfig verifies that DefaultConfig returns sane defaults.
+// TestDefaultConfig verifies that DefaultConfig returns sane defaults for the current platform.
+// Platform-specific paths are verified by TestDefaultConfigForGOOS_Paths in templates_test.go.
 func TestDefaultConfig(t *testing.T) {
 	cfg := service.DefaultConfig()
 
@@ -78,6 +79,10 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if cfg.Port != 7822 {
 		t.Errorf("DefaultConfig.Port = %d, want 7822", cfg.Port)
+	}
+	// ConfigDir must be the full raxd-specific path, not a bare XDG parent (BUG-1 fix).
+	if cfg.ConfigDir == "/etc" {
+		t.Errorf("DefaultConfig.ConfigDir = %q: must be full path /etc/raxd, not bare XDG parent", cfg.ConfigDir)
 	}
 }
 

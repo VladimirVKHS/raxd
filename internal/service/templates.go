@@ -18,6 +18,14 @@ import (
 	"text/template"
 )
 
+// Note on ConfigHome / StateHome (BUG-1 macOS fix):
+// plistTemplateText uses {{.ConfigHome}} and {{.StateHome}} rather than hardcoded
+// /etc and /var/lib so that macOS gets /usr/local/etc and /usr/local/var respectively.
+// These fields are populated by TemplateDataFromConfig as filepath.Dir(ConfigDir) /
+// filepath.Dir(StateDir), preserving the invariant:
+//   filepath.Join(ConfigHome, "raxd") == ConfigDir
+//   filepath.Join(StateHome,  "raxd") == StateDir
+
 // ─── TemplateData (plan.md §Contracts) ───────────────────────────────────────
 
 // TemplateData carries validated values for unit/plist template rendering.
@@ -49,14 +57,25 @@ type TemplateData struct {
 	// TYPED bool — not a raw string (SR-90).
 	NeedNetBindCap bool
 
-	// StateDir: absolute path for service state (/var/lib/raxd).
+	// StateDir: absolute path for service state (/var/lib/raxd on Linux, /usr/local/var/raxd on macOS).
 	StateDir string
 
-	// ConfigDir: absolute path for configuration (/etc).
+	// ConfigDir: absolute path for configuration (/etc/raxd on Linux, /usr/local/etc/raxd on macOS).
+	// FULL raxd-specific directory — NOT the XDG parent (BUG-1 fix).
 	ConfigDir string
 
-	// LogPath: absolute path for log directory (macOS only, /var/log/raxd).
+	// LogPath: absolute path for log directory (macOS only; Linux uses journald).
 	LogPath string
+
+	// ConfigHome: parent of ConfigDir, used as XDG_CONFIG_HOME in the launchd plist.
+	// Invariant: filepath.Join(ConfigHome, "raxd") == ConfigDir.
+	// Linux: /etc; macOS: /usr/local/etc (BUG-1 macOS fix).
+	ConfigHome string
+
+	// StateHome: parent of StateDir, used as XDG_STATE_HOME in the launchd plist.
+	// Invariant: filepath.Join(StateHome, "raxd") == StateDir.
+	// Linux: /var/lib; macOS: /usr/local/var (BUG-1 macOS fix).
+	StateHome string
 }
 
 // ─── Validation regexps (SR-90) ───────────────────────────────────────────────
@@ -121,7 +140,7 @@ func ValidateTemplateData(d TemplateData) error {
 		return fmt.Errorf("Port %d is out of range 1..65535 (SR-90)", d.Port)
 	}
 
-	// StateDir, ConfigDir, LogPath: absolute, no control chars.
+	// StateDir, ConfigDir, LogPath, ConfigHome, StateHome: absolute, no control chars.
 	for _, field := range []struct {
 		name string
 		val  string
@@ -129,6 +148,8 @@ func ValidateTemplateData(d TemplateData) error {
 		{"StateDir", d.StateDir},
 		{"ConfigDir", d.ConfigDir},
 		{"LogPath", d.LogPath},
+		{"ConfigHome", d.ConfigHome},
+		{"StateHome", d.StateHome},
 	} {
 		if field.val == "" {
 			return fmt.Errorf("%s is empty (SR-90)", field.name)
@@ -268,13 +289,15 @@ const plistTemplateText = `<?xml version="1.0" encoding="UTF-8"?>
     <string>{{.Group}}</string>
 
     <!-- Environment: XDG paths so internal/config/paths.go resolves system dirs
-         without code changes (ADR-002). HOME needed as fallback in paths.go. -->
+         without code changes (ADR-002). HOME needed as fallback in paths.go.
+         ConfigHome=filepath.Dir(ConfigDir), StateHome=filepath.Dir(StateDir) —
+         invariant: XDG_CONFIG_HOME + "/raxd" == ConfigDir (BUG-1 macOS fix). -->
     <key>EnvironmentVariables</key>
     <dict>
         <key>XDG_CONFIG_HOME</key>
-        <string>/etc</string>
+        <string>{{.ConfigHome}}</string>
         <key>XDG_STATE_HOME</key>
-        <string>/var/lib</string>
+        <string>{{.StateHome}}</string>
         <key>HOME</key>
         <string>{{.StateDir}}</string>
     </dict>
@@ -336,6 +359,12 @@ func JournaldDropIn() string {
 
 // TemplateDataFromConfig constructs a TemplateData from a Config.
 // NeedNetBindCap is derived from Port < 1024 (ADR-003, SR-90 typed bool).
+// ConfigHome and StateHome are filepath.Dir(ConfigDir) / filepath.Dir(StateDir):
+//
+//	Linux:  ConfigHome=/etc,            StateHome=/var/lib
+//	macOS:  ConfigHome=/usr/local/etc,  StateHome=/usr/local/var
+//
+// Invariant E: filepath.Join(ConfigHome,"raxd") == ConfigDir (BUG-1 macOS fix).
 func TemplateDataFromConfig(cfg Config) TemplateData {
 	return TemplateData{
 		ExecPath:       cfg.ExecPath,
@@ -347,6 +376,8 @@ func TemplateDataFromConfig(cfg Config) TemplateData {
 		StateDir:       cfg.StateDir,
 		ConfigDir:      cfg.ConfigDir,
 		LogPath:        cfg.LogPath,
+		ConfigHome:     filepath.Dir(cfg.ConfigDir),
+		StateHome:      filepath.Dir(cfg.StateDir),
 	}
 }
 

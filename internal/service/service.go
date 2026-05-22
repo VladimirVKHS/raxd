@@ -116,18 +116,39 @@ type Config struct {
 	LogPath string
 }
 
-// DefaultConfig returns a Config with sensible production defaults.
-// plan.md §Contracts: defaults from service-design.md.
+// DefaultConfig returns a Config with sensible production defaults for the current platform.
+// plan.md §Contracts: defaults from service-design.md (updated for macOS BUG-1 fix).
+//
+// Linux:  ConfigDir=/etc/raxd,            StateDir=/var/lib/raxd,    LogPath=/var/log/raxd
+// macOS:  ConfigDir=/usr/local/etc/raxd,  StateDir=/usr/local/var/raxd, LogPath=/usr/local/var/log/raxd
+//
+// ConfigDir is the FULL raxd-specific directory (not the XDG parent).
+// XDG_CONFIG_HOME for plist is derived as filepath.Dir(ConfigDir) at render time.
 func DefaultConfig() Config {
-	return Config{
-		Port:      7822,
-		User:      "raxd",
-		Group:     "raxd",
-		Label:     "tech.oem.raxd",
-		StateDir:  "/var/lib/raxd",
-		ConfigDir: "/etc",
-		LogPath:   "/var/log/raxd",
+	return DefaultConfigForGOOS(runtime.GOOS)
+}
+
+// DefaultConfigForGOOS returns platform-specific defaults by GOOS string.
+// Called by DefaultConfig() and exported for tests that build darwin configs
+// on Linux (AC13 — tests run in Docker, runtime.GOOS is always linux there).
+func DefaultConfigForGOOS(goos string) Config {
+	base := Config{
+		Port:  7822,
+		User:  "raxd",
+		Group: "raxd",
+		Label: "tech.oem.raxd",
 	}
+	switch goos {
+	case "darwin":
+		base.ConfigDir = "/usr/local/etc/raxd"
+		base.StateDir = "/usr/local/var/raxd"
+		base.LogPath = "/usr/local/var/log/raxd"
+	default: // linux and all others
+		base.ConfigDir = "/etc/raxd"
+		base.StateDir = "/var/lib/raxd"
+		base.LogPath = "/var/log/raxd"
+	}
+	return base
 }
 
 // ─── ServiceManager interface (plan.md §Contracts) ────────────────────────────
@@ -173,27 +194,28 @@ func New(cfg Config) (ServiceManager, error) {
 		cfg.ExecPath = exe
 	}
 
-	// Apply defaults for missing fields.
+	// Apply defaults for missing fields using platform-specific values (BUG-1 macOS fix).
+	platformDefaults := DefaultConfigForGOOS(runtime.GOOS)
 	if cfg.User == "" {
-		cfg.User = "raxd"
+		cfg.User = platformDefaults.User
 	}
 	if cfg.Group == "" {
-		cfg.Group = "raxd"
+		cfg.Group = platformDefaults.Group
 	}
 	if cfg.Label == "" {
-		cfg.Label = "tech.oem.raxd"
+		cfg.Label = platformDefaults.Label
 	}
 	if cfg.StateDir == "" {
-		cfg.StateDir = "/var/lib/raxd"
+		cfg.StateDir = platformDefaults.StateDir
 	}
 	if cfg.ConfigDir == "" {
-		cfg.ConfigDir = "/etc"
+		cfg.ConfigDir = platformDefaults.ConfigDir
 	}
 	if cfg.LogPath == "" {
-		cfg.LogPath = "/var/log/raxd"
+		cfg.LogPath = platformDefaults.LogPath
 	}
 	if cfg.Port == 0 {
-		cfg.Port = 7822
+		cfg.Port = platformDefaults.Port
 	}
 
 	switch runtime.GOOS {

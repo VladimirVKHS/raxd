@@ -13,6 +13,8 @@ import (
 )
 
 // validData returns a minimal valid TemplateData for Linux (port >= 1024).
+// ConfigHome and StateHome are filepath.Dir of the respective full paths —
+// mirrors what TemplateDataFromConfig computes (BUG-1 invariant E).
 func validData() service.TemplateData {
 	return service.TemplateData{
 		ExecPath:       "/usr/local/bin/raxd",
@@ -23,8 +25,18 @@ func validData() service.TemplateData {
 		StateDir:       "/var/lib/raxd",
 		ConfigDir:      "/etc/raxd",
 		LogPath:        "/var/log/raxd",
+		ConfigHome:     "/etc",       // filepath.Dir("/etc/raxd")
+		StateHome:      "/var/lib",   // filepath.Dir("/var/lib/raxd")
 		NeedNetBindCap: false,
 	}
+}
+
+// validDataDarwin returns TemplateData built from the darwin defaults.
+// AC13: constructed directly (not via New()) so tests run on Linux in Docker.
+func validDataDarwin() service.TemplateData {
+	cfg := service.DefaultConfigForGOOS("darwin")
+	cfg.ExecPath = "/usr/local/bin/raxd"
+	return service.TemplateDataFromConfig(cfg)
 }
 
 // ─── renderUnit tests ─────────────────────────────────────────────────────────
@@ -356,5 +368,124 @@ func TestRenderPlist_InjectionRejectedBeforeRender(t *testing.T) {
 	}
 	if strings.Contains(out, "User=root") {
 		t.Errorf("injected directive appeared in plist output despite error")
+	}
+}
+
+// ─── BUG-1 macOS path invariant tests (AC13 — Linux-testable) ────────────────
+
+// TestPlist_DarwinXDGPaths verifies that the launchd plist rendered with darwin
+// defaults contains macOS-correct XDG_CONFIG_HOME and XDG_STATE_HOME values.
+//
+// AC13: constructed via validDataDarwin() (uses DefaultConfigForGOOS("darwin")),
+// NOT via New(), so this test runs on Linux in Docker without dispatching to darwin.
+func TestPlist_DarwinXDGPaths(t *testing.T) {
+	d := validDataDarwin()
+	out, err := service.RenderPlist(d)
+	if err != nil {
+		t.Fatalf("RenderPlist (darwin) failed: %v", err)
+	}
+
+	// macOS XDG homes must NOT be the Linux values.
+	if strings.Contains(out, "<string>/etc</string>") {
+		t.Errorf("darwin plist must not contain Linux XDG_CONFIG_HOME /etc\nGot:\n%s", out)
+	}
+	if strings.Contains(out, "<string>/var/lib</string>") {
+		t.Errorf("darwin plist must not contain Linux XDG_STATE_HOME /var/lib\nGot:\n%s", out)
+	}
+
+	// macOS XDG homes must be the correct values.
+	mustContain := []string{
+		"<string>/usr/local/etc</string>",   // XDG_CONFIG_HOME for darwin
+		"<string>/usr/local/var</string>",   // XDG_STATE_HOME for darwin
+		"<string>/usr/local/var/raxd</string>", // HOME / WorkingDirectory
+	}
+	for _, want := range mustContain {
+		if !strings.Contains(out, want) {
+			t.Errorf("darwin plist missing %q\nGot:\n%s", want, out)
+		}
+	}
+}
+
+// TestDefaultConfigForGOOS_Paths verifies that platform-specific Config paths are correct.
+//
+// Linux regress: ConfigDir=/etc/raxd, StateDir=/var/lib/raxd.
+// Darwin new:    ConfigDir=/usr/local/etc/raxd, StateDir=/usr/local/var/raxd.
+func TestDefaultConfigForGOOS_Paths(t *testing.T) {
+	cases := []struct {
+		goos            string
+		wantConfigDir   string
+		wantStateDir    string
+		wantLogPath     string
+	}{
+		{
+			goos:          "linux",
+			wantConfigDir: "/etc/raxd",
+			wantStateDir:  "/var/lib/raxd",
+			wantLogPath:   "/var/log/raxd",
+		},
+		{
+			goos:          "darwin",
+			wantConfigDir: "/usr/local/etc/raxd",
+			wantStateDir:  "/usr/local/var/raxd",
+			wantLogPath:   "/usr/local/var/log/raxd",
+		},
+	}
+
+	for _, tc := range cases {
+		cfg := service.DefaultConfigForGOOS(tc.goos)
+		if cfg.ConfigDir != tc.wantConfigDir {
+			t.Errorf("GOOS=%s ConfigDir = %q, want %q", tc.goos, cfg.ConfigDir, tc.wantConfigDir)
+		}
+		if cfg.StateDir != tc.wantStateDir {
+			t.Errorf("GOOS=%s StateDir = %q, want %q", tc.goos, cfg.StateDir, tc.wantStateDir)
+		}
+		if cfg.LogPath != tc.wantLogPath {
+			t.Errorf("GOOS=%s LogPath = %q, want %q", tc.goos, cfg.LogPath, tc.wantLogPath)
+		}
+	}
+}
+
+// TestTemplateDataFromConfig_InvariantE verifies that the XDG-home invariant holds
+// for both linux and darwin configs (BUG-1 invariant E):
+//
+//	filepath.Join(ConfigHome, "raxd") == ConfigDir
+//	filepath.Join(StateHome,  "raxd") == StateDir
+func TestTemplateDataFromConfig_InvariantE(t *testing.T) {
+	for _, goos := range []string{"linux", "darwin"} {
+		cfg := service.DefaultConfigForGOOS(goos)
+		cfg.ExecPath = "/usr/local/bin/raxd"
+		td := service.TemplateDataFromConfig(cfg)
+
+		wantConfigDir := td.ConfigHome + "/raxd"
+		if wantConfigDir != td.ConfigDir {
+			t.Errorf("GOOS=%s invariant E violated: ConfigHome(%q)+/raxd = %q, ConfigDir = %q",
+				goos, td.ConfigHome, wantConfigDir, td.ConfigDir)
+		}
+
+		wantStateDir := td.StateHome + "/raxd"
+		if wantStateDir != td.StateDir {
+			t.Errorf("GOOS=%s invariant E violated: StateHome(%q)+/raxd = %q, StateDir = %q",
+				goos, td.StateHome, wantStateDir, td.StateDir)
+		}
+	}
+}
+
+// TestPlist_LinuxXDGPathsRegress is a regression test: Linux plist still uses
+// /etc and /var/lib for XDG homes (unchanged from before the BUG-1 macOS fix).
+func TestPlist_LinuxXDGPathsRegress(t *testing.T) {
+	d := validData() // Linux defaults
+	out, err := service.RenderPlist(d)
+	if err != nil {
+		t.Fatalf("RenderPlist (linux) failed: %v", err)
+	}
+
+	mustContain := []string{
+		"<string>/etc</string>",      // XDG_CONFIG_HOME
+		"<string>/var/lib</string>",  // XDG_STATE_HOME
+	}
+	for _, want := range mustContain {
+		if !strings.Contains(out, want) {
+			t.Errorf("linux plist missing %q\nGot:\n%s", want, out)
+		}
 	}
 }
