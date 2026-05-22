@@ -19,7 +19,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 )
 
@@ -103,9 +102,8 @@ func (m *launchdManager) createDirs() error {
 			return fmt.Errorf("cannot create %s: %w", d, err)
 		}
 		// chown to service user (SR-89: owner = raxd:raxd).
-		// exec.Command is used here because os.Chown requires UID/GID lookup.
-		// SR-91: separate args, no shell.
-		chownCmd := exec.Command("/usr/sbin/chown", "-R", m.cfg.User+":"+m.cfg.Group, d) //nolint:gosec
+		// runCommandRaw: separate args, no shell (SR-91).
+		chownCmd := runCommandRaw(context.Background(), "/usr/sbin/chown", "-R", m.cfg.User+":"+m.cfg.Group, d)
 		_ = chownCmd.Run() // best-effort; failure is non-fatal for the test path
 	}
 	return nil

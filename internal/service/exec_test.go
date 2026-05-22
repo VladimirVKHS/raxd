@@ -7,6 +7,7 @@ package service_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/vladimirvkhs/raxd/internal/service"
@@ -45,25 +46,29 @@ func TestRunManager_NoShellInterpolation(t *testing.T) {
 
 // TestRunManager_RawStderrNotPropagated verifies that raw stderr from the subprocess
 // is NOT included verbatim in the returned error message (SR-95).
-// We use "false" (exits with code 1) if available; the error should be neutral.
+//
+// Strategy: run `ls /nonexistent-raxd-stderr-test-xyzzy` — the command writes a known
+// path fragment to stderr on Linux (ls: cannot access '/nonexistent-raxd-stderr-test-xyzzy':
+// No such file or directory) and exits non-zero. We assert the raw path fragment does NOT
+// appear in err.Error(), proving RunManager neutralizes stderr before returning.
 func TestRunManager_RawStderrNotPropagated(t *testing.T) {
 	ctx := context.Background()
-	// Use a command that writes to stderr and exits non-zero.
-	// On Linux "sh -c 'echo RAW_SECRET_STDERR >&2; exit 1'" would expose stderr.
-	// We verify the returned error does NOT contain raw stderr.
-	// Since we can't guarantee /bin/sh here, test a simpler invariant:
-	// any non-zero exit from a real command should give a neutral error.
-	_, err := service.RunManager(ctx, "/bin/false")
-	// /bin/false may or may not exist; either way, test the error type.
-	if err != nil {
-		// Error must NOT be nil here since /bin/false exits 1 (or is unavailable).
-		// The error message must not contain raw "exec:" prefixes from os/exec internal.
-		errStr := err.Error()
-		// It's OK to mention the command failed; NOT OK to have raw stderr.
-		// We just verify it's a service error type (neutral).
-		_ = errStr // We can't test absence of specific secret since we don't know what /bin/false outputs.
+
+	// This sentinel path will appear verbatim in /bin/ls stderr output.
+	// It must NOT appear in the returned error.
+	sentinel := "nonexistent-raxd-stderr-test-xyzzy"
+	_, err := service.RunManager(ctx, "/bin/ls", "/"+sentinel)
+	if err == nil {
+		// /bin/ls on a non-existent path must exit non-zero; if it somehow
+		// succeeded (impossible) we cannot test the SR-95 invariant.
+		t.Fatal("expected error from ls on nonexistent path, got nil")
 	}
-	// If /bin/false doesn't exist, we get ErrManagerUnavailable — also fine.
+
+	errStr := err.Error()
+	if strings.Contains(errStr, sentinel) {
+		t.Errorf("SR-95 violation: raw stderr leaked into error message.\n"+
+			"sentinel %q found in: %q", sentinel, errStr)
+	}
 }
 
 // TestRunManager_ContextCancellation verifies that a cancelled context stops execution.

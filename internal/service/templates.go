@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
-	"strings"
 	"text/template"
 )
 
@@ -347,23 +346,12 @@ func TemplateDataFromConfig(cfg Config) TemplateData {
 
 // ─── Helper: neutral error message (SR-95) ───────────────────────────────────
 
-// neutralizeStderr redacts/filters raw manager stderr to a neutral message.
+// neutralizeStderr returns a neutral failure message regardless of the raw stderr content.
 // SR-95: raw stderr from systemctl/launchctl must NOT be propagated to user output.
-// Returns a neutral description of the failure suitable for wrapping in an error.
-func neutralizeStderr(raw string) string {
-	// Drop raw stderr content; return a generic indicator.
-	// We keep a short, non-secret fragment only if it doesn't contain sensitive patterns.
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return "manager command failed"
-	}
-	// Redact anything longer than 120 chars to prevent raw trace leakage.
-	if len(raw) > 120 {
-		raw = raw[:120] + "..."
-	}
-	// Remove any occurrence of paths that look like secrets or PEM blocks.
-	if strings.Contains(raw, "BEGIN ") || strings.Contains(raw, "rax_") {
-		return "manager command failed (output redacted)"
-	}
+//
+// The raw argument is intentionally ignored — any content from the OS manager
+// (paths, error text, PEM fragments) must not appear in user-facing error messages.
+// Callers wrap this return value in a typed ServiceError.
+func neutralizeStderr(_ string) string {
 	return "manager command failed"
 }

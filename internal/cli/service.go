@@ -22,6 +22,7 @@ import (
 
 	"github.com/charmbracelet/log"
 	"github.com/spf13/cobra"
+	"github.com/vladimirvkhs/raxd/internal/config"
 	"github.com/vladimirvkhs/raxd/internal/service"
 )
 
@@ -50,14 +51,43 @@ Installation requires root/sudo. The daemon itself always runs as a non-root use
 	return cmd
 }
 
-// resolveManager returns the injected manager (test) or constructs one from service.New().
-func resolveManager(injected service.ServiceManager) (service.ServiceManager, error) {
+// resolveManagerWithPort returns the injected manager (test) or constructs one from service.New()
+// using the port from config.Load(). The actual port is returned alongside the manager so that
+// CLI output blocks (install success, status) can display the real configured port (ISSUE-1).
+//
+// ISSUE-1 fix (SR-85, ADR-003): in production the port comes from config.Load(config.Paths()),
+// NOT from service.DefaultConfig(). Using DefaultConfig() hardcodes port=7822 and would
+// suppress AmbientCapabilities=CAP_NET_BIND_SERVICE for privileged ports (< 1024).
+//
+// For test injection (injected != nil) the port is returned as 0 — tests override the manager
+// entirely and do not exercise the port-from-config path.
+func resolveManagerWithPort(injected service.ServiceManager) (service.ServiceManager, int, error) {
 	if injected != nil {
-		return injected, nil
+		return injected, 0, nil
 	}
-	cfg := service.DefaultConfig()
-	cfg.ExecPath, _ = os.Executable()
-	return service.New(cfg)
+
+	// Resolve config paths (XDG-based, see internal/config/paths.go).
+	paths, err := config.Paths()
+	if err != nil {
+		// Fallback: HOME unavailable; use default port.
+		cfg := service.DefaultConfig()
+		cfg.ExecPath, _ = os.Executable()
+		mgr, err2 := service.New(cfg)
+		return mgr, cfg.Port, err2
+	}
+
+	// Load config.yaml — absence of the file is not an error (uses defaults).
+	appCfg, err := config.Load(paths)
+	if err != nil {
+		return nil, 0, fmt.Errorf("cannot load configuration: %w", err)
+	}
+
+	svcCfg := service.DefaultConfig()
+	svcCfg.Port = appCfg.Port // carry real port (SR-85/ADR-003 — drives NeedNetBindCap)
+	svcCfg.ExecPath, _ = os.Executable()
+
+	mgr, err := service.New(svcCfg)
+	return mgr, svcCfg.Port, err
 }
 
 // serviceContext returns a context with a reasonable timeout for manager calls.
@@ -80,7 +110,7 @@ After install, start the service with "raxd service start".`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			stderr := cmd.ErrOrStderr()
 
-			m, err := resolveManager(mgr)
+			m, port, err := resolveManagerWithPort(mgr)
 			if err != nil {
 				printSvcError(stderr, mapManagerError(err))
 				return err
@@ -108,6 +138,10 @@ After install, start the service with "raxd service start".`,
 				fmt.Fprintf(stderr, "  %-14s %s\n", "drop-in", "/etc/systemd/journald.conf.d/raxd.conf")
 			}
 			fmt.Fprintf(stderr, "  %-14s raxd  [not root]\n", "user")
+			if port > 0 {
+				fmt.Fprintf(stderr, "  %-14s %d\n", "port", port)
+			}
+			fmt.Fprintf(stderr, "  %-14s %s\n", "autostart", "enabled")
 			fmt.Fprintf(stderr, "  %-14s %s\n", "hint:", "start the service now with \"raxd service start\"")
 
 			// Audit log (ux-spec).
@@ -117,6 +151,7 @@ After install, start the service with "raxd service start".`,
 				"platform", runtime.GOOS,
 				"unit", unitDisplayPath,
 				"user", "raxd",
+				"port", port,
 			)
 
 			return nil
@@ -140,7 +175,7 @@ Requires root or sudo.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			stderr := cmd.ErrOrStderr()
 
-			m, err := resolveManager(mgr)
+			m, _, err := resolveManagerWithPort(mgr)
 			if err != nil {
 				printSvcError(stderr, mapManagerError(err))
 				return err
@@ -194,7 +229,7 @@ func newServiceStartCmd(mgr service.ServiceManager) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			stderr := cmd.ErrOrStderr()
 
-			m, err := resolveManager(mgr)
+			m, _, err := resolveManagerWithPort(mgr)
 			if err != nil {
 				printSvcError(stderr, mapManagerError(err))
 				return err
@@ -245,7 +280,7 @@ func newServiceStopCmd(mgr service.ServiceManager) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			stderr := cmd.ErrOrStderr()
 
-			m, err := resolveManager(mgr)
+			m, _, err := resolveManagerWithPort(mgr)
 			if err != nil {
 				printSvcError(stderr, mapManagerError(err))
 				return err
@@ -292,7 +327,7 @@ Output goes to stdout (suitable for scripting). Use --json for machine-readable 
 			stderr := cmd.ErrOrStderr()
 			jsonFlag, _ := cmd.Flags().GetBool("json")
 
-			m, err := resolveManager(mgr)
+			m, port, err := resolveManagerWithPort(mgr)
 			if err != nil {
 				printSvcError(stderr, mapManagerError(err))
 				return err
@@ -308,9 +343,9 @@ Output goes to stdout (suitable for scripting). Use --json for machine-readable 
 			}
 
 			if jsonFlag {
-				return printStatusJSON(stdout, st)
+				return printStatusJSON(stdout, st, port)
 			}
-			printStatusHuman(stdout, st)
+			printStatusHuman(stdout, st, port)
 			return nil // exit 0 always for status (AC10)
 		},
 	}
@@ -386,7 +421,8 @@ func mapManagerError(err error) serviceErrorMsg {
 }
 
 // printStatusHuman prints the human-readable status block to stdout (ux-spec §status).
-func printStatusHuman(w io.Writer, st service.Status) {
+// port is the TCP port from the resolved config (ISSUE-3 fix: ux-spec requires port row).
+func printStatusHuman(w io.Writer, st service.Status, port int) {
 	const w12 = "%-12s"
 
 	if !st.Installed {
@@ -414,6 +450,10 @@ func printStatusHuman(w io.Writer, st service.Status) {
 	}
 
 	fmt.Fprintf(w, "  "+w12+" raxd  [not root]\n", "user")
+	if port > 0 {
+		fmt.Fprintf(w, "  "+w12+" %d\n", "port", port)
+	}
+	fmt.Fprintf(w, "  "+w12+" %s\n", "autostart", "enabled")
 	fmt.Fprintf(w, "  "+w12+" %s\n", "unit", unitDisplayPathForOS())
 	fmt.Fprintf(w, "  "+w12+" %s\n", "manager", managerNameForOS())
 	fmt.Fprintf(w, "  "+w12+" %s\n", "state", st.State)
@@ -424,20 +464,26 @@ func printStatusHuman(w io.Writer, st service.Status) {
 }
 
 // printStatusJSON writes the status as JSON to w (ux-spec §status --json).
-func printStatusJSON(w io.Writer, st service.Status) error {
+// port is the TCP port from the resolved config (ISSUE-2 fix: ux-spec requires port/autostart/unit_path fields).
+func printStatusJSON(w io.Writer, st service.Status, port int) error {
 	type jsonStatus struct {
 		Installed bool   `json:"installed"`
 		Active    bool   `json:"active"`
 		PID       int    `json:"pid"`
 		EUID      int    `json:"euid"`
 		User      string `json:"user"`
+		Port      int    `json:"port"`
+		Autostart string `json:"autostart"`
+		UnitPath  string `json:"unit_path"`
 		State     string `json:"state"`
 		Manager   string `json:"manager"`
 	}
 
 	user := ""
+	autostart := "disabled"
 	if st.Installed {
 		user = "raxd"
+		autostart = "enabled"
 	}
 	js := jsonStatus{
 		Installed: st.Installed,
@@ -445,6 +491,9 @@ func printStatusJSON(w io.Writer, st service.Status) error {
 		PID:       st.PID,
 		EUID:      st.EUID,
 		User:      user,
+		Port:      port,
+		Autostart: autostart,
+		UnitPath:  unitDisplayPathForOS(),
 		State:     st.State,
 		Manager:   managerNameForOS(),
 	}

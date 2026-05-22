@@ -1,4 +1,6 @@
 // Package cli_test — unit-tests for "raxd service" command group.
+// Note: whitebox tests that call exported helpers from export_test.go are in
+// package cli (same package) and are placed in service_whitebox_test.go.
 //
 // Tests verify:
 // - service subcommand is registered in root (AC1)
