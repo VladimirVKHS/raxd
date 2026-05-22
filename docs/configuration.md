@@ -536,4 +536,3 @@ For the tool's input/output contract, error mapping, and curl examples, see
 - [`troubleshooting.md`](troubleshooting.md) — common problems with `serve`, the service, the TLS
   certificate, the config file, `execute_command`, and `upload_file`.
 - [`development.md`](development.md) — building and testing in Docker.
-</content>

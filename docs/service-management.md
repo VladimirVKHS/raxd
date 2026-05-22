@@ -346,4 +346,3 @@ error, never a raw `systemctl` trace or any secret).
   [`file-upload-security.md`](file-upload-security.md) — the per-tool security guides whose root-level
   residual risks the non-root service layout closes.
 - [`development.md`](development.md) — building and testing in Docker.
-</content>

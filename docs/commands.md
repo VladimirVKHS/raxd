@@ -1446,4 +1446,3 @@ networking/`serve` fields, the `exec` / `upload` fields, and the service layout;
 [`development.md`](development.md) for building and testing in Docker;
 [`troubleshooting.md`](troubleshooting.md) for common `serve`, `service`, `execute_command`, and
 `upload_file` problems.
-</content>
