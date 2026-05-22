@@ -25,12 +25,28 @@ import (
 	"time"
 
 	clog "github.com/charmbracelet/log"
+	"github.com/vladimirvkhs/raxd/internal/cmdexec"
 	"github.com/vladimirvkhs/raxd/internal/config"
 	"github.com/vladimirvkhs/raxd/internal/keystore"
 	internalmcp "github.com/vladimirvkhs/raxd/internal/mcp"
 	"github.com/vladimirvkhs/raxd/internal/server"
 	"github.com/vladimirvkhs/raxd/internal/version"
 )
+
+// defaultExecCfg возвращает безопасный ExecConfig для тестов.
+func defaultExecCfg() cmdexec.Config {
+	return cmdexec.Config{
+		Allowlist:        nil,
+		DefaultTimeoutMs: 30000,
+		MaxTimeoutMs:     300000,
+		DefaultCwd:       "/tmp",
+		EnvWhitelist:     []string{"PATH", "HOME", "LANG", "TERM"},
+		MaxArgs:          256,
+		MaxArgLen:        131072,
+		MaxOutputBytes:   1048576,
+		DenyRoot:         false,
+	}
+}
 
 // ---- helpers ----------------------------------------------------------------
 
@@ -105,7 +121,7 @@ func startMCPServer(t *testing.T) (baseURL string, keyStr string, client *http.C
 	logger := newTestLogger(auditBuf)
 
 	auditFn := server.NewAuditFnForTest(logger)
-	mcpH, err := internalmcp.NewHandler(version.Version, auditFn)
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg())
 	if err != nil {
 		t.Fatalf("mcp.NewHandler: %v", err)
 	}
@@ -389,10 +405,11 @@ func TestMCPToolsList(t *testing.T) {
 	if !names["server_info"] {
 		t.Errorf("AC4: tools/list must include server_info; names=%v; body=%s", names, body)
 	}
-	// AC13: must NOT include execute_command or upload_file.
-	if names["execute_command"] {
-		t.Errorf("AC13: tools/list must NOT include execute_command")
+	// command-exec task: execute_command MUST now be present (AC1/SR-40).
+	if !names["execute_command"] {
+		t.Errorf("AC1/command-exec: tools/list must include execute_command; names=%v; body=%s", names, body)
 	}
+	// upload_file still NOT in scope.
 	if names["upload_file"] {
 		t.Errorf("AC13: tools/list must NOT include upload_file")
 	}
@@ -559,9 +576,9 @@ func TestMCPUnknownToolReturnsError(t *testing.T) {
 	}), nil)
 	readBody(t, initResp)
 
-	// Call an unknown tool.
+	// Call an unknown tool (not execute_command which is now registered).
 	callBody := jsonrpcBody(5, "tools/call", map[string]interface{}{
-		"name":      "execute_command",
+		"name":      "upload_file",
 		"arguments": map[string]interface{}{},
 	})
 	resp := postMCP(t, client, baseURL, keyStr, callBody, map[string]string{
@@ -861,7 +878,7 @@ func TestMCPAuditNonMCPNoToolField(t *testing.T) {
 	auditBuf := &bytes.Buffer{}
 	logger := newTestLogger(auditBuf)
 	auditFn := server.NewAuditFnForTest(logger)
-	mcpH, err := internalmcp.NewHandler(version.Version, auditFn)
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg())
 	if err != nil {
 		t.Fatalf("mcp.NewHandler: %v", err)
 	}
@@ -1012,7 +1029,7 @@ func TestMCPPackageDoesNotImportKeystore(t *testing.T) {
 
 // TestNewHandlerReturnsHTTPHandler verifies that NewHandler returns a non-nil http.Handler.
 func TestNewHandlerReturnsHTTPHandler(t *testing.T) {
-	h, err := internalmcp.NewHandler("1.0.0", func(server.AuditRecord) {})
+	h, err := internalmcp.NewHandler("1.0.0", func(server.AuditRecord) {}, defaultExecCfg())
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1024,7 +1041,7 @@ func TestNewHandlerReturnsHTTPHandler(t *testing.T) {
 // TestNewHandlerInitializeViaHTTPTest drives initialize via httptest.Server.
 // This does NOT require TLS and validates the pure MCP logic.
 func TestNewHandlerInitializeViaHTTPTest(t *testing.T) {
-	h, err := internalmcp.NewHandler("1.0.0", func(server.AuditRecord) {})
+	h, err := internalmcp.NewHandler("1.0.0", func(server.AuditRecord) {}, defaultExecCfg())
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1067,7 +1084,7 @@ func TestNewHandlerInitializeViaHTTPTest(t *testing.T) {
 
 // TestNewHandlerPingViaHTTPTest drives ping via httptest (no TLS/auth).
 func TestNewHandlerPingViaHTTPTest(t *testing.T) {
-	h, err := internalmcp.NewHandler("1.0.0", func(server.AuditRecord) {})
+	h, err := internalmcp.NewHandler("1.0.0", func(server.AuditRecord) {}, defaultExecCfg())
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1120,7 +1137,7 @@ func TestNewHandlerPingViaHTTPTest(t *testing.T) {
 
 // TestNewHandlerServerInfoViaHTTPTest drives server_info via httptest.
 func TestNewHandlerServerInfoViaHTTPTest(t *testing.T) {
-	h, err := internalmcp.NewHandler("1.0.0", func(server.AuditRecord) {})
+	h, err := internalmcp.NewHandler("1.0.0", func(server.AuditRecord) {}, defaultExecCfg())
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1172,7 +1189,7 @@ func TestNewHandlerServerInfoViaHTTPTest(t *testing.T) {
 
 // TestNewHandlerGetReturns405 verifies GET /mcp returns 405.
 func TestNewHandlerGetReturns405(t *testing.T) {
-	h, err := internalmcp.NewHandler("1.0.0", func(server.AuditRecord) {})
+	h, err := internalmcp.NewHandler("1.0.0", func(server.AuditRecord) {}, defaultExecCfg())
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
@@ -1199,7 +1216,7 @@ func TestNewHandlerAuditContainsToolAndFP(t *testing.T) {
 	logger := newTestLogger(&auditBuf)
 	auditFn := server.NewAuditFnForTest(logger)
 
-	h, err := internalmcp.NewHandler("1.0.0", auditFn)
+	h, err := internalmcp.NewHandler("1.0.0", auditFn, defaultExecCfg())
 	if err != nil {
 		t.Fatalf("NewHandler: %v", err)
 	}
