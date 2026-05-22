@@ -29,9 +29,26 @@ CMD       := ./cmd/raxd
 SYSTEMD_IMAGE := raxd-systemd-test
 SYSTEMD_CTR   := raxd-svc-test
 
+# Docker image name for install-flow tests (AC12, Dockerfile.install).
+INSTALL_TEST_IMAGE := raxd-install-test
+
 # Detect native arch for verify-cross (nativee binary to run).
 NATIVE_GOOS   := linux
 NATIVE_GOARCH := $(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+
+# Release version: from git tag or override.
+# Usage: make release VERSION=v0.1.0
+VERSION ?= $(shell git describe --tags --always 2>/dev/null || echo "dev")
+
+# ldflags with version metadata (AC10, SR-110).
+# Целевые переменные — в cmd/raxd/main.go (package main).
+# Для package main ldflags путь = "main.<var>" (не полный import path).
+VERSION_COMMIT := $(shell git rev-parse --short HEAD 2>/dev/null || echo "none")
+VERSION_DATE   := $(shell date -u +%Y-%m-%d 2>/dev/null || echo "unknown")
+VERSION_LDFLAGS := -ldflags="-s -w \
+	-X main.buildVersion=$(VERSION) \
+	-X main.buildCommit=$(VERSION_COMMIT) \
+	-X main.buildDate=$(VERSION_DATE)"
 
 # ── Phony targets ────────────────────────────────────────────────────────────
 
@@ -40,6 +57,8 @@ NATIVE_GOARCH := $(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
         build-darwin-amd64 build-darwin-arm64 \
         verify-cross \
         docker-systemd test-service test-unit \
+        release checksums release-all \
+        test-install ci-local \
         clean
 
 all: build-all
@@ -54,7 +73,7 @@ build-all: build-linux-amd64 build-linux-arm64 build-darwin-amd64 build-darwin-a
 ## build-linux-amd64: linux/amd64
 build-linux-amd64: $(DIST_DIR)
 	$(CGO_OFF) GOOS=linux GOARCH=amd64 $(GO) build \
-		$(GOFLAGS) $(LDFLAGS) \
+		$(GOFLAGS) $(VERSION_LDFLAGS) \
 		-o $(DIST_DIR)/raxd_linux_amd64 \
 		$(CMD)
 	@echo "OK: $(DIST_DIR)/raxd_linux_amd64"
@@ -62,7 +81,7 @@ build-linux-amd64: $(DIST_DIR)
 ## build-linux-arm64: linux/arm64
 build-linux-arm64: $(DIST_DIR)
 	$(CGO_OFF) GOOS=linux GOARCH=arm64 $(GO) build \
-		$(GOFLAGS) $(LDFLAGS) \
+		$(GOFLAGS) $(VERSION_LDFLAGS) \
 		-o $(DIST_DIR)/raxd_linux_arm64 \
 		$(CMD)
 	@echo "OK: $(DIST_DIR)/raxd_linux_arm64"
@@ -70,7 +89,7 @@ build-linux-arm64: $(DIST_DIR)
 ## build-darwin-amd64: darwin/amd64
 build-darwin-amd64: $(DIST_DIR)
 	$(CGO_OFF) GOOS=darwin GOARCH=amd64 $(GO) build \
-		$(GOFLAGS) $(LDFLAGS) \
+		$(GOFLAGS) $(VERSION_LDFLAGS) \
 		-o $(DIST_DIR)/raxd_darwin_amd64 \
 		$(CMD)
 	@echo "OK: $(DIST_DIR)/raxd_darwin_amd64"
@@ -78,7 +97,7 @@ build-darwin-amd64: $(DIST_DIR)
 ## build-darwin-arm64: darwin/arm64 (Apple Silicon)
 build-darwin-arm64: $(DIST_DIR)
 	$(CGO_OFF) GOOS=darwin GOARCH=arm64 $(GO) build \
-		$(GOFLAGS) $(LDFLAGS) \
+		$(GOFLAGS) $(VERSION_LDFLAGS) \
 		-o $(DIST_DIR)/raxd_darwin_arm64 \
 		$(CMD)
 	@echo "OK: $(DIST_DIR)/raxd_darwin_arm64"
@@ -163,6 +182,81 @@ stop-service-test:
 	docker stop $(SYSTEMD_CTR) 2>/dev/null || true
 	docker rm $(SYSTEMD_CTR) 2>/dev/null || true
 	@echo "OK: $(SYSTEMD_CTR) stopped and removed"
+
+# ── Release: архивы + SHA256SUMS (AC8/AC10/AC15/AC16, ADR-001) ───────────────
+#
+# Таргеты release/checksums/release-all вызывают scripts/release.sh.
+# Единственный источник имён артефактов: scripts/release.sh (SR-101).
+# Версия: VERSION (из git describe или override, AC10, SR-110).
+#
+# Использование:
+#   make release-all VERSION=v0.1.0
+
+## release: собрать 4 архива tar.gz в dist/ (требует build-all)
+release: build-all
+	@echo "=== release: VERSION=$(VERSION) ==="
+	VERSION=$(VERSION) DIST_DIR=$(DIST_DIR) bash scripts/release.sh
+
+## checksums: сгенерировать SHA256SUMS из существующих архивов (без пересборки)
+checksums:
+	@echo "=== checksums: VERSION=$(VERSION) ==="
+	VERSION=$(VERSION) DIST_DIR=$(DIST_DIR) bash scripts/release.sh --checksums-only
+
+## release-all: release + checksums (полный релизный цикл)
+release-all: release
+	@echo "=== release-all: ГОТОВО ==="
+	@echo "    артефакты: $(DIST_DIR)/raxd_$(VERSION)_*.tar.gz"
+	@echo "    контрольные суммы: $(DIST_DIR)/SHA256SUMS"
+
+# ── test-install: AC12 install-flow в чистом Docker-контейнере ───────────────
+#
+# SECURITY-BASELINE §6: test-install гоняется в чистом debian-контейнере.
+# docker-guard /.dockerenv защищает от случайного запуска на хосте.
+# ADR-002: мок-HTTP python3 -m http.server --bind 127.0.0.1 (SR-113).
+#
+# Предусловие: make release-all VERSION=<v> должен быть выполнен.
+
+## test-install: прогнать install-flow в чистом контейнере (AC12, baseline §6)
+test-install: release-all
+	@echo "=== test-install: сборка образа $(INSTALL_TEST_IMAGE)... ==="
+	docker build -f Dockerfile.install -t $(INSTALL_TEST_IMAGE) \
+		--build-arg VERSION=$(VERSION) .
+	@echo "=== test-install: запуск в контейнере... ==="
+	docker run --rm \
+		-e VERSION=$(VERSION) \
+		-e PORT=8000 \
+		$(INSTALL_TEST_IMAGE)
+	@echo "=== test-install: ПРОШЁЛ ==="
+
+# ── ci-local: полный локальный CI в Docker (AC14, baseline §6) ───────────────
+#
+# docker-guard: ci-local и входящие в него таргеты (verify-cross, test-install)
+# содержат собственный guard /.dockerenv. Ci-local запускает их через docker run.
+#
+# Порядок: go vet + unit-тесты → build-all (4 цели) → release-all → test-install.
+
+## ci-local: локальный CI-гейт (go vet+test + build-all + test-install) в Docker
+ci-local:
+	@echo "=== ci-local: сборка образа для unit-тестов... ==="
+	docker build --target test -t raxd-test .
+	@echo "=== ci-local: go vet + unit-тесты... ==="
+	docker run --rm raxd-test
+	@echo "=== ci-local: сборка образа для кросс-компиляции... ==="
+	docker build --target build -t raxd-build .
+	@echo "=== ci-local: build-all (4 цели) + release-all... ==="
+	docker run --rm \
+		-v "$(PWD)/dist:/src/dist" \
+		-e VERSION=$(VERSION) \
+		-w /src \
+		raxd-build \
+		sh -c "make build-all release-all VERSION=$(VERSION)"
+	@echo "=== ci-local: test-install... ==="
+	$(MAKE) test-install VERSION=$(VERSION)
+	@echo ""
+	@echo "=== ci-local: ВСЕ ПРОВЕРКИ ПРОШЛИ ==="
+	@echo "    VERSION=$(VERSION)"
+	@echo "    Артефакты: dist/raxd_$(VERSION)_*.tar.gz"
+	@echo "    SHA256SUMS: dist/SHA256SUMS"
 
 # ── Cleanup ──────────────────────────────────────────────────────────────────
 
