@@ -12,6 +12,7 @@ import (
 
 	clog "github.com/charmbracelet/log"
 	"github.com/spf13/cobra"
+	"github.com/vladimirvkhs/raxd/internal/cmdexec"
 	"github.com/vladimirvkhs/raxd/internal/config"
 	"github.com/vladimirvkhs/raxd/internal/keystore"
 	internalmcp "github.com/vladimirvkhs/raxd/internal/mcp"
@@ -76,15 +77,31 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	// Build audit logger (charmbracelet/log, structured key=value to stderr).
+	// Build audit logger (charmbracelet/log, strict logfmt to stderr).
+	// F-1/SR-60: LogfmtFormatter обеспечивает строгий парсимый key=value формат.
 	// SR-21: logger must not be used to log key bodies or Authorization headers.
 	logger := clog.New(stderr)
 	logger.SetTimeFormat("2006-01-02T15:04:05Z")
+	logger.SetFormatter(clog.LogfmtFormatter) // F-1/SR-60: строгий logfmt (не human-readable TextFormatter)
+
+	// Собираем cmdexec.Config из cfg.Exec (SR-66/plan §Contracts).
+	execCfg := cmdexec.Config{
+		Allowlist:        cfg.Exec.Allowlist,
+		DefaultTimeoutMs: cfg.Exec.DefaultTimeoutMs,
+		MaxTimeoutMs:     cfg.Exec.MaxTimeoutMs,
+		DefaultCwd:       cfg.Exec.DefaultCwd,
+		EnvWhitelist:     cfg.Exec.EnvWhitelist,
+		MaxArgs:          cfg.Exec.MaxArgs,
+		MaxArgLen:        cfg.Exec.MaxArgLen,
+		MaxOutputBytes:   cfg.Exec.MaxOutputBytes,
+		DenyRoot:         cfg.Exec.DenyRoot,
+	}
 
 	// Build MCP handler (AC11/SR-29): same port/TLS as serve; no second auth channel (SR-28).
 	// auditFn for MCP uses the same logger channel as transport audit.
+	// ADR-004: execHandler manages its own exec-audit; not wrapped with withAudit.
 	auditFn := server.NewAuditFn(logger)
-	mcpH, err := internalmcp.NewHandler(version.Version, auditFn)
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, execCfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: failed to build MCP handler: %s\n", err)
 		return err
