@@ -122,4 +122,28 @@ docs (installation.md/troubleshooting.md) синхронизированы с а
 D-1 (host-build, §6), D-2 (3 фальш-/ложно-зелёных ассерта qa), D-3 (язык вывода install.sh —
 консистентность интерфейса). Фальш-зелёных не осталось.
 
-<!-- Раздел «Живая end-to-end Docker-проверка install-flow» дописывается дирижёром перед merge. -->
+## 6. Живая end-to-end Docker-проверка merge-кандидата (перед merge)
+
+Финальный чистый прогон дирижёра на КОММИТНОМ tip ветки (commit `908ed02`, после всех фиксов
+D-1/D-2/D-3 и коммитов спек/докой):
+
+```
+$ rm -rf dist && make ci-local VERSION=v0.1.0-test
+=== ci-local: ВСЕ ПРОВЕРКИ ПРОШЛИ ===   (0 FAIL)
+```
+
+Живой install-flow в чистом `debian:stable-slim` (мок-HTTP 127.0.0.1), английский вывод:
+```
+==> detected platform: linux/arm64
+==> downloading raxd_v0.1.0-test_linux_arm64.tar.gz...
+==> downloading SHA256SUMS...
+==> verifying SHA256 integrity...
+==> SHA256 verified — archive is intact
+==> installing to /tmp/raxd-test-install/raxd...
+==> raxd installed successfully (v0.1.0-test)
+raxd v0.1.0-test (commit 908ed02, built 2026-05-22)
+```
+Негативный кейс целостности (реальный): подмена архива → `install.sh` код **3**, бинарь НЕ установлен.
+§6: после хостового `make test-install` — НИ ОДНОГО `go build` на хосте (D-1 чист).
+
+**Вывод:** merge-кандидат `908ed02` зелёный end-to-end в Docker. Готово к `git merge --no-ff` в develop.
