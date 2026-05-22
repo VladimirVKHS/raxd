@@ -4,7 +4,8 @@ package fileupload
 //
 // POLICY (ADR-003/SR-73):
 //   - Допустимы ТОЛЬКО биты прав в маске 0777 (rwx user/group/other).
-//   - Setuid (04000), setgid (02000), sticky (01000) — ЗАПРЕЩЕНЫ → ErrBadMode.
+//   - ЛЮБОЙ бит вне 0777 запрещён: setuid (04000), setgid (02000), sticky (01000)
+//     и любые старшие биты (напр. 010000) → ErrBadMode.
 //   - World-writable (0002) — ЗАПРЕЩЁН → ErrBadMode.
 //   - Непарсимые строки → ErrBadMode.
 //
@@ -45,11 +46,10 @@ func ParseMode(s string) (fs.FileMode, error) {
 
 	mode := fs.FileMode(val)
 
-	// ADR-003 §2: маска — только 0777.
-	// Биты вне 0777 (setuid 04000, setgid 02000, sticky 01000) → ErrBadMode.
-	const specialBits = fs.FileMode(0o7000) // setuid | setgid | sticky
-	if mode&specialBits != 0 {
-		return 0, fmt.Errorf("%w: mode %s contains forbidden special bits (setuid/setgid/sticky)", ErrBadMode, s)
+	// ADR-003 §2: допустимы только биты прав в маске 0777; любой бит вне 0777 запрещён
+	// (включает setuid 04000, setgid 02000, sticky 01000 и любые старшие биты, напр. 010000).
+	if mode&^fs.FileMode(0o777) != 0 {
+		return 0, fmt.Errorf("%w: mode %s contains forbidden bits outside 0777 (setuid/setgid/sticky/etc)", ErrBadMode, s)
 	}
 
 	// ADR-003 §3: world-writable (0002) → ErrBadMode.

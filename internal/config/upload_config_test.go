@@ -210,6 +210,32 @@ func TestUploadDefaultModeWorldWritable0777IsError(t *testing.T) {
 	t.Logf("ADR-003: OK — default_mode=0777 → ошибка: %v", err)
 }
 
+// TestUploadDefaultModeBitsOutside0777IsError: default_mode с битами вне 0777 → ошибка (ADR-003 §2, F-1).
+// До исправления F-1 значение "010000" ложно проходило валидацию конфига.
+func TestUploadDefaultModeBitsOutside0777IsError(t *testing.T) {
+	cases := []string{"010000", "017777"}
+	for _, mode := range cases {
+		mode := mode
+		t.Run(mode, func(t *testing.T) {
+			base := t.TempDir()
+			cfgFile := filepath.Join(base, "config.yaml")
+			yaml := "upload:\n  default_mode: \"" + mode + "\"\n"
+			if err := os.WriteFile(cfgFile, []byte(yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			p := config.PathSet{ConfigDir: base, ConfigFile: cfgFile}
+			_, err := config.Load(p)
+			if err == nil {
+				t.Fatalf("Load() с default_mode=%s (биты вне 0777) должна возвращать ошибку", mode)
+			}
+			if !strings.Contains(err.Error(), "default_mode") {
+				t.Errorf("сообщение об ошибке должно упоминать default_mode; got: %v", err)
+			}
+			t.Logf("ADR-003 F-1: OK — default_mode=%s → ошибка: %v", mode, err)
+		})
+	}
+}
+
 // TestUploadDefaultModeValidIsOK: допустимые дефолтные моды без ошибок (ADR-003).
 func TestUploadDefaultModeValidIsOK(t *testing.T) {
 	cases := []string{"0600", "0700", "0644", "0400", "0640"}

@@ -268,7 +268,7 @@ func buildConfig(v *viper.Viper) (*Config, error) {
 
 // parseModeStr парсит восьмеричную строку и применяет mode-политику ADR-003.
 // Дублирует логику fileupload.ParseMode, чтобы избежать циклической зависимости.
-// SECURITY (SR-73/ADR-003): запрет setuid/setgid/sticky/world-writable.
+// SECURITY (SR-73/ADR-003): запрет любых битов вне 0777 и world-writable.
 func parseModeStr(s string) (fs.FileMode, error) {
 	if s == "" {
 		return 0, fmt.Errorf("empty mode string")
@@ -278,9 +278,10 @@ func parseModeStr(s string) (fs.FileMode, error) {
 		return 0, fmt.Errorf("cannot parse %q as octal mode", s)
 	}
 	mode := fs.FileMode(val)
-	const specialBits = fs.FileMode(0o7000)
-	if mode&specialBits != 0 {
-		return 0, fmt.Errorf("mode %s contains forbidden special bits (setuid/setgid/sticky)", s)
+	// ADR-003 §2: допустимы только биты прав в маске 0777; любой бит вне 0777 запрещён
+	// (включает setuid 04000, setgid 02000, sticky 01000 и любые старшие биты, напр. 010000).
+	if mode&^fs.FileMode(0o777) != 0 {
+		return 0, fmt.Errorf("mode %s contains forbidden bits outside 0777 (setuid/setgid/sticky/etc)", s)
 	}
 	const worldWritable = fs.FileMode(0o002)
 	if mode&worldWritable != 0 {
