@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vladimirvkhs/raxd/internal/fileupload"
 	internalmcp "github.com/vladimirvkhs/raxd/internal/mcp"
@@ -729,36 +730,290 @@ func TestUploadFile_ExactlyOneAuditRecord(t *testing.T) {
 
 // ─── SR-79: logfmt-инъекция через путь ───────────────────────────────────────
 
-// TestUploadFile_PathLogfmtInjection: путь со спецсимволами квотируется (SR-79).
+// TestUploadFile_PathLogfmtInjection: путь со спецсимволами квотируется logfmt'ом (SR-79).
+//
+// Три вектора:
+//  1. Путь с пробелом и '=' (классическая logfmt-инъекция):
+//     ожидаем path="..." (квотированное) в success-строке.
+//  2. Путь с кавычкой '"' — charmbracelet/log экранирует её внутри кавычек.
+//  3. Путь с переводом строки '\n' — charmbracelet/log рендерит multiline-блок
+//     с │ prefix; инъекция result=injected не должна появляться как самостоятельная пара key=value.
+//
+// Примечание о Docker (euid==0): uploadHandler записывает WARN + основную запись,
+// т.е. при euid==0 будет 2+ строк с tool=upload_file. Тесты учитывают это.
+//
+// Тест РЕАЛЬНО падает при поломке: убери кавычки из path= в writeAudit —
+// вектор 1 не найдёт путь целиком ("with space=eq.txt") в success-строке.
 func TestUploadFile_PathLogfmtInjection(t *testing.T) {
-	cfg := defaultUplCfg(t)
-	ts, auditBuf := newUploadTestServer(t, cfg)
+	// --- Вектор 1: пробел и '=' в пути ---
+	t.Run("space_and_equals", func(t *testing.T) {
+		cfg := defaultUplCfg(t)
+		ts, auditBuf := newUploadTestServer(t, cfg)
 
-	// Путь с символом = и пробелом (logfmt-инъекция).
-	maliciousPath := "file with spaces and=signs.txt"
-	data := []byte("content")
-	auditBuf.Reset()
+		// Путь содержит пробел и '=' — при логировании charmbracelet/log обязан квотировать.
+		injectPath := "subdir/file with space=eq.txt"
+		auditBuf.Reset()
 
-	// Этот вызов может упасть с traversal или succeed — в любом случае проверяем аудит.
-	callUploadFile(t, ts, map[string]interface{}{
-		"path":    maliciousPath,
-		"content": b64(data),
-	})
+		body, _ := callUploadFile(t, ts, map[string]interface{}{
+			"path":    injectPath,
+			"content": b64([]byte("hello")),
+		})
+		_ = body
 
-	log := auditBuf.String()
-	// Проверяем, что лог не содержит несплавленных key=value пар (хотя бы нет \n внутри пути).
-	for _, line := range strings.Split(log, "\n") {
-		if line == "" {
-			continue
-		}
-		if strings.Contains(line, "tool=upload_file") {
-			// Путь должен быть квотирован (содержать кавычки вокруг значения со спецсимволами).
-			// Если путь = "file with spaces..." то в logfmt он будет path="file with spaces..."
-			// Проверяем что сырой пробел вне кавычек не ломает строку.
-			// Достаточно проверить что строка содержит tool=upload_file как полное поле.
-			if !strings.Contains(line, "tool=upload_file") {
-				t.Errorf("SR-79: logfmt line broken by path injection; line=%q", line)
+		logStr := auditBuf.String()
+
+		// Собираем все строки с tool=upload_file.
+		var uploadLines []string
+		for _, line := range strings.Split(logStr, "\n") {
+			if strings.Contains(line, "tool=upload_file") {
+				uploadLines = append(uploadLines, line)
 			}
 		}
-	}
+		if len(uploadLines) == 0 {
+			t.Fatalf("SR-79 вектор 1: нет строки с tool=upload_file в аудите; log=%q", logStr)
+		}
+
+		// Ищем строку success (INFO/result=ok) — именно в ней должен быть path.
+		// При euid==0 есть и WARN-строка, поэтому ищем по result=ok.
+		var successLine string
+		for _, line := range uploadLines {
+			if strings.Contains(line, "result=ok") {
+				successLine = line
+				break
+			}
+		}
+		if successLine == "" {
+			t.Fatalf("SR-79 вектор 1: нет success-строки (result=ok) с tool=upload_file; lines=%v", uploadLines)
+		}
+
+		// Путь должен присутствовать квотированным в success-строке.
+		// charmbracelet/log квотирует значения содержащие пробел/=: path="subdir/file with space=eq.txt"
+		// Если квотирование сломано: path=subdir/file → пробел разрывает → "with" "space=eq.txt" отдельные поля.
+		// Проверяем, что ВЕСЬ путь (включая "with space=eq.txt") присутствует в строке.
+		if !strings.Contains(successLine, "with space=eq.txt") {
+			t.Errorf("SR-79 вектор 1: путь не найден целиком в success audit-строке — квотирование сломано; line=%q", successLine)
+		}
+
+		// path должен быть представлен как path="..." (с кавычками из-за пробела).
+		if !strings.Contains(successLine, `path="`) {
+			t.Errorf("SR-79 вектор 1: path= не квотирован (ожидалось path=\"...\"); line=%q", successLine)
+		}
+
+		// Не должно быть поддельной пары result=injected в success-строке.
+		if strings.Contains(successLine, "result=injected") {
+			t.Errorf("SR-79 вектор 1: инъекция result=injected в success audit-строке; line=%q", successLine)
+		}
+	})
+
+	// --- Вектор 2: кавычка в пути ---
+	t.Run("quote_in_path", func(t *testing.T) {
+		cfg := defaultUplCfg(t)
+		ts, auditBuf := newUploadTestServer(t, cfg)
+
+		// Путь содержит кавычку — charmbracelet/log экранирует её.
+		injectPath := `a"b.txt`
+		auditBuf.Reset()
+
+		callUploadFile(t, ts, map[string]interface{}{
+			"path":    injectPath,
+			"content": b64([]byte("x")),
+		})
+
+		logStr := auditBuf.String()
+		// Ищем успешную загрузку или deny-запись (если OS отвергла имя).
+		var found bool
+		for _, line := range strings.Split(logStr, "\n") {
+			if strings.Contains(line, "tool=upload_file") {
+				found = true
+				// В корректном logfmt кавычка внутри значения экранирована (\"); строка не обрывается.
+				// Если сломано — за `"` лог-парсер интерпретирует остаток как новое поле.
+				// Не должно быть оборванной пары b.txt= без кавычек:
+				if strings.Contains(line, " b.txt ") || strings.Contains(line, " b.txt=") {
+					t.Errorf("SR-79 вектор 2: кавычка в пути не экранирована → line=%q", line)
+				}
+			}
+		}
+		if !found {
+			t.Logf("SR-79 вектор 2: путь с кавычкой отвергнут до логирования (OK); log=%q", logStr)
+		}
+	})
+
+	// --- Вектор 3: перевод строки в пути ---
+	t.Run("newline_in_path", func(t *testing.T) {
+		cfg := defaultUplCfg(t)
+		ts, auditBuf := newUploadTestServer(t, cfg)
+
+		// Путь с '\n' — filepath.IsLocal пропускает его, os.Root может создать.
+		// charmbracelet/log рендерит multiline значения как блок с │ prefix.
+		// Инъекция: если path="file\nresult=injected.txt" разбьёт лог,
+		// то в ответе/аудите появится самостоятельная строка "result=injected.txt=..."
+		// (НЕ как часть блока │). Мы проверяем именно это.
+		injectPath := "file\nresult=injected.txt"
+		auditBuf.Reset()
+
+		callUploadFile(t, ts, map[string]interface{}{
+			"path":    injectPath,
+			"content": b64([]byte("x")),
+		})
+
+		logStr := auditBuf.String()
+
+		// Ключевая проверка: "result=injected" НЕ должно появляться как начало строки
+		// (не как часть multiline-блока с │ prefix).
+		// charmbracelet/log форматирует multiline-значения как:
+		//   path=
+		//     │ file
+		//     │ result=injected.txt
+		// Строка "  │ result=injected.txt" — безопасна (экранирована блоком).
+		// Строка "result=injected.txt" БЕЗ "│" prefix — это инъекция.
+		for _, line := range strings.Split(logStr, "\n") {
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "result=injected") {
+				t.Errorf("SR-79 вектор 3: 'result=injected' появился как самостоятельное поле (инъекция через \\n в пути); line=%q", line)
+			}
+		}
+		// Не должно быть самостоятельной строки (без │) с result=injected.
+		// charmbracelet/log сам добавляет │ для multiline — это документированное поведение.
+		t.Logf("SR-79 вектор 3: OK — \\n в пути экранирован charmbracelet/log (multiline block); log=%q", logStr)
+	})
+}
+
+// ─── SR-77: root-detect для upload_file ──────────────────────────────────────
+
+// TestUploadRootWarnAuditRecord проверяет логику SR-77 для upload_file:
+//   - Unit-уровень: writeAudit при Result="warn" и Tool="upload_file" пишет WARN + reason + path.
+//   - При euid==0 (Docker от root): реальный MCP-вызов → WARN-запись в аудите.
+//   - При euid!=0: WARN-запись НЕ должна появляться (uploadHandler не пишет warn).
+//   - deny_root=true + euid==0 → isError:true, файл не создан, DENY в аудите.
+func TestUploadRootWarnAuditRecord(t *testing.T) {
+	// --- Unit-уровень: writeAudit обрабатывает warn для upload_file ---
+	t.Run("unit_warn_writeAudit", func(t *testing.T) {
+		auditBuf := &bytes.Buffer{}
+		logger := newTestLogger(auditBuf)
+		auditFn := server.NewAuditFnForTest(logger)
+
+		auditFn(server.AuditRecord{
+			TS:          testTime(),
+			Fingerprint: "aabbccdd1122",
+			RemoteAddr:  "127.0.0.1:9999",
+			Result:      "warn",
+			Tool:        "upload_file",
+			Reason:      "running-as-root-upload: raxd executing upload as root (euid==0); ensure raxd runs as non-root",
+			Path:        "test/file.txt",
+		})
+
+		logStr := auditBuf.String()
+		if !strings.Contains(logStr, "WARN") {
+			t.Errorf("SR-77: WARN-запись для upload_file не содержит WARN; log=%q", logStr)
+		}
+		if !strings.Contains(logStr, "tool=upload_file") {
+			t.Errorf("SR-77: WARN-запись должна содержать tool=upload_file; log=%q", logStr)
+		}
+		if !strings.Contains(logStr, "root") {
+			t.Errorf("SR-77: WARN-запись должна содержать 'root' в reason; log=%q", logStr)
+		}
+		if !strings.Contains(logStr, "fp=") {
+			t.Errorf("SR-77: WARN-запись должна содержать fp=; log=%q", logStr)
+		}
+		t.Logf("SR-77: OK — writeAudit warn для upload_file: %q", logStr)
+	})
+
+	// --- При euid!=0: WARN не появляется (uploadHandler не пишет warn для не-root) ---
+	t.Run("no_warn_when_not_root", func(t *testing.T) {
+		if os.Geteuid() == 0 {
+			t.Skip("SR-77: этот подтест работает только при euid!=0; в Docker запускайте как non-root")
+		}
+		cfg := defaultUplCfg(t)
+		ts, auditBuf := newUploadTestServer(t, cfg)
+		auditBuf.Reset()
+
+		body, _ := callUploadFile(t, ts, map[string]interface{}{
+			"path":    "nowarn.txt",
+			"content": b64([]byte("data")),
+		})
+		res := parseUploadResult(t, body)
+		if res["isError"] == true {
+			t.Fatalf("SR-77: upload failed при non-root; body=%s", body)
+		}
+
+		logStr := auditBuf.String()
+		for _, line := range strings.Split(logStr, "\n") {
+			if strings.Contains(line, "tool=upload_file") && strings.Contains(line, "WARN") {
+				t.Errorf("SR-77: WARN-запись upload_file при euid!=0 недопустима; line=%q", line)
+			}
+		}
+		t.Logf("SR-77: OK — нет WARN при euid!=0")
+	})
+
+	// --- При euid==0 (Docker от root): реальный MCP-вызов пишет WARN ---
+	t.Run("warn_when_root", func(t *testing.T) {
+		if os.Geteuid() != 0 {
+			t.Skip("SR-77: этот подтест требует euid==0 (запускается в Docker от root)")
+		}
+		cfg := defaultUplCfg(t)
+		ts, auditBuf := newUploadTestServer(t, cfg)
+		auditBuf.Reset()
+
+		body, _ := callUploadFile(t, ts, map[string]interface{}{
+			"path":    "root-warn.txt",
+			"content": b64([]byte("warn-data")),
+		})
+		_ = body
+
+		logStr := auditBuf.String()
+		// При euid==0 uploadHandler пишет WARN-запись ДО основного аудита.
+		var warnFound bool
+		for _, line := range strings.Split(logStr, "\n") {
+			if strings.Contains(line, "tool=upload_file") && strings.Contains(line, "WARN") {
+				warnFound = true
+				if !strings.Contains(line, "root") {
+					t.Errorf("SR-77: WARN-строка не содержит 'root'; line=%q", line)
+				}
+			}
+		}
+		if !warnFound {
+			t.Errorf("SR-77: при euid==0 ожидалась WARN-запись tool=upload_file; log=%s", logStr)
+		}
+		t.Logf("SR-77: OK — WARN 'running-as-root-upload' найден в аудите при euid==0")
+	})
+
+	// --- deny_root=true + euid==0 → isError, файл не создан, DENY в аудите ---
+	t.Run("deny_root_upload", func(t *testing.T) {
+		if os.Geteuid() != 0 {
+			t.Skip("SR-77: deny_root подтест требует euid==0 (Docker от root)")
+		}
+		cfg := defaultUplCfg(t)
+		cfg.DenyRoot = true
+		ts, auditBuf := newUploadTestServer(t, cfg)
+		auditBuf.Reset()
+
+		body, _ := callUploadFile(t, ts, map[string]interface{}{
+			"path":    "should-not-exist.txt",
+			"content": b64([]byte("forbidden")),
+		})
+
+		res := parseUploadResult(t, body)
+		isErr, _ := res["isError"].(bool)
+		if !isErr {
+			t.Errorf("SR-77: deny_root=true + euid==0 → ожидается isError:true; body=%s", body)
+		}
+
+		// Файл не должен быть создан.
+		uploadRoot := cfg.UploadRoot
+		if _, err := os.Stat(filepath.Join(uploadRoot, "should-not-exist.txt")); !os.IsNotExist(err) {
+			t.Errorf("SR-77: файл создан при deny_root=true + euid==0")
+		}
+
+		// DENY должен быть в аудите.
+		logStr := auditBuf.String()
+		if !strings.Contains(logStr, "DENY") {
+			t.Errorf("SR-77: при deny_root=true+euid==0 нет DENY в аудите; log=%s", logStr)
+		}
+		t.Logf("SR-77: OK — deny_root=true + euid==0 → isError:true + DENY в аудите")
+	})
+}
+
+// testTime возвращает фиксированное время для unit-тестов аудита.
+func testTime() time.Time {
+	return time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 }
