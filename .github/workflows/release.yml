@@ -1,0 +1,144 @@
+# .github/workflows/release.yml — релизный пайплайн (AC8/AC10/AC14, ADR-004)
+#
+# SECURITY-BASELINE §6: сборка в Docker-контейнере, офлайн из vendor/.
+# Секреты: GITHUB_TOKEN — только через GitHub Secrets, не в файле (SR-110).
+#
+# Примечание ADR-004: этот файл — артефакт на будущее (remote отсутствует).
+# Локальный гейт v1: make release-all VERSION=<tag>.
+#
+# Триггер: push тега vX.Y.Z (семантическое версионирование).
+# Публикует GitHub Release с 4 архивами + SHA256SUMS.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Версия релиза (например v0.1.0)"
+        required: true
+
+env:
+  CGO_ENABLED: "0"
+
+jobs:
+  # ── Сборка и тесты (как в ci.yml) ─────────────────────────────────────────
+  build-release:
+    name: build release artifacts
+    runs-on: ubuntu-latest
+    container:
+      image: golang:1.25
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive version
+        id: version
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            VER="${{ github.event.inputs.version }}"
+          else
+            VER="${GITHUB_REF_NAME}"
+          fi
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "Building release: ${VER}"
+
+      - name: go vet + unit tests (offline)
+        run: |
+          go vet -mod=vendor ./...
+          go test -mod=vendor -v -count=1 ./...
+
+      - name: build-all (4 цели, CGO_ENABLED=0, offline)
+        run: make build-all VERSION=${{ steps.version.outputs.version }}
+
+      - name: release-all (архивы + SHA256SUMS)
+        run: make release-all VERSION=${{ steps.version.outputs.version }}
+
+      - name: Verify SHA256SUMS
+        run: |
+          cd dist
+          sha256sum -c SHA256SUMS
+          echo "SHA256SUMS verified OK"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: raxd-release-${{ steps.version.outputs.version }}
+          path: |
+            dist/raxd_*.tar.gz
+            dist/SHA256SUMS
+          retention-days: 1
+
+  # ── test-install-flow ─────────────────────────────────────────────────────
+  install-flow:
+    name: install-flow (debian clean)
+    runs-on: ubuntu-latest
+    needs: build-release
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: raxd-release-${{ needs.build-release.outputs.version }}
+          path: dist/
+
+      - name: test-install (Dockerfile.install, мок-HTTP 127.0.0.1)
+        run: make test-install VERSION=${{ needs.build-release.outputs.version }}
+
+  # ── Публикация GitHub Release ─────────────────────────────────────────────
+  # Примечание SR-110: GITHUB_TOKEN — только через env/secrets, не хардкод.
+  # Примечание П-1/ОР-1: GPG-подпись SHA256SUMS отсутствует в v1.
+  #   Целостность держится на TLS-канале (SR-99) + SHA256SUMS (SR-100).
+  #   Перед публичным релизом — добавить GPG-подпись (ОР-1).
+  publish:
+    name: publish GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-release
+      - install-flow
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: raxd-release-${{ needs.build-release.outputs.version }}
+          path: dist/
+
+      - name: Create GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ needs.build-release.outputs.version }}" \
+            dist/raxd_*.tar.gz \
+            dist/SHA256SUMS \
+            --title "raxd ${{ needs.build-release.outputs.version }}" \
+            --notes "## Установка
+
+          \`\`\`bash
+          curl -fsSL https://github.com/vladimirvkhs/raxd/releases/download/${{ needs.build-release.outputs.version }}/install.sh | bash
+          \`\`\`
+
+          ## Проверка целостности (SHA256)
+
+          \`\`\`bash
+          sha256sum -c SHA256SUMS
+          \`\`\`
+
+          ## Примечания безопасности
+
+          - GPG-подпись SHA256SUMS отсутствует в v1 (ОР-1, П-1). Целостность — TLS + SHA256SUMS.
+          - macOS: без Apple Developer ID возможен Gatekeeper-warning. install.sh снимает quarantine автоматически.
+          - Перед боевым применением: добавить GPG-подпись SHA256SUMS и нотаризацию (ОР-1/ОР-2)."
