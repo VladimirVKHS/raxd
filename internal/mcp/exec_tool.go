@@ -75,8 +75,9 @@ func execTool() *sdkmcp.Tool {
 // ADR-004/SR-57: НЕ оборачивается withAudit. Пишет exec-аудит самостоятельно во всех ветках.
 // Ветки:
 //   - success/таймаут → AuditRecord{Result:"success", ...exec-поля...}
-//   - deny (allowlist/лимиты входа/deny_root) → AuditRecord{Result:"deny", ...}
-//   - fail (несуществующий бинарь/bad cwd) → AuditRecord{Result:"fail", ...}
+//   - warn  (root-предупреждение, SR-55) → AuditRecord{Result:"warn", reason="running-as-root"}
+//   - deny  (allowlist/лимиты входа/deny_root) → AuditRecord{Result:"deny", ...}
+//   - fail  (несуществующий бинарь/bad cwd) → AuditRecord{Result:"fail", ...}
 //
 // root-WARN (SR-55) — отдельная WARN-запись при euid==0, помимо основной.
 func execHandler(cfg cmdexec.Config, audit server.AuditFn) sdkmcp.ToolHandlerFor[ExecInput, ExecOutput] {
@@ -85,23 +86,36 @@ func execHandler(cfg cmdexec.Config, audit server.AuditFn) sdkmcp.ToolHandlerFor
 		fp := server.FingerprintFromContext(ctx)
 		remote := server.RemoteAddrFromContext(ctx)
 
-		// --- Root-детекция (SR-55/AC9) ---
-		// При euid==0 — отдельная WARN-аудит-запись при КАЖДОМ вызове (обязательна всегда).
-		// Рендерится writeAudit как WARN (через Result:"deny" с root-reason — это отдельная запись).
+		// --- Root-детекция (SR-55/SR-56/AC9) ---
+		// При euid==0 ВСЕГДА эмитируется отдельная WARN-запись (Result:"warn", reason="running-as-root").
+		// Это предупреждение, семантически отличное от deny — оно информирует, что raxd запущен под root.
+		// Случай (а): deny_root=false → WARN, команда продолжается дальше.
+		// Случай (б): deny_root=true  → WARN + реальный deny (Result:"deny"), команда НЕ выполняется.
 		if os.Geteuid() == 0 {
-			// Отдельная WARN-запись (помимо основной exec-записи; mcp-spec §2.3.2).
+			// Отдельная WARN-запись (Result:"warn"; mcp-spec §2.3.2 / SR-55).
 			audit(server.AuditRecord{
 				TS:          time.Now().UTC(),
 				Fingerprint: fp,
 				RemoteAddr:  remote,
-				Result:      "deny",
+				Result:      "warn",
 				Tool:        "execute_command",
-				Reason:      "root-warn: executing commands as root (euid==0); ensure raxd runs as non-root",
+				Reason:      "running-as-root: raxd executing commands as root (euid==0); ensure raxd runs as non-root",
 				Command:     input.Command,
 				Args:        input.Args,
 			})
-			// SR-56: deny_root=true → hard-fail ПОСЛЕ root-WARN.
+			// SR-56: deny_root=true → реальный deny ПОСЛЕ root-WARN (команда не запускается).
 			if cfg.DenyRoot {
+				denyReason := "execution as root is forbidden by policy (deny_root=true)"
+				audit(server.AuditRecord{
+					TS:          time.Now().UTC(),
+					Fingerprint: fp,
+					RemoteAddr:  remote,
+					Result:      "deny",
+					Tool:        "execute_command",
+					Reason:      denyReason,
+					Command:     input.Command,
+					Args:        input.Args,
+				})
 				return nil, ExecOutput{}, fmt.Errorf("execution as root is forbidden by policy")
 			}
 		}
