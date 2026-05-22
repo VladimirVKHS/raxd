@@ -67,11 +67,12 @@ assert_file_exists() {
 }
 
 # assert_grep <pattern> <file> <description>
+# Добавляем '--' перед паттерном: защита от трактовки ведущего '-' как опции grep (дефект 2).
 assert_grep() {
     local pattern="$1"
     local file="$2"
     local desc="$3"
-    if grep -qE "${pattern}" "${file}"; then
+    if grep -qE -- "${pattern}" "${file}"; then
         pass "${desc} — паттерн найден: '${pattern}'"
     else
         fail "${desc} — паттерн НЕ найден: '${pattern}' в ${file}"
@@ -79,11 +80,12 @@ assert_grep() {
 }
 
 # assert_no_grep <pattern> <file> <description>
+# Добавляем '--' перед паттерном: защита от трактовки ведущего '-' как опции grep (дефект 2).
 assert_no_grep() {
     local pattern="$1"
     local file="$2"
     local desc="$3"
-    if ! grep -qE "${pattern}" "${file}"; then
+    if ! grep -qE -- "${pattern}" "${file}"; then
         pass "${desc} — паттерн отсутствует: '${pattern}' (как ожидалось)"
     else
         fail "${desc} — запрещённый паттерн найден: '${pattern}' в ${file}"
@@ -451,17 +453,43 @@ UNAME_SHIM_B
         "${install_script}" \
         "TEST8: нет ложного gpg --verify в install.sh (SR-105)"
 
-    # curl … | bash/sh запрещён (посторонняя загрузка+исполнение)
-    assert_no_grep \
-        'curl\s.*\|\s*(ba)?sh' \
-        "${install_script}" \
-        "TEST8: нет curl | bash/sh в install.sh (SR-103)"
+    # curl … | bash/sh запрещён в ИСПОЛНЯЕМОМ коде (посторонняя загрузка+исполнение, SR-103).
+    # Дефект 1: паттерн совпадал с легитимными строками-примерами в комментариях и heredoc --help.
+    # Решение: отфильтровываем строки-комментарии (^\s*#) и содержимое heredoc cat <<EOF...EOF
+    # (тело help-текста), затем ищем curl … | bash/sh в оставшемся исполняемом коде.
+    #
+    # Доказательство не-тавтологичности:
+    #   - На текущем install.sh: после фильтрации комментариев/heredoc паттерн НЕ найден → PASS.
+    #   - Если добавить `curl "$url" | bash` в тело main() — отфильтрованный вывод содержит строку
+    #     и паттерн совпадёт → FAIL. Тест реально ловит регрессию.
+    local curl_pipe_in_code
+    curl_pipe_in_code="$(
+        # Убираем строки-комментарии и содержимое heredoc (от cat <<EOF до EOF включительно).
+        # sed: удаляем строки, начинающиеся с необязательных пробелов + '#'.
+        # perl: вырезаем блоки cat <<WORD ... WORD (любой heredoc-маркер).
+        grep -v '^\s*#' "${install_script}" \
+            | perl -0777 -pe 's/cat\s*<<'\''?(\w+)'\''?.*?\n\1\n//gs' \
+            | grep -E -- 'curl\s+.*\|\s*(ba)?sh' \
+            || true
+    )"
+    if [[ -z "${curl_pipe_in_code}" ]]; then
+        pass "TEST8: нет curl | bash/sh в исполняемом коде install.sh (SR-103)"
+    else
+        fail "TEST8: найден curl | bash/sh в исполняемом коде install.sh (SR-103): ${curl_pipe_in_code}"
+    fi
 
-    # chmod 777 запрещён (SR-107)
+    # chmod 777 / chmod -R 777 запрещён (SR-107, нет world-writable).
+    # Дефект 3: прежний паттерн 'chmod\s+777\|chmod\s+-R\s+777' использовал \| как ЛИТЕРАЛЬНЫЙ
+    # символ '|' в ERE (не альтернацию), поэтому ассерт был тавтологичен — всегда проходил.
+    # Исправлено: ERE-альтернация без экранирования: 'chmod\s+(-R\s+)?777' покрывает оба случая.
+    #
+    # Доказательство не-тавтологичности:
+    #   - На текущем install.sh: 'chmod 777' отсутствует → grep не найдёт → PASS.
+    #   - Если добавить `chmod 777 /usr/local/bin/raxd` или `chmod -R 777 ...` → grep найдёт → FAIL.
     assert_no_grep \
-        'chmod\s+777\|chmod\s+-R\s+777' \
+        'chmod\s+(-R\s+)?777' \
         "${install_script}" \
-        "TEST8: нет chmod 777 в install.sh (SR-107)"
+        "TEST8: нет chmod 777 / chmod -R 777 в install.sh (SR-107)"
 
     # Мок-сервер в тест-скрипте должен иметь --bind 127.0.0.1 (SR-113)
     assert_grep \

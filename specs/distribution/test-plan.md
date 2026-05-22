@@ -11,8 +11,8 @@ threat-model.md, SECURITY-BASELINE.ru.md §5/§6.
 
 | Уровень | Что проверяем | Инструмент |
 |---------|---------------|------------|
-| **Статический** | Наличие обязательных конструкций в install.sh (set -euo pipefail, main, trap, xattr, отсутствие eval); согласованность имён артефактов install.sh↔release.sh↔SHA256SUMS | grep в test-install-static.sh + секция в test-install-edge.sh |
-| **Install-flow (Docker)** | Полный curl\|sh в чистом debian:stable-slim: позитив, идемпотентность, SHA256-fail, edge cases платформы, привилегии | scripts/test-install.sh (TEST 1-3) + scripts/test-install-edge.sh (TEST 4-8) в Dockerfile.install |
+| **Статический** | Наличие обязательных конструкций в install.sh (set -euo pipefail, main, trap, xattr, отсутствие eval); согласованность имён артефактов install.sh↔release.sh↔SHA256SUMS | scripts/test-install-edge.sh TEST 8 (grep-ассерты внутри контейнера) |
+| **Install-flow (Docker)** | Полный curl\|sh в чистом debian:stable-slim: позитив, идемпотентность, SHA256-fail, edge cases платформы, привилегии | scripts/test-install.sh (TEST 1-3) + scripts/test-install-edge.sh (TEST 4-9) в Dockerfile.install |
 | **Сборка/CI (Docker)** | 4 архива + SHA256SUMS; офлайн из vendor; ldflags; целостность sha256sum -c | make ci-local → make release-all в raxd-build-контейнере |
 | **Ограничение macOS** | darwin-ветка: статически grep + фиксация ОР-4 | test-install-edge.sh TEST 6 (grep) |
 
