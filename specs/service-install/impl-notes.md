@@ -154,6 +154,45 @@ ok  github.com/vladimirvkhs/raxd/internal/version
 - SR-90 анти-инъекция: `TestValidateTemplateData_UserInjection` (newline/equals), `TestRenderUnit_InjectionRejectedBeforeRender`, `TestRenderPlist_InjectionRejectedBeforeRender` — PASS
 - AC13 plist на Linux: `TestRenderPlist_Structure`, `TestRenderPlist_KeepAliveSuccessfulExitFalse` — PASS
 
+**Round 3 — BUG-1 (коммиты 827d736, 70ff715, ожидается Docker-верификация от дирижёра):**
+
+#### Причина бага
+
+`raxd serve` вызывает `config.EnsureDirs` → `os.MkdirAll(/etc/raxd, 0700)`. Под systemd-юнитом `ProtectSystem=strict` запрещает запись в `/etc` для непривилегированного пользователя `raxd`. До фикса `/etc/raxd` не существовал (systemd его не создавал) — `MkdirAll` пытался создать каталог и падал с `permission denied` → crash-loop → `MainPID=0` → euid не поймать. С предсозданным `/etc/raxd owned raxd` `MkdirAll` на существующем каталоге — no-op → `serve` стартует корректно.
+
+Второй аспект (macOS): `DefaultConfig` возвращал `ConfigDir="/etc"` (XDG-родитель, не raxd-каталог), а plist хардкодил linux-пути `/etc` и `/var/lib` — на macOS эти пути под SIP / не существуют.
+
+#### Что изменено
+
+**Коммит 827d736 (Linux systemd):**
+- `internal/service/templates.go` — unit-шаблон дополнен директивами `ConfigurationDirectory=raxd` и `ConfigurationDirectoryMode=0700` (рядом со `StateDirectory`). systemd создаёт `/etc/raxd` owned raxd ДО `ExecStart` → `EnsureDirs` становится no-op (SR-89, AC2).
+
+**Коммит 70ff715 (macOS launchd + консистентность):**
+- `internal/service/service.go` — `DefaultConfig()` заменён на `DefaultConfigForGOOS(goos string)` (экспортирован для AC13-тестов). Linux: `ConfigDir=/etc/raxd`, `StateDir=/var/lib/raxd`, `LogPath=/var/log/raxd`. Darwin: `ConfigDir=/usr/local/etc/raxd`, `StateDir=/usr/local/var/raxd`, `LogPath=/usr/local/var/log/raxd`. `ConfigDir` — полный raxd-каталог (не XDG-родитель).
+- `internal/service/templates.go` — `TemplateData` получил поля `ConfigHome` и `StateHome` (`filepath.Dir` от полных путей). `TemplateDataFromConfig` вычисляет их автоматически. `ValidateTemplateData` проверяет оба поля. Plist-шаблон: хардкод `/etc`/`/var/lib` заменён на `{{.ConfigHome}}`/`{{.StateHome}}` — darwin plist получает `/usr/local/etc` и `/usr/local/var`.
+- `internal/service/launchd.go` — `createDirs()` создаёт `ConfigDir` (теперь `/usr/local/etc/raxd`), `StateDir`, `LogPath` — все 0700 + chown raxd:raxd (SR-89, SR-91).
+
+**Инвариант E (проверен тестом):** `filepath.Join(ConfigHome, "raxd") == ConfigDir` для обеих платформ; конкретные значения: linux ConfigHome=`/etc`, darwin ConfigHome=`/usr/local/etc`.
+
+#### Новые тесты (AC13 — все запускаются на Linux в Docker)
+
+| Тест | AC/SR |
+|------|-------|
+| `TestRenderUnit_DefaultPort` + `TestRenderUnit_PrivilegedPort` (дополнены) | `ConfigurationDirectory=raxd` + `ConfigurationDirectoryMode=0700` в обоих вариантах (SR-89, AC2) |
+| `TestPlist_DarwinXDGPaths` | darwin plist: XDG_CONFIG_HOME=`/usr/local/etc`, XDG_STATE_HOME=`/usr/local/var` (AC13, SR-89) |
+| `TestDefaultConfigForGOOS_Paths` | linux/darwin пути точно верны (AC2, регресс) |
+| `TestTemplateDataFromConfig_InvariantE` | инвариант E + конкретные ConfigHome/StateHome для linux и darwin (AC2, SR-89) |
+| `TestPlist_LinuxXDGPathsRegress` | linux plist по-прежнему `/etc` / `/var/lib` (AC13, регресс) |
+
+#### Docker unit + QA systemd-интеграция
+
+Unit-тесты Docker: ожидается Round 3 верификация от дирижёра (локально `go test ./... -count=1` — 12 пакетов PASS, 0 FAIL).
+
+QA systemd-интеграция (подтверждено дирижёром, 62 PASS / 0 FAIL):
+- LIVE euid=999 (AC6: демон работает под непривилегированным пользователем raxd)
+- Рестарт: PID 179→245 (AC4: перезапуск при сбое)
+- AC8 journald: 5.0M ≤ 10M (лимит journald drop-in SR-94 работает корректно)
+
 ## Безопасность
 
 ### Анти-инъекция в шаблоны (SR-90)

@@ -450,22 +450,44 @@ func TestDefaultConfigForGOOS_Paths(t *testing.T) {
 //
 //	filepath.Join(ConfigHome, "raxd") == ConfigDir
 //	filepath.Join(StateHome,  "raxd") == StateDir
+//
+// Additionally asserts the CONCRETE expected values per platform so that the test
+// fails if the paths change to wrong-but-consistent values (e.g. /foo/raxd would
+// still satisfy the invariant but would not be /etc/raxd or /usr/local/etc/raxd).
 func TestTemplateDataFromConfig_InvariantE(t *testing.T) {
-	for _, goos := range []string{"linux", "darwin"} {
-		cfg := service.DefaultConfigForGOOS(goos)
+	cases := []struct {
+		goos           string
+		wantConfigHome string
+		wantStateHome  string
+	}{
+		{goos: "linux", wantConfigHome: "/etc", wantStateHome: "/var/lib"},
+		{goos: "darwin", wantConfigHome: "/usr/local/etc", wantStateHome: "/usr/local/var"},
+	}
+
+	for _, tc := range cases {
+		cfg := service.DefaultConfigForGOOS(tc.goos)
 		cfg.ExecPath = "/usr/local/bin/raxd"
 		td := service.TemplateDataFromConfig(cfg)
 
+		// Invariant E: XDG parent + "/raxd" must equal the full ConfigDir/StateDir.
 		wantConfigDir := td.ConfigHome + "/raxd"
 		if wantConfigDir != td.ConfigDir {
 			t.Errorf("GOOS=%s invariant E violated: ConfigHome(%q)+/raxd = %q, ConfigDir = %q",
-				goos, td.ConfigHome, wantConfigDir, td.ConfigDir)
+				tc.goos, td.ConfigHome, wantConfigDir, td.ConfigDir)
 		}
-
 		wantStateDir := td.StateHome + "/raxd"
 		if wantStateDir != td.StateDir {
 			t.Errorf("GOOS=%s invariant E violated: StateHome(%q)+/raxd = %q, StateDir = %q",
-				goos, td.StateHome, wantStateDir, td.StateDir)
+				tc.goos, td.StateHome, wantStateDir, td.StateDir)
+		}
+
+		// Concrete value assertions — catch wrong-but-consistent paths
+		// (e.g. /foo/raxd satisfies the invariant above but is not a valid system path).
+		if td.ConfigHome != tc.wantConfigHome {
+			t.Errorf("GOOS=%s ConfigHome = %q, want %q", tc.goos, td.ConfigHome, tc.wantConfigHome)
+		}
+		if td.StateHome != tc.wantStateHome {
+			t.Errorf("GOOS=%s StateHome = %q, want %q", tc.goos, td.StateHome, tc.wantStateHome)
 		}
 	}
 }
