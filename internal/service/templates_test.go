@@ -48,6 +48,9 @@ func TestRenderUnit_DefaultPort(t *testing.T) {
 		"ProtectHome=yes",
 		"PrivateTmp=yes",
 		"StateDirectoryMode=0700",
+		// BUG-1 fix: systemd must pre-create /etc/raxd owned by raxd before ExecStart.
+		"ConfigurationDirectory=raxd",
+		"ConfigurationDirectoryMode=0700",
 		"StandardError=journal",
 		"ExecStart=/usr/local/bin/raxd serve",
 		"User=raxd",
@@ -96,6 +99,9 @@ func TestRenderUnit_PrivilegedPort(t *testing.T) {
 		"ProtectSystem=strict",
 		"ProtectHome=yes",
 		"PrivateTmp=yes",
+		// BUG-1 fix: ConfigurationDirectory must be present in both unit variants.
+		"ConfigurationDirectory=raxd",
+		"ConfigurationDirectoryMode=0700",
 	}
 	for _, want := range mustContain {
 		if !strings.Contains(out, want) {

@@ -172,6 +172,12 @@ RestartSec=2s
 StateDirectory=raxd
 StateDirectoryMode=0700
 
+# Config directory: systemd creates /etc/raxd owned by raxd BEFORE ExecStart (BUG-1 fix).
+# Without this, config.EnsureDirs → MkdirAll(/etc/raxd) fails under ProtectSystem=strict.
+# ConfigurationDirectoryMode=0700 is EXPLICIT per SR-89 baseline.
+ConfigurationDirectory=raxd
+ConfigurationDirectoryMode=0700
+
 # Path environment: overrides XDG defaults so internal/config/paths.go resolves
 # /etc/raxd (ConfigDir) and /var/lib/raxd (StateDir) without code changes (ADR-002).
 Environment=XDG_CONFIG_HOME=/etc

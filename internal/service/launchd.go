@@ -93,10 +93,13 @@ func (m *launchdManager) Install(ctx context.Context) error {
 	return nil
 }
 
-// createDirs creates state and log directories for macOS (no StateDirectory= in launchd).
-// SR-89: 0700 mode + chown raxd.
+// createDirs creates state, log, and config directories for macOS.
+// launchd has no ConfigurationDirectory= equivalent (unlike systemd), so we provision
+// ConfigDir explicitly here (BUG-1 fix: config.EnsureDirs → MkdirAll(ConfigDir) must
+// find the directory existing and owned by raxd before raxd serve runs).
+// SR-89: 0700 mode + chown raxd for all provisioned directories.
 func (m *launchdManager) createDirs() error {
-	dirs := []string{m.cfg.StateDir, m.cfg.LogPath}
+	dirs := []string{m.cfg.StateDir, m.cfg.LogPath, m.cfg.ConfigDir}
 	for _, d := range dirs {
 		if err := os.MkdirAll(d, 0o700); err != nil {
 			return fmt.Errorf("cannot create %s: %w", d, err)
