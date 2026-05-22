@@ -515,11 +515,14 @@ UNAME_SHIM_B
         "${install_script}" \
         "TEST8: mktemp -d для временного каталога (SR-98)"
 
-    # RAXD_BASE_URL дефолт = https:// (SR-99)
+    # Дефолтный источник артефактов — HTTPS (SR-99).
+    # В новой логике дефолтный base_url вычисляется из RAXD_API_URL (GitHub API) и
+    # repo/version (GitHub Releases), оба — HTTPS. Проверяем наличие https:// в
+    # дефолтных значениях (RAXD_API_URL и вычисленный base_url из https://github.com).
     assert_grep \
-        'RAXD_BASE_URL.*https://' \
+        'https://api\.github\.com|https://github\.com' \
         "${install_script}" \
-        "TEST8: дефолтный RAXD_BASE_URL начинается с https:// (SR-99)"
+        "TEST8: дефолтный источник использует https:// (RAXD_API_URL/base_url — SR-99)"
 
     # curl -fsSL (SR-99)
     assert_grep \
@@ -646,6 +649,167 @@ UNAME_SHIM_B
         # чтобы не создавать ложного ощущения допустимой деградации (Н-1 guardian).
         fail "TEST9: ${dist_dir}/SHA256SUMS не найден — невозможно проверить согласованность имён"
     fi
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # TEST 10: latest-resolve через мок-API (ОР-3, RAXD_API_URL override)
+    #
+    # Проверяет: install.sh, когда RAXD_VERSION не задан (latest) и RAXD_BASE_URL
+    # не задан явно, резолвит реальный тег через RAXD_API_URL, затем скачивает
+    # артефакт и устанавливает бинарь.
+    #
+    # Сценарий:
+    #   - Мок-API-сервер (python3) на 127.0.0.1:<port_api> раздаёт JSON с tag_name.
+    #   - Мок-артефакт-сервер (второй python3) на 127.0.0.1:<port_artifacts>
+    #     раздаёт реальный dist/.
+    #   - install.sh запускается с RAXD_API_URL=http://127.0.0.1:<port_api>/latest.json
+    #     и RAXD_BASE_URL=http://127.0.0.1:<port_artifacts> (мок-override артефактов).
+    #     ВАЖНО: RAXD_BASE_URL задан явно → install.sh использует его, НЕ формирует
+    #     из GitHub. RAXD_VERSION НЕ задан → install.sh вызывает API → резолвит тег.
+    #
+    # Что проверяем:
+    #   1. install.sh вызвал RAXD_API_URL и распарсил tag_name из JSON-мока.
+    #   2. Скачал архив raxd_<resolved_tag>_<os>_<arch>.tar.gz.
+    #   3. Прошёл SHA256-проверку (архив реальный).
+    #   4. Установил бинарь, raxd version ≠ dev.
+    #
+    # Не-тавтология:
+    #   - Если убрать резолв latest в install.sh → имя архива останется
+    #     raxd_latest_<os>_<arch>.tar.gz → 404/sha256-fail → FAIL.
+    #   - Если сломать парсинг tag_name → resolved_tag пустой → install.sh
+    #     выходит с кодом 5 → тест ловит exit ≠ 0 → FAIL.
+    #   - Существующие TEST1-9 (явный RAXD_BASE_URL+RAXD_VERSION) НЕ затронуты:
+    #     они используют Путь 1 (base_url_explicit=1), API не вызывается.
+    # ══════════════════════════════════════════════════════════════════════════
+    echo ""
+    echo "══════════════════════════════════════════"
+    echo "TEST 10: latest-resolve через мок-API (ОР-3)"
+    echo "══════════════════════════════════════════"
+
+    local port_api="${PORT_API:-8010}"
+    local port_artifacts="${PORT_ARTIFACTS:-8011}"
+    local test10_dir="/tmp/raxd-edge-test10"
+    rm -rf "${test10_dir}"
+    mkdir -p "${test10_dir}/api" "${test10_dir}/install_dest"
+
+    # Тег, который вернёт мок-API. Должен совпасть с реальным архивом в dist/.
+    local mock_tag="${version}"
+
+    # Создаём JSON-файл мок-API (имитация GitHub Releases API).
+    # Помещаем его в отдельный каталог (python3 http.server раздаёт его как /latest.json).
+    cat > "${test10_dir}/api/latest.json" <<MOCKJSON
+{"tag_name":"${mock_tag}","name":"raxd ${mock_tag}","draft":false,"prerelease":false}
+MOCKJSON
+
+    echo "==> мок-API JSON: $(cat "${test10_dir}/api/latest.json")"
+
+    # Запускаем мок-API-сервер (раздаёт latest.json)
+    echo "==> запуск мок-API-сервера на 127.0.0.1:${port_api}..."
+    python3 -m http.server "${port_api}" --directory "${test10_dir}/api" --bind 127.0.0.1 &
+    _API_SERVER_PID=$!
+    stop_api_server() {
+        kill "${_API_SERVER_PID}" 2>/dev/null || true
+        wait "${_API_SERVER_PID}" 2>/dev/null || true
+    }
+    # Добавляем остановку API-сервера к существующему trap
+    trap 'stop_api_server; stop_edge_server' EXIT INT TERM
+
+    # Ждём готовности мок-API-сервера
+    local retries_api=10
+    until curl -sf "http://127.0.0.1:${port_api}/latest.json" -o /dev/null; do
+        retries_api=$((retries_api - 1))
+        if [[ $retries_api -le 0 ]]; then
+            fail "TEST10: мок-API-сервер не запустился за отведённое время"
+            rm -rf "${test10_dir}"
+            echo "══════════════════════════════════════════"
+            echo "Итог test-install-edge:"
+            echo "  PASS: ${PASS_COUNT}"
+            echo "  FAIL: ${FAIL_COUNT}"
+            echo "══════════════════════════════════════════"
+            echo "ИТОГ: FAIL — ${FAIL_COUNT} проверок провалено"
+            exit 1
+        fi
+        sleep 0.2
+    done
+    echo "==> мок-API-сервер готов (127.0.0.1:${port_api})"
+
+    # Мок-артефакт-сервер уже поднят (_EDGE_SERVER_PID, dist/ на port).
+    # Используем его же (порт $port) для раздачи архивов.
+
+    # Запускаем install.sh без RAXD_VERSION (latest) и без RAXD_BASE_URL в env,
+    # НО с RAXD_BASE_URL передаём явно в строке запуска (override для артефактов).
+    # RAXD_API_URL указывает на мок-API. install.sh должен:
+    #   1. увидеть RAXD_VERSION == latest → вызвать RAXD_API_URL
+    #   2. распарсить tag_name == mock_tag
+    #   3. сформировать base_url (из RAXD_BASE_URL переданного явно)
+    #   4. скачать raxd_${mock_tag}_linux_<arch>.tar.gz → SHA256 → install
+    local test10_exit=0
+    local test10_output
+    test10_output="$(
+        RAXD_API_URL="http://127.0.0.1:${port_api}/latest.json" \
+        RAXD_BASE_URL="http://127.0.0.1:${port}" \
+        RAXD_PREFIX="${test10_dir}/install_dest" \
+            bash "${install_script}" 2>&1
+    )" || test10_exit=$?
+
+    echo "==> код выхода install.sh (latest-resolve): ${test10_exit}"
+    echo "==> фрагмент вывода:"
+    echo "${test10_output}" | head -20
+
+    # Проверка 1: install.sh завершился успешно (код 0)
+    assert_eq "${test10_exit}" "0" "TEST10: install.sh завершился успешно при latest-resolve"
+
+    # Проверка 2: вывод содержит resolved tag (тег действительно был резолвлен из API)
+    if echo "${test10_output}" | grep -qF "resolved latest tag: ${mock_tag}"; then
+        pass "TEST10: вывод подтверждает резолв тега: ${mock_tag}"
+    else
+        fail "TEST10: вывод НЕ содержит 'resolved latest tag: ${mock_tag}' — резолв не сработал"
+    fi
+
+    # Проверка 3: бинарь установлен
+    assert_file_exists "${test10_dir}/install_dest/raxd" \
+        "TEST10: бинарь установлен после latest-resolve"
+
+    # Проверка 4: raxd version ≠ dev (ldflags применены)
+    if [[ -x "${test10_dir}/install_dest/raxd" ]]; then
+        local test10_ver
+        test10_ver="$("${test10_dir}/install_dest/raxd" version 2>&1 || true)"
+        echo "==> raxd version: ${test10_ver}"
+        if echo "${test10_ver}" | grep -qE '^raxd .+ \(commit .+, built .+\)$'; then
+            pass "TEST10: формат version корректен после latest-resolve"
+        else
+            fail "TEST10: неожиданный формат version: '${test10_ver}'"
+        fi
+        if echo "${test10_ver}" | grep -qE '^raxd dev '; then
+            fail "TEST10: version содержит 'dev' — ldflags не применены"
+        else
+            pass "TEST10: version не 'dev'"
+        fi
+    fi
+
+    # Проверка 5: API НЕ вызывается при явном RAXD_BASE_URL + явном RAXD_VERSION
+    # (регрессионная проверка: TEST1-9 работают как раньше).
+    # Запускаем install.sh с явным RAXD_VERSION и RAXD_BASE_URL — вывод НЕ должен
+    # содержать "resolving latest" (API не вызывается).
+    local test10b_exit=0
+    local test10b_output
+    test10b_output="$(
+        RAXD_BASE_URL="http://127.0.0.1:${port}" \
+        RAXD_VERSION="${mock_tag}" \
+        RAXD_PREFIX="${test10_dir}/install_dest_explicit" \
+            bash "${install_script}" 2>&1
+    )" || test10b_exit=$?
+
+    if echo "${test10b_output}" | grep -q "resolving latest"; then
+        fail "TEST10b: API вызван при явном RAXD_VERSION — ошибка логики override"
+    else
+        pass "TEST10b: API НЕ вызывается при явном RAXD_BASE_URL+RAXD_VERSION (override работает)"
+    fi
+
+    # Остановка API-сервера (артефакт-сервер остановится через общий trap)
+    stop_api_server
+    trap 'stop_edge_server' EXIT INT TERM
+
+    rm -rf "${test10_dir}"
 
     # ── Итог ──────────────────────────────────────────────────────────────────
     echo ""
