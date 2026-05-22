@@ -14,6 +14,11 @@ package mcp_test
 //   - QA-5 (AC18/SR-68): rate-limit 429 ДО upload_file → файл НЕ создаётся, RATE в аудите.
 //   - QA-6 (AC10/SR-74): нет temp-файла после ошибки ВНУТРИ fileupload.Write (страховочная
 //     проверка ErrTooLarge в Write до создания temp — чистота upload root подтверждается).
+//   - QA-7 (AC14): fail-ветка (I/O ошибка записи → Result:"fail", FAIL в аудите, сервер жив).
+//     Два теста: integration (MCP-уровень) + unit (writeAudit напрямую для Result:"fail"+isUpload).
+//     Вектор I/O-fail: создать файл с именем промежуточного каталога внутри upload root;
+//     root.MkdirAll получает ENOTDIR → неизвестная ошибка → auditResult="fail".
+//     Надёжен в Docker от root (ENOTDIR не зависит от euid).
 //
 // Все тесты запускаются только в Docker (-mod=vendor; AC20/SR-82).
 // НЕ используют t.Skip для скрытия провалов;
@@ -217,7 +222,13 @@ func TestUploadFile_AuditHasFpAndRemote(t *testing.T) {
 	log := auditBuf.String()
 
 	// fingerprint (fp=) обязателен (AC12/SR-78).
-	// В httptest без реальной TLS-auth fp="-" (нет fingerprint) — ключ пуст.
+	// Примечание о httptest-контексте: в httptest.Server нет TLS-рукопожатия с ключом raxd,
+	// поэтому fp= содержит "-" (нет fingerprint). Это ожидаемо — ключ не передаётся через
+	// стандартный httptest.NewServer (нет authMiddleware). Реальный fingerprint из keystore
+	// проверяется в TLS-тестах: TestUploadFile_UnauthenticatedReturns401 и
+	// TestUploadFile_RateLimit429BeforeUpload (полный TLS-стек через startMCPServerWithBodyLimit
+	// и startMCPServerWithRateLimit соответственно).
+	// Данный тест проверяет, что поле fp= ПРИСУТСТВУЕТ в аудите (не отсутствует целиком).
 	if !strings.Contains(log, "fp=") {
 		t.Errorf("QA-2/AC12/SR-78: audit missing fp= field; log=%q", log)
 	}
@@ -464,6 +475,148 @@ func TestUploadFile_RateLimit429BeforeUpload(t *testing.T) {
 		t.Logf("QA-5/AC18: OK — RATE-запись присутствует в аудите")
 	}
 	t.Logf("QA-5/AC18: OK — 429 ДО upload_file подтверждён")
+}
+
+// ─── QA-7a (AC14): fail-ветка MCP-уровень — I/O ошибка при MkdirAll (ENOTDIR) ─────────────────────
+
+// TestUploadFile_FailBranchIOError_MCP проверяет fail-ветку AC14:
+// сырая I/O ошибка (не ErrTraversal/ErrExists/ErrIsDir/ErrTooLarge/ErrBadMode) →
+// handler возвращает isError:true, аудит содержит FAIL + tool=upload_file + path=,
+// сервер остаётся жив.
+//
+// Вектор I/O-fail: создать обычный файл с именем "notadir" внутри upload root,
+// затем запросить upload_file с path="notadir/target.txt".
+// fileupload.Write вызывает root.MkdirAll("notadir", ...) — получает ENOTDIR
+// (notadir — файл, не каталог). Это НЕ один из известных сентинель-ошибок,
+// поэтому uploadHandler переходит в default-ветку: auditResult="fail".
+//
+// Надёжность: ENOTDIR возникает независимо от euid (файл блокирует mkdir для всех).
+// В Docker от root (euid==0) механизм тот же — нельзя создать каталог на месте файла.
+//
+// Если тест падает (isError=false или нет FAIL в аудите) → PRODUCT BUG, эскалируй к developer.
+func TestUploadFile_FailBranchIOError_MCP(t *testing.T) {
+	cfg := defaultUplCfg(t)
+
+	// Создаём файл с именем "notadir" внутри upload root.
+	// root.MkdirAll("notadir", ...) получит ENOTDIR → fail-ветка в handler.
+	notadirPath := filepath.Join(cfg.UploadRoot, "notadir")
+	if err := os.WriteFile(notadirPath, []byte("i am a file"), 0o644); err != nil {
+		t.Fatalf("QA-7a/AC14: create blocking file: %v", err)
+	}
+
+	ts, auditBuf := newUploadTestServer(t, cfg)
+
+	auditBuf.Reset()
+	body, _ := callUploadFile(t, ts, map[string]interface{}{
+		"path":    "notadir/target.txt",
+		"content": b64([]byte("should fail with I/O")),
+	})
+
+	res := parseUploadResult(t, body)
+
+	// (1) MCP должен вернуть isError:true (handler не справился, не паниковал).
+	if res["isError"] != true {
+		t.Errorf("QA-7a/AC14: ожидался isError:true для I/O-fail (ENOTDIR);\n"+
+			"тело ответа: %s", body)
+	}
+
+	log := auditBuf.String()
+
+	// (2) Аудит должен содержать FAIL (не DENY, не MCP/result=ok).
+	// Т.е. ветка auditResult="fail" → writeAudit Case "fail" → msg=FAIL.
+	// При euid==0 добавляется WARN-запись перед ней, FAIL всё равно присутствует.
+	hasFail := false
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, "FAIL") && strings.Contains(line, "tool=upload_file") {
+			hasFail = true
+			break
+		}
+	}
+	if !hasFail {
+		t.Errorf("QA-7a/AC14: PRODUCT BUG — нет строки 'FAIL tool=upload_file' в аудите;\n"+
+			"fail-ветка uploadHandler не сработала для I/O-ошибки. Эскалируй к developer.\nlog=%q", log)
+	}
+
+	// (3) Целевой файл НЕ создан (операция провалилась до создания target).
+	targetFile := filepath.Join(cfg.UploadRoot, "notadir", "target.txt")
+	if _, err := os.Stat(targetFile); err == nil {
+		t.Errorf("QA-7a/AC14: PRODUCT BUG — файл создан несмотря на I/O ошибку MkdirAll!")
+	}
+
+	// (4) Сервер жив — следующий вызов работает нормально.
+	auditBuf.Reset()
+	okBody, _ := callUploadFile(t, ts, map[string]interface{}{
+		"path":    "after_fail.txt",
+		"content": b64([]byte("server still alive")),
+	})
+	okRes := parseUploadResult(t, okBody)
+	if okRes["isError"] == true {
+		t.Errorf("QA-7a/AC14: сервер не жив после fail-ошибки; okBody=%s", okBody)
+	}
+
+	t.Logf("QA-7a/AC14: OK — ENOTDIR → isError:true, FAIL в аудите (tool=upload_file), сервер жив")
+}
+
+// ─── QA-7b (AC14): unit-тест writeAudit для Result:"fail" + isUpload ────────────────────────────
+
+// TestUploadFile_WriteAuditFailBranch_Unit проверяет что writeAudit для
+// AuditRecord{Result:"fail", Tool:"upload_file", Path:"some/path.txt"} выводит:
+//   - msg=FAIL (уровень WARN)
+//   - tool=upload_file
+//   - path=some/path.txt (SR-79: upload fail логирует path если известен)
+//   - fp= (fingerprint, может быть "-")
+//   - remote= (адрес)
+//
+// (AC14/SR-78/SR-79) Это unit-тест напрямую для writeAudit.
+// Гарантирует рендер fail-ветки независимо от возможности вызвать реальный I/O-fail.
+// Дополняет QA-7a (TestUploadFile_FailBranchIOError_MCP).
+func TestUploadFile_WriteAuditFailBranch_Unit(t *testing.T) {
+	var buf bytes.Buffer
+	// newTestLogger — helper из mcp_test.go (тот же пакет mcp_test).
+	logger := newTestLogger(&buf)
+	auditFn := server.NewAuditFnForTest(logger)
+
+	// Симулируем fail-запись (I/O ошибка записи) с путём.
+	auditFn(server.AuditRecord{
+		Fingerprint: "abc123",
+		RemoteAddr:  "127.0.0.1:9999",
+		Result:      "fail",
+		Tool:        "upload_file",
+		Path:        "some/path.txt",
+		Reason:      "create directories: mkdir some/notadir: not a directory",
+	})
+
+	log := buf.String()
+
+	if !strings.Contains(log, "FAIL") {
+		t.Errorf("QA-7b/AC14/SR-78: writeAudit fail+isUpload → ожидался msg=FAIL; log=%q", log)
+	}
+	if !strings.Contains(log, "tool=upload_file") {
+		t.Errorf("QA-7b/AC14/SR-79: writeAudit fail+isUpload → ожидался tool=upload_file; log=%q", log)
+	}
+	if !strings.Contains(log, "path=") {
+		t.Errorf("QA-7b/AC14/SR-79: writeAudit fail+isUpload → ожидался path= (SR-79 isUpload path); log=%q", log)
+	}
+	if !strings.Contains(log, "fp=") {
+		t.Errorf("QA-7b/AC14/SR-78: writeAudit fail+isUpload → ожидался fp=; log=%q", log)
+	}
+	if !strings.Contains(log, "remote=") {
+		t.Errorf("QA-7b/AC14/SR-78: writeAudit fail+isUpload → ожидался remote=; log=%q", log)
+	}
+	// Не должно быть result=ok или DENY — это ветка fail.
+	for _, line := range strings.Split(log, "\n") {
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "result=ok") {
+			t.Errorf("QA-7b/AC14: writeAudit fail → нет result=ok в FAIL-строке; line=%q", line)
+		}
+		if strings.Contains(line, "DENY") {
+			t.Errorf("QA-7b/AC14: writeAudit fail → нет DENY в FAIL-строке; line=%q", line)
+		}
+	}
+
+	t.Logf("QA-7b/AC14: OK — writeAudit fail+isUpload рендерит FAIL tool=upload_file path= fp= remote=; log=%q", log)
 }
 
 // ─── QA-6 (AC10/SR-74): нет temp-файла после ErrTooLarge в fileupload.Write ──────────────────────
