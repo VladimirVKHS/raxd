@@ -19,12 +19,14 @@
 FROM debian:stable-slim
 
 # Зависимости тест-образа: curl (для install.sh) + python3 (мок-HTTP, ADR-002).
+# passwd/useradd — для TEST7 (проверка нет прав на запись, AC9/SR-106/SR-108).
 # Никакого Go, никакого raxd — имитация чистого сервера (AC12).
 RUN apt-get update -qq && \
     apt-get install -y --no-install-recommends \
         curl \
         ca-certificates \
         python3 \
+        passwd \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
@@ -34,9 +36,11 @@ WORKDIR /workspace
 COPY dist/ ./dist/
 COPY install.sh ./install.sh
 COPY scripts/test-install.sh ./scripts/test-install.sh
+COPY scripts/test-install-edge.sh ./scripts/test-install-edge.sh
+COPY scripts/release.sh ./scripts/release.sh
 
 # Права на исполнение скриптов
-RUN chmod +x install.sh scripts/test-install.sh
+RUN chmod +x install.sh scripts/test-install.sh scripts/test-install-edge.sh scripts/release.sh
 
 # Метаданные: образ для тестирования install-flow, не для production.
 LABEL description="raxd install-flow test image (debian, no Go, no raxd pre-installed)" \

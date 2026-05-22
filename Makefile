@@ -58,7 +58,7 @@ VERSION_LDFLAGS := -ldflags="-s -w \
         verify-cross \
         docker-systemd test-service test-unit \
         release checksums release-all \
-        test-install ci-local \
+        test-install test-install-edge test-install-all ci-local \
         clean
 
 all: build-all
@@ -267,6 +267,44 @@ test-install:
 		-e PORT=8000 \
 		$(INSTALL_TEST_IMAGE)
 	@echo "=== test-install: ПРОШЁЛ ==="
+
+# ── test-install-edge: edge-тесты install-flow (AC2/AC4/AC7/AC9/AC11/AC16) ───
+#
+# SECURITY-BASELINE §6: гоняется в том же Dockerfile.install-контейнере.
+# docker-guard /.dockerenv защищает от случайного запуска на хосте.
+# Покрывает: AC2(усечённый скрипт), AC4(неподдерж. платформа), AC7(минимизация),
+#            AC9(нет прав→код 4), AC11(darwin-ветка), AC16(согласованность имён).
+#
+# Предусловие: dist/ должен содержать SHA256SUMS.
+
+# Docker-образ для edge-тестов (тот же Dockerfile.install, другая CMD).
+INSTALL_EDGE_IMAGE := raxd-install-edge-test
+
+## test-install-edge: edge-тесты install.sh в чистом контейнере (AC2/AC4/AC7/AC9/AC11/AC16)
+test-install-edge:
+	@# Проверяем наличие готового dist/ — go build на хосте ЗАПРЕЩЁН (§6/SR-112, D-1).
+	@test -f $(DIST_DIR)/SHA256SUMS || { \
+		echo "ERROR: $(DIST_DIR)/SHA256SUMS не найден."; \
+		echo "  Сначала соберите артефакты в Docker (go build на хосте запрещён — §6):"; \
+		echo "    make ci-local VERSION=$(VERSION)"; \
+		exit 1; \
+	}
+	@echo "=== test-install-edge: сборка образа $(INSTALL_EDGE_IMAGE)... ==="
+	docker build -f Dockerfile.install -t $(INSTALL_EDGE_IMAGE) \
+		--build-arg VERSION=$(VERSION) .
+	@echo "=== test-install-edge: запуск edge-тестов в контейнере... ==="
+	docker run --rm \
+		-e VERSION=$(VERSION) \
+		-e PORT=8001 \
+		--entrypoint bash \
+		$(INSTALL_EDGE_IMAGE) \
+		scripts/test-install-edge.sh
+	@echo "=== test-install-edge: ПРОШЁЛ ==="
+
+## test-install-all: TEST1-3 + edge-тесты TEST4-9 (полное покрытие install.sh)
+test-install-all: test-install test-install-edge
+	@echo ""
+	@echo "=== test-install-all: ВСЕ ТЕСТЫ (TEST1-9) ПРОШЛИ ==="
 
 # ── ci-local: полный локальный CI в Docker (AC14, baseline §6) ───────────────
 #
