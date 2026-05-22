@@ -187,7 +187,7 @@ func TestTLS13Enforced(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestCertGeneratedWithCorrectPerms(t *testing.T) {
 
 	cfg := newTestConfig(0)
 	var logBuf bytes.Buffer
-	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf))
+	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -256,7 +256,7 @@ func TestCertIsECDSAP256SelfSignedWithSAN(t *testing.T) {
 
 	cfg := newTestConfig(0)
 	var logBuf bytes.Buffer
-	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf))
+	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -324,7 +324,7 @@ func TestCertReusedOnSecondNew(t *testing.T) {
 	var logBuf bytes.Buffer
 
 	// First call — generates cert.
-	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf))
+	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("first server.New: %v", err)
 	}
@@ -337,7 +337,7 @@ func TestCertReusedOnSecondNew(t *testing.T) {
 	stat1, _ := os.Stat(certPath)
 
 	// Second call — must reuse.
-	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf))
+	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("second server.New: %v", err)
 	}
@@ -381,7 +381,7 @@ func TestCorruptCertReturnsError(t *testing.T) {
 
 	cfg := newTestConfig(0)
 	var logBuf bytes.Buffer
-	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf))
+	_, err = server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err == nil {
 		t.Fatal("AC13/SR-6: expected error for corrupt cert, got nil")
 	}
@@ -412,7 +412,7 @@ func TestNoAuthReturns401(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -437,7 +437,7 @@ func TestUnknownKeyReturns401(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -466,7 +466,7 @@ func TestValidKeyReachesHealth(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -502,7 +502,7 @@ func TestRevokedKeyReturns401(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -550,7 +550,7 @@ func TestRateLimitPerKeyReturns429(t *testing.T) {
 	cfg.RateBurst = 1   // burst of 1
 
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -589,7 +589,7 @@ func TestRateLimitPerIPReturns429(t *testing.T) {
 	cfg.RateBurst = 1
 
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -624,7 +624,7 @@ func TestServerBindsLoopback(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -655,7 +655,7 @@ func TestAuditHasNoKeyBody(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -691,7 +691,7 @@ func TestAuditHasFingerprintField(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -716,7 +716,7 @@ func TestAuditFailHasDash(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -750,7 +750,7 @@ func TestHealthReturnsPoong(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -784,7 +784,7 @@ func TestDispatchReturns501(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -813,7 +813,7 @@ func TestGracefulShutdown(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -868,7 +868,7 @@ func TestInvalidHostReturns403(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -908,7 +908,7 @@ func TestInvalidOriginReturns403(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -953,7 +953,7 @@ func TestOriginBypassAttemptRejected(t *testing.T) {
 	cfg := newTestConfig(port)
 	// HostAllow has "localhost" and "127.0.0.1"; OriginAllow same.
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1006,7 +1006,7 @@ func TestInvalidOriginUnparseable(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1104,7 +1104,7 @@ func TestSingleAuditRecordOnSuccess(t *testing.T) {
 	cfg.RateBurst = 1000
 
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1151,7 +1151,7 @@ func TestSingleAuditRecordOnRateLimit(t *testing.T) {
 	cfg.RateBurst = 1
 
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1207,7 +1207,7 @@ func TestAbsentOriginNotRejected(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1244,7 +1244,7 @@ func TestPortInUse(t *testing.T) {
 
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1282,7 +1282,7 @@ func TestRateLimiterConcurrency(t *testing.T) {
 	cfg.RateBurst = 1000
 
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1316,7 +1316,7 @@ func TestAuditFailRecorded(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1349,7 +1349,7 @@ func TestAuditRateRecorded(t *testing.T) {
 	cfg.RateBurst = 1
 
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1386,7 +1386,7 @@ func TestErrCorruptReturns403(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1428,7 +1428,7 @@ func TestGracefulShutdownOrder(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1498,7 +1498,7 @@ func TestOnListenHookCalledOnSuccessfulBind(t *testing.T) {
 	port := freePort(t)
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}
@@ -1568,7 +1568,7 @@ func TestOnListenHookNotCalledOnPortInUse(t *testing.T) {
 
 	cfg := newTestConfig(port)
 	var logBuf bytes.Buffer
-	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf))
+	srv, err := server.New(cfg, paths, store, newTestLogger(&logBuf), nil)
 	if err != nil {
 		t.Fatalf("server.New: %v", err)
 	}

@@ -14,7 +14,9 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/vladimirvkhs/raxd/internal/config"
 	"github.com/vladimirvkhs/raxd/internal/keystore"
+	internalmcp "github.com/vladimirvkhs/raxd/internal/mcp"
 	"github.com/vladimirvkhs/raxd/internal/server"
+	"github.com/vladimirvkhs/raxd/internal/version"
 )
 
 // newServeCmd returns the "serve" command.
@@ -79,8 +81,17 @@ func runServe(cmd *cobra.Command, _ []string) error {
 	logger := clog.New(stderr)
 	logger.SetTimeFormat("2006-01-02T15:04:05Z")
 
+	// Build MCP handler (AC11/SR-29): same port/TLS as serve; no second auth channel (SR-28).
+	// auditFn for MCP uses the same logger channel as transport audit.
+	auditFn := server.NewAuditFn(logger)
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn)
+	if err != nil {
+		fmt.Fprintf(stderr, "error: failed to build MCP handler: %s\n", err)
+		return err
+	}
+
 	// Build server (generates or loads TLS cert).
-	srv, err := server.New(cfg, paths, ks, logger)
+	srv, err := server.New(cfg, paths, ks, logger, mcpH)
 	if err != nil {
 		printStartError(stderr, err, paths)
 		return err

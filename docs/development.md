@@ -9,12 +9,12 @@ build metadata is injected. It targets contributors working on the codebase.
 dangerous tool (like SSH). For that reason the security baseline (§6) requires that **all builds,
 tests, and any execution of `raxd` happen inside a Docker container — never on the host machine.**
 
-This now applies in a very concrete way: `raxd serve` opens a TLS listener and authenticates network
-connections, so running it (and its tests) belongs inside a container. The features that run *behind*
-that listener — command execution, the MCP server, file upload — do not exist yet, but the
-Docker-only workflow is established from the start so it is already in place when those features
-arrive. The state that `raxd` writes (`keys.db`, the TLS certificate under the state directory) stays
-inside the container, off the host.
+This now applies in a very concrete way: `raxd serve` opens a TLS listener, authenticates network
+connections, and serves an MCP endpoint on `/mcp`, so running it (and its tests) belongs inside a
+container. The features that still run *behind* that listener — command execution and file upload —
+do not exist yet, but the Docker-only workflow is established from the start so it is already in place
+when those features arrive. The state that `raxd` writes (`keys.db`, the TLS certificate under the
+state directory) stays inside the container, off the host.
 
 ## Build and test in Docker
 
@@ -47,22 +47,24 @@ docker run --rm -v "$PWD":/src -w /src golang:1.25 \
   sh -c "go test -race ./internal/keystore/..."
 ```
 
-### Testing the TLS server (`internal/server`)
+### Testing the TLS server and the MCP layer (`internal/server`, `internal/mcp`)
 
 The network server lives in `internal/server` and is exercised end-to-end with `httptest`'s TLS
-helpers — there is no need to bind a real privileged port. The rate limiter uses goroutines and a
-shared map, so the server tests must be run **with the race detector** (which requires
-`CGO_ENABLED=1`). Inside the container:
+helpers — there is no need to bind a real privileged port. The MCP layer in `internal/mcp` is tested
+both in isolation (via `httptest.NewServer` against the MCP handler) and end-to-end (through
+`server.New(..., mcpHandler)` with the full middleware chain). The rate limiter and the SDK handler
+use goroutines and shared state, so the server and MCP tests must be run **with the race detector**
+(which requires `CGO_ENABLED=1`). Inside the container:
 
 ```sh
-# Server tests with the race detector:
+# Server + MCP tests with the race detector:
 docker run --rm raxd-test \
-  sh -c "CGO_ENABLED=1 go test -race -v -count=1 ./internal/server/..."
+  sh -c "CGO_ENABLED=1 go test -race -v -count=1 ./internal/server/... ./internal/mcp/..."
 ```
 
 `go vet ./...` and the full suite run from the default `test` image step above; they also cover
-`internal/server` and `internal/cli` (the `serve` command). As with everything else, do not run the
-server on the host — keep it in the container.
+`internal/server`, `internal/mcp`, and `internal/cli` (the `serve` command). As with everything else,
+do not run the server on the host — keep it in the container.
 
 ### Build only
 
@@ -105,18 +107,22 @@ surface intentionally empty at this stage.
 │   │   ├── root.go          Root command, sub-command registration, banner via PersistentPreRun
 │   │   ├── key.go           "key" group: create / list / delete (working)
 │   │   ├── config.go        "config" group: port (stub)
-│   │   ├── serve.go         "serve" command: foreground TLS server (working)
+│   │   ├── serve.go         "serve" command: foreground TLS server + MCP handler (working)
 │   │   ├── version.go       "version" command (working)
 │   │   ├── status.go        "status" command (working)
 │   │   └── stub.go          Shared not-implemented-yet helper for stub commands
 │   ├── server/              TLS HTTP transport (the "serve" backend)
-│   │   ├── server.go        Server type: http.Server + tls.Config, Run / graceful shutdown
+│   │   ├── server.go        Server type: http.Server + tls.Config, Run / graceful shutdown; mounts /mcp
 │   │   ├── tls.go           Load or generate the self-signed ECDSA P-256 cert (0600/0644)
-│   │   ├── auth.go          Bearer extraction + keystore.Verify; success-audit middleware
+│   │   ├── auth.go          Bearer extraction + keystore.Verify; success-audit middleware; Fingerprint/RemoteAddrFromContext
 │   │   ├── middleware.go    Host/Origin, body-limit, recover, rate-limit middlewares
 │   │   ├── ratelimit.go     Per-key/per-IP token-bucket limiters with TTL GC
-│   │   ├── audit.go         AuditRecord + structured key=value audit logging
+│   │   ├── audit.go         AuditRecord (incl. Tool field) + structured key=value audit logging
 │   │   └── handlers.go      healthHandler (pong) and dispatchHandler (501 catch-all)
+│   ├── mcp/                 MCP server layer (official Go MCP SDK), mounted on /mcp by serve
+│   │   ├── server.go        NewHandler: builds the MCP server, registers tools, returns http.Handler
+│   │   ├── tools.go         ping and server_info tool descriptors + handlers
+│   │   └── audit.go         withAudit decorator: one MCP audit record per tools/call
 │   ├── keystore/            API key generation, storage, verification, revocation
 │   │   ├── keystore.go      Store: Open / Create / List / Revoke / Verify / FlushUsage
 │   │   ├── crypto.go        Key body / salt / id generation, hashing, fingerprint (crypto/rand)
@@ -147,15 +153,23 @@ surface intentionally empty at this stage.
 - `internal/cli/key.go` implements the `key` group on top of `internal/keystore`: it opens the
   store at the `KeysDB` path, calls `Create` / `List` / `Revoke`, and renders output per the UX
   contract (key body on stdout, decoration on stderr).
-- `internal/cli/serve.go` resolves paths and config, opens the keystore, builds a `server.Server`
-  (which loads or generates the TLS certificate), registers an `OnListen` hook that prints the
-  startup block only after a successful bind (via `srv.SetOnListen`, fired from inside `srv.Run`),
+- `internal/cli/serve.go` resolves paths and config, opens the keystore, builds the MCP handler
+  (`internalmcp.NewHandler(version.Version, auditFn)`), builds a `server.Server` (which loads or
+  generates the TLS certificate) passing the MCP handler in, registers an `OnListen` hook that prints
+  the startup block only after a successful bind (via `srv.SetOnListen`, fired from inside `srv.Run`),
   and runs the server until `SIGINT` / `SIGTERM`. The API key is never read from argv or the
   environment.
 - `internal/server` owns the transport: it wraps a TCP listener in TLS 1.3, runs the fixed
   middleware chain (body-limit → recover → Host/Origin → auth → rate-limit), routes `GET /healthz`
-  to `pong` and everything else to a `501` catch-all, and on shutdown calls `Store.FlushUsage` after
-  `http.Server.Shutdown`.
+  to `pong`, mounts the MCP handler at `/mcp` (when one is supplied — `nil` falls through to `501`),
+  sends every other route to a `501` catch-all, and on shutdown calls `Store.FlushUsage` after
+  `http.Server.Shutdown`. It exposes `FingerprintFromContext` / `RemoteAddrFromContext` so the MCP
+  layer can read the per-request fingerprint and remote address from the context (the key body is
+  never exposed).
+- `internal/mcp` owns the MCP server: `NewHandler` builds an `*mcp.Server` (via the official Go MCP
+  SDK), registers exactly `ping` and `server_info` (each wrapped by `withAudit`), and returns the
+  Streamable-HTTP `http.Handler` that `serve` mounts at `/mcp`. It does **not** import
+  `internal/keystore` — authentication is the transport's job (it runs before `/mcp`).
 - `internal/keystore` owns all secret handling: `crypto/rand` generation, `sha256(key‖salt)`
   hashing, constant-time `Verify`, atomic `0600` writes, and advisory flock. The server consumes it
   read-only via `Verify` and `Fingerprint`; the plaintext key never leaves the caller's stack.
@@ -185,6 +199,8 @@ go build -ldflags "\
 raxd 1.0.0 (commit abc1234, built 2025-06-01)
 ```
 
+The same `Version` value is what the MCP `server_info` tool reports as its `version` field.
+
 ## Vendoring and offline builds
 
 All dependencies are vendored: the `vendor/` directory is committed to git, and the Go toolchain
@@ -195,7 +211,10 @@ together with `vendor/` and compiles **without** any networked `go mod download`
 [`specs/key-management/decisions/ADR-002-vendoring-offline-builds.md`](../specs/key-management/decisions/ADR-002-vendoring-offline-builds.md).
 
 If you change dependencies (`go get` or an edit to `go.mod`), you **must** run `go mod vendor` and
-commit the updated `vendor/` and `go.sum`; otherwise the offline build will break.
+commit the updated `vendor/` and `go.sum`; otherwise the offline build will break. This is how the
+MCP SDK (`github.com/modelcontextprotocol/go-sdk`) and its transitive dependencies were added — the
+proxy is not reachable from inside Docker, so `go mod vendor` is run on the host and the result is
+committed.
 
 ## Dependencies
 
@@ -207,11 +226,14 @@ the direct dependencies (the `require` block in `go.mod`) are:
 | `github.com/spf13/cobra` | CLI and sub-commands |
 | `github.com/spf13/viper` | `config.yaml` loading |
 | `github.com/olekukonko/tablewriter` | `key list` table rendering |
-| `github.com/charmbracelet/log` | structured audit logging (`key create` / `key delete` and the `serve` audit stream) |
+| `github.com/charmbracelet/log` | structured audit logging (`key create` / `key delete` and the `serve` / MCP audit stream) |
 | `golang.org/x/time/rate` | per-key / per-IP token-bucket rate limiting in `internal/server` |
+| `github.com/modelcontextprotocol/go-sdk` | the official Go MCP SDK — the MCP server in `internal/mcp` |
 
-The TLS transport itself uses only the standard library (`net/http`, `crypto/tls`, `crypto/x509`,
-`crypto/ecdsa`); no third-party HTTP or TLS framework is added.
+The MCP SDK pulls in a few transitive dependencies (for example `github.com/google/jsonschema-go`
+and `github.com/yosida95/uritemplate/v3`); they are all pure-Go and permissive-licensed, vendored
+alongside the rest. The TLS transport itself uses only the standard library (`net/http`,
+`crypto/tls`, `crypto/x509`, `crypto/ecdsa`); no third-party HTTP or TLS framework is added.
 
 Two notes on libraries that are present but not used directly:
 
@@ -228,6 +250,7 @@ Two notes on libraries that are present but not used directly:
 ## Related documents
 
 - [`commands.md`](commands.md) — what each command does and outputs.
+- [`mcp.md`](mcp.md) — the MCP integration guide (the `/mcp` endpoint, tools, connection, audit).
 - [`configuration.md`](configuration.md) — paths, the `keys.db` database, the TLS directory, and the
   `config.yaml` format.
 - [`troubleshooting.md`](troubleshooting.md) — common problems with `serve`, the TLS certificate,

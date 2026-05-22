@@ -52,9 +52,13 @@ type Server struct {
 // Contract (plan.md):
 //   - Returns ErrTLSCert if TLS cert/key files are corrupt (AC13).
 //   - Does not bind the port — that happens in Run.
+//   - mcpHandler: if non-nil, mounted at /mcp BEFORE the catch-all dispatchHandler
+//     (which returns 501). This keeps MCP behind the same auth/Origin/rate-limit chain.
+//     If nil, /mcp falls through to dispatchHandler (501 — backward compat).
 //
 // SR-21: logger must not log key body, Authorization header, or private TLS key.
-func New(cfg *config.Config, paths config.PathSet, store *keystore.Store, logger *clog.Logger) (*Server, error) {
+// SR-29: mcpHandler is mounted in the same mux as /healthz — same port, same TLS.
+func New(cfg *config.Config, paths config.PathSet, store *keystore.Store, logger *clog.Logger, mcpHandler http.Handler) (*Server, error) {
 	// Load or generate TLS certificate (AC2/AC3, SR-3/SR-4/SR-5/SR-6).
 	cr, err := loadOrCreateCert(paths.TLSDir)
 	if err != nil {
@@ -80,6 +84,12 @@ func New(cfg *config.Config, paths config.PathSet, store *keystore.Store, logger
 	// audit(outer) → recover → Host/Origin → auth → rate-limit → mux
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", healthHandler)
+	// SR-29/AC11: if mcpHandler is provided, mount it at /mcp BEFORE the catch-all.
+	// The handler is already behind auth/Origin/rate-limit from the middleware chain.
+	// nil mcpHandler → /mcp falls through to dispatchHandler (501, backward compat).
+	if mcpHandler != nil {
+		mux.Handle("/mcp", mcpHandler)
+	}
 	mux.HandleFunc("/", dispatchHandler)
 
 	var handler http.Handler = mux
