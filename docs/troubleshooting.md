@@ -40,8 +40,8 @@ You have no active API keys, or you are not sending the key correctly.
   next request. Confirm the key is still active with `raxd key list`.
 
 This applies to the MCP endpoint too: a `401` on `/mcp` means the same thing, and no tool runs
-(including `execute_command` — no command is executed). See [MCP server (`/mcp`)](#mcp-server-mcp)
-below.
+(including `execute_command` — no command is executed — and `upload_file` — no file is written). See
+[MCP server (`/mcp`)](#mcp-server-mcp) below.
 
 Note: response bodies for rejected requests are intentionally empty; the reason is only in the
 server's audit stream. That is by design (it avoids telling a caller whether a key is unknown or
@@ -100,6 +100,20 @@ error: cannot create TLS directory: permission denied
 Make sure the current user can write under `~/.local/state/raxd/` (or wherever `XDG_STATE_HOME`
 points). In a container, ensure the mounted path is writable by the container user.
 
+### `error: cannot create upload root directory: …`
+
+`raxd serve` could not create the upload root (default `<state directory>/uploads`). It is created
+with `0700` permissions on startup, before the listener binds, so this error is a startup failure
+(exit `1`) and the server does not start.
+
+```
+error: cannot create upload root directory: permission denied
+```
+
+Make sure the current user can write under the state directory (or wherever `upload.root` points if
+you set it), and that any custom `upload.root` is a writable path. See
+[`configuration.md`](configuration.md#file-upload-upload-fields).
+
 ### `error: failed to generate TLS certificate`
 
 Certificate generation failed while writing to disk — typically no free space or no write permission
@@ -139,7 +153,9 @@ per cause. So:
 - **Read the `hint:` line as "fix your `config.yaml`"** rather than literally "the problem is
   `bind_addr`". For a YAML-syntax error the `bind_addr` mention is incidental.
 
-The two concrete cases follow.
+The two concrete cases follow. (Note: an invalid `upload.max_file_bytes` or `upload.default_mode` is
+also a `config.Load` failure and surfaces through this same path — the `error:` line names the upload
+field; see [the `upload_file` section](#the-upload_file-tool) below.)
 
 ### `error: invalid bind address "…": not a valid IP address`
 
@@ -190,30 +206,44 @@ by default. There is no built-in trust anchor and no mTLS in this build.
 
 This is expected for an **unimplemented** route. After authentication, the routes that do real work
 are `GET /healthz` (returns `pong`) and `/mcp` (the MCP server). Every other path (for example
-`/exec`) returns `501` with the body `not implemented`. Note that command execution is **not** a
-separate route: it is the MCP `execute_command` tool on `/mcp`, not a `/exec` endpoint. There is
-nothing to fix about the `501` on other paths — those routes are simply unimplemented.
+`/exec`) returns `501` with the body `not implemented`. Note that command execution and file upload
+are **not** separate routes: they are the MCP `execute_command` and `upload_file` tools on `/mcp`, not
+`/exec` or `/upload` endpoints. There is nothing to fix about the `501` on other paths — those routes
+are simply unimplemented.
 
 > **`/mcp` no longer returns `501`.** If you used an older build, the MCP route was a `501` stub. In
 > the current build, `POST /mcp` with a valid key returns a real JSON-RPC response. If you still get
 > `501` on `/mcp`, you are running an old binary — rebuild. (A `GET /mcp` returns `405`, not `501` —
 > see the MCP section below.)
 
-### A request returns `413` (and nothing shows up in the audit stream)
+### A request returns `413` or `400` for an oversized body (and nothing shows up in the audit stream)
 
-The request body exceeded `max_body_bytes` (default 1 MiB). The `413` is produced by the outermost
-body-size limit (`http.MaxBytesReader`), which sits **before** the auth and audit middlewares — so,
-unlike the `401` / `403` / `429` cases, a `413` **does not** write any audit line (`FAIL` / `DENY` /
-`RATE`). If you are debugging an oversized request, do not look for it in the audit stream: confirm
-it from the client side (the `413` response) instead. Reduce the request body or raise
+The request body exceeded `max_body_bytes` (default 1 MiB). The rejection is produced by the
+outermost body-size limit (`http.MaxBytesReader`), which sits **before** the auth and audit
+middlewares — so, unlike the `401` / `403` / `429` cases, it **does not** write any audit line
+(`FAIL` / `DENY` / `RATE`). If you are debugging an oversized request, do not look for it in the audit
+stream: confirm it from the client side (the response code) instead. Reduce the request body or raise
 `max_body_bytes` in `config.yaml` (see
 [`configuration.md`](configuration.md#networking-and-serve-fields)).
 
+> **`413` vs `400` — which one you see depends on the route.**
+> - For a plain non-MCP route, the body limit surfaces as **`413`**.
+> - For an **`upload_file`** request on `/mcp`, an oversized body surfaces (in this build) as an HTTP
+>   **`400`** with "failed to read body" — this comes from the Go MCP SDK reading the truncated
+>   `MaxBytesReader`, **not** a `413`. (The project spec/mcp-spec mention `413`; the SDK returns `400`
+>   here. This is a documentation caveat, **not** a defect — the body is rejected before the handler
+>   and **no file is written**.) See [`mcp.md`](mcp.md#upload_file) for the full caveat.
+>
+> Either way, the rejection is **silent in the audit stream** — confirm an oversized request by the
+> response code, not by grepping the audit log.
+
 > Note: large `execute_command` arguments are bounded twice — first by `max_body_bytes` (the whole
-> JSON-RPC body), then by `exec.max_args` / `exec.max_arg_len`. A `413` means the **whole request**
-> was too big; an `isError: true` with a "too many arguments" / "argument too long" message means the
-> request was fine but the per-argument limits were exceeded (see
-> [the `execute_command` section](#the-execute_command-tool) below).
+> JSON-RPC body), then by `exec.max_args` / `exec.max_arg_len`. An oversized body means the **whole
+> request** was too big; an `isError: true` with a "too many arguments" / "argument too long" message
+> means the request was fine but the per-argument limits were exceeded (see
+> [the `execute_command` section](#the-execute_command-tool) below). The analogous distinction for
+> `upload_file` (body limit vs `upload.max_file_bytes`) is in
+> [the `upload_file` section](#the-upload_file-tool).
 
 ### A request returns `429 Too Many Requests`
 
@@ -228,8 +258,8 @@ time=… level=WARN msg=RATE fp=- remote=… reason="rate limit exceeded (ip)"
 
 Slow down, or raise `rate_limit` / `rate_burst` in `config.yaml` (see
 [`configuration.md`](configuration.md#networking-and-serve-fields)). This rate limit also applies to
-MCP calls on `/mcp`, including `execute_command` — when the limit is hit the call is rejected with
-`429` **before** any command runs.
+MCP calls on `/mcp`, including `execute_command` and `upload_file` — when the limit is hit the call is
+rejected with `429` **before** any command runs or any file is written.
 
 ### A request returns `403 Forbidden`
 
@@ -273,9 +303,9 @@ curl -k https://127.0.0.1:7822/mcp \
 
 ### A `tools/call` returns a JSON-RPC error instead of running
 
-- **Unknown tool name** (for example a typo like `exec` instead of `execute_command`, or
-  `upload_file`, which is not implemented) → error code `-32602` (`Invalid params`). Only `ping`,
-  `server_info`, and `execute_command` are registered. No command runs. See
+- **Unknown tool name** (for example a typo like `exec` instead of `execute_command`, or `upload`
+  instead of `upload_file`) → error code `-32602` (`Invalid params`). Only `ping`, `server_info`,
+  `execute_command`, and `upload_file` are registered. No command runs and no file is written. See
   [`mcp.md`](mcp.md#behaviour-and-error-handling).
 - **Unknown method** → `-32601`. **Malformed JSON** → `-32700`. **Not a valid JSON-RPC request** →
   `-32600`.
@@ -283,9 +313,10 @@ curl -k https://127.0.0.1:7822/mcp \
 These are JSON-RPC errors returned with HTTP `200`, not transport `4xx`/`501`. After such an error
 the server stays up, and a valid `ping` still returns `pong`.
 
-> Do not confuse a JSON-RPC `-32602` ("unknown tool name") with an `execute_command` **tool result**
-> that has `isError: true`. The former means the tool name was wrong and nothing was dispatched; the
-> latter means `execute_command` *was* called but the command was rejected or could not start (see
+> Do not confuse a JSON-RPC `-32602` ("unknown tool name") with a **tool result** that has
+> `isError: true`. The former means the tool name was wrong and nothing was dispatched; the latter
+> means the tool *was* called but the operation was rejected or could not complete (see the
+> [`execute_command`](#the-execute_command-tool) and [`upload_file`](#the-upload_file-tool) sections
 > below).
 
 ### An MCP client cannot connect even though `curl` works
@@ -392,6 +423,101 @@ What to look for:
 > masking. If you find a secret in the audit log, the client put it in `args` — do not do that. See
 > [the security guide](execute-command-security.md#1-do-not-pass-secrets-in-command-arguments-argv).
 
+## The `upload_file` tool
+
+`upload_file` writes a file to the host inside the upload root. Like `execute_command`, it can fail in
+tool-specific ways. The full contract is in [`mcp.md`](mcp.md#upload_file); the security warnings are
+in [`file-upload-security.md`](file-upload-security.md). This section is for diagnosing a call.
+
+### An upload returns `isError: true`
+
+`isError: true` means the write was **rejected by a control** or **failed mid-write** — no successful
+upload reports `isError`. The cases, the client text, and the matching audit line:
+
+| Symptom (text content) | Cause | Audit |
+|------------------------|-------|-------|
+| `path is outside the upload root` | the `path` escapes the root: a `..`-segment, an absolute path, or an out-of-root symlink | `msg=DENY … reason=traversal` |
+| `file already exists (set overwrite to replace)` | the target exists and `overwrite` is `false` (the default) | `msg=DENY … reason="file already exists"` |
+| `target path is a directory` | the `path` points at an existing directory, not a file | `msg=DENY … reason="target is a directory"` |
+| `file too large: exceeds max_file_bytes` | the **decoded** content is larger than `upload.max_file_bytes` (default 700 KiB) | `msg=DENY … reason="file too large"` |
+| `invalid base64 content` | `content` is not valid standard base64 | `msg=DENY … reason="invalid base64 content"` |
+| `invalid file mode` | `mode` is unparseable, has a bit outside `0777` (setuid/setgid/sticky/higher), or is world-writable | `msg=DENY … reason="invalid file mode"` |
+| `upload as root is forbidden by policy` | `upload.deny_root: true` and the daemon is root | `msg=WARN reason=running-as-root` then `msg=DENY` |
+| `write failed` | an I/O error during the write (for example a full disk) | `msg=FAIL … reason="write failed"` |
+| `validating "arguments": …` | an unknown input field, a wrong type, or a missing required `path`/`content` | none (rejected by the SDK before the handler) |
+
+How to act on each:
+
+- **`path is outside the upload root`.** The `path` must be **relative** and stay inside the root.
+  Drop any leading `/`, remove `..` segments, and do not target a symlink that points outside the
+  root. Missing intermediate sub-directories inside the root are created for you, so a path like
+  `scripts/sub/deploy.sh` is fine even if `scripts/sub` does not exist yet.
+- **`file already exists (set overwrite to replace)`.** A file already exists at that path and
+  `overwrite` defaulted to `false`. To replace it, send `overwrite: true` (the replace is atomic). To
+  keep both, choose a different `path`.
+- **`target path is a directory`.** You pointed `path` at an existing directory. Choose a file path
+  (for example `dir/file.txt`, not `dir`).
+- **`file too large: exceeds max_file_bytes`.** The decoded content is over `upload.max_file_bytes`.
+  This is the **per-file** limit (default 700 KiB). It is distinct from the **transport body limit**:
+  if the **whole request body** is too big you get an HTTP `400`/`413` *before* the tool (no audit
+  line, see [the oversized-body entry](#a-request-returns-413-or-400-for-an-oversized-body-and-nothing-shows-up-in-the-audit-stream))
+  — whereas this `isError: true` deny means the body was fine but the decoded file exceeded the
+  per-file cap. Send a smaller file, or raise `upload.max_file_bytes` (it must stay below the ceiling
+  derived from `max_body_bytes`; see [`configuration.md`](configuration.md#file-upload-upload-fields)).
+- **`invalid base64 content`.** Encode the file as **standard** base64 with padding. A common mistake
+  is sending URL-safe base64 (`-`/`_` instead of `+`/`/`) or stripping the `=` padding.
+- **`invalid file mode`.** Use an octal string with only `0777` permission bits, for example `"0600"`,
+  `"0644"`, `"0700"`, `"0755"`. setuid (`"04000"`), setgid (`"02000"`), sticky (`"01000"`), higher
+  bits (`"010000"`), and world-writable values (`"0666"`, `"0002"`) are rejected. See
+  [the mode policy](file-upload-security.md#4-file-mode-policy--only-0777-permission-bits-default-0600).
+- **`upload as root is forbidden by policy`.** `upload.deny_root: true` is set and the daemon is root.
+  Run `raxd` as a non-root user, or set `upload.deny_root: false` (which downgrades the refusal to a
+  per-call `WARN` — the file is then written as root, which is itself risky).
+- **`write failed`.** A genuine I/O error (often a full disk, or a permission problem on the upload
+  root). Check free space and that the upload root is writable (`0700`, owned by the daemon user). No
+  partial or temp file is left behind. See the next entry.
+- **`validating "arguments": …`.** Remove the unknown field, fix the type, or supply the missing
+  required field. The only accepted fields are `path`, `content`, `overwrite`, `mode`; `path` and
+  `content` are required.
+
+### `error: cannot create upload root directory` / permission denied on the upload root
+
+If `raxd serve` cannot create the upload root at startup, see
+[the startup entry above](#error-cannot-create-upload-root-directory-). If the root exists but a write
+fails at runtime with `write failed`, the upload root is probably not writable by the daemon user.
+Check:
+
+- the upload root exists and is owned by the user running `raxd` (default `<state directory>/uploads`,
+  permissions `0700`);
+- there is free disk space (there is **no** total-size quota — the per-file limit does not stop the
+  disk filling up; see [the security guide](file-upload-security.md#7-residual-risks-out-of-scope-for-this-version));
+- any custom `upload.root` you set is a writable absolute path.
+
+### Reading the `upload_file` audit lines
+
+Every call writes its own audit record to the `stderr` audit stream. To watch only file uploads:
+
+```sh
+raxd serve 2>&1 | grep "tool=upload_file"
+```
+
+What to look for:
+
+- `msg=MCP … result=ok path=<rel> size=<N>` — the file was written. `path=` is the relative path and
+  `size=` is the byte count (plain integer).
+- `msg=DENY … reason=…` — the write was rejected by a control (traversal, exists, is-a-directory,
+  too-large, bad base64, bad mode, `deny_root`); nothing was written.
+- `msg=FAIL … reason="write failed"` — an I/O error during the write; nothing usable was written and
+  the temp file was cleaned up.
+- `msg=WARN … reason=running-as-root` — an extra record written on **every** call when the daemon is
+  root. If you see this, the daemon is running as root and every file is written as root. Fix the
+  deployment (run non-root) or set `upload.deny_root: true`.
+
+> **The destination path is logged; the content is never logged.** The `path=` field shows exactly
+> what the client sent (auto-quoted as a logfmt value). If you find a secret in the audit log, the
+> client put it in `path` — do not do that. The file content never appears in the log. See
+> [the security guide](file-upload-security.md#2-do-not-put-secrets-in-the-destination-path).
+
 ## Key management
 
 ### `error: key store is corrupted or unreadable` (from `key create` / `key delete`)
@@ -427,14 +553,17 @@ Revoke the lost key (`raxd key delete <id>`) and create a new one.
 ### `config.yaml` changes have no effect
 
 Only `raxd serve` reads `config.yaml` today, and it reads the file **at startup**. Restart `serve`
-after editing the file. This includes the `exec.*` keys — changing the allowlist, timeouts, limits,
-or `deny_root` requires a `serve` restart to take effect. The other commands (`version`, `status`,
-the `key` group) do not act on the config values. `raxd config port` is a stub and does not write the
-file — edit `config.yaml` by hand.
+after editing the file. This includes the `exec.*` and `upload.*` keys — changing the allowlist,
+timeouts, limits, the upload root, the size limit, the default mode, or either `deny_root` requires a
+`serve` restart to take effect. The other commands (`version`, `status`, the `key` group) do not act
+on the config values. `raxd config port` is a stub and does not write the file — edit `config.yaml`
+by hand.
 
 > Cross-reference: the dedicated entries for the two config-load failures live under
 > [`raxd serve`](#configuration-load-errors-share-one-generic-hint) above, including the note that an
-> invalid `config.yaml` and an invalid `bind_addr` share one generic hint.
+> invalid `config.yaml` and an invalid `bind_addr` share one generic hint. An invalid
+> `upload.max_file_bytes` / `upload.default_mode` is also a startup failure — its `error:` line names
+> the upload field.
 
 ## Paths and `$HOME`
 
@@ -454,10 +583,11 @@ sure the user running `raxd` has a home directory set.
 
 - [`commands.md`](commands.md) — full command reference, including all `serve` error cases.
 - [`mcp.md`](mcp.md) — MCP integration guide: the `/mcp` endpoint, connection parameters, the
-  `ping` / `server_info` / `execute_command` tools, and audit.
+  `ping` / `server_info` / `execute_command` / `upload_file` tools, and audit.
 - [`execute-command-security.md`](execute-command-security.md) — mandatory security warnings for
   `execute_command`.
+- [`file-upload-security.md`](file-upload-security.md) — mandatory security warnings for `upload_file`.
 - [`configuration.md`](configuration.md) — paths, `keys.db`, the TLS directory, and the
-  `config.yaml` networking and `exec` fields.
+  `config.yaml` networking, `exec`, and `upload` fields.
 - [`development.md`](development.md) — building and testing in Docker.
 </content>

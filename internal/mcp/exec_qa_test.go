@@ -69,7 +69,7 @@ func startMCPServerWithRateLimit(t *testing.T, rateLimit float64, rateBurst int)
 	logger := newTestLogger(auditBuf)
 	auditFn := server.NewAuditFnForTest(logger)
 
-	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg())
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg(), defaultUplCfg(t))
 	if err != nil {
 		t.Fatalf("mcp.NewHandler: %v", err)
 	}
@@ -758,7 +758,7 @@ func TestExecKeystoreCorruptReturns403(t *testing.T) {
 	logger := newTestLogger(auditBuf)
 	auditFn := server.NewAuditFnForTest(logger)
 
-	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg())
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg(), defaultUplCfg(t))
 	if err != nil {
 		t.Fatalf("AC12/SR-27: mcp.NewHandler: %v", err)
 	}

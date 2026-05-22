@@ -10,8 +10,9 @@ All CLI text (usage strings, messages, the banner, errors) is in English.
 
 > Where to run these commands: per the security baseline, `raxd` is built and run **inside Docker
 > only**. This applies in particular to `raxd serve`, which opens a TLS listener and (through the MCP
-> `execute_command` tool) runs commands on the host. Examples below show the command and its output;
-> for how to actually invoke them in a container, see [`development.md`](development.md).
+> `execute_command` and `upload_file` tools) runs commands and writes files on the host. Examples
+> below show the command and its output; for how to actually invoke them in a container, see
+> [`development.md`](development.md).
 
 ## Command tree
 
@@ -34,8 +35,8 @@ raxd
 > **MCP is not a CLI command.** The MCP server is not a separate command — it is hosted by
 > `raxd serve` on the `/mcp` route. To use it, run `raxd serve` and connect an MCP client to
 > `https://127.0.0.1:<port>/mcp`. See [`mcp.md`](mcp.md) and [`raxd serve`](#raxd-serve) below.
-> Command execution is **not** a CLI sub-command either: it is the MCP `execute_command` tool, run by
-> an MCP client over `/mcp`.
+> Command execution and file upload are **not** CLI sub-commands either: they are the MCP
+> `execute_command` and `upload_file` tools, run by an MCP client over `/mcp`.
 
 ## Global behaviour
 
@@ -97,7 +98,7 @@ stay on the terminal because they go to stderr.
 | `key create` validation/store error (e.g. label too long, corrupt store) | `1` |
 | `key delete` with an unknown id, an already-revoked id, or a missing id argument | `1` |
 | `serve` shuts down gracefully (SIGINT / SIGTERM) | `0` |
-| `serve` startup error (port in use, no TLS-dir permission, corrupt cert, corrupt `keys.db`, invalid bind address, invalid `config.yaml`) | `1` |
+| `serve` startup error (port in use, no TLS-dir permission, corrupt cert, corrupt `keys.db`, invalid bind address, invalid `config.yaml`, cannot create upload root) | `1` |
 | Stub command (`config port`) | `1` |
 | `status` cannot determine `$HOME` | non-zero (error) |
 | Unknown command or flag (cobra default) | non-zero |
@@ -204,7 +205,8 @@ an error, and the exit code remains `0`:
 The `keys` line shows the **path** to the key database (`keys.db`). It never prints the contents of
 that file. The `tls` line shows the **path** to the TLS directory (`tls/`), where `raxd serve`
 stores the certificate and private key. `status` never prints TLS contents, the configured port, or
-any other secret — only the state string and the resolved paths.
+any other secret — only the state string and the resolved paths. (The upload root, default
+`<state directory>/uploads`, is created by `raxd serve`, not listed by `status`.)
 
 **Error case — `$HOME` cannot be determined.** If the home directory cannot be resolved, `status`
 prints an error with a hint to stderr and exits with a non-zero code:
@@ -229,8 +231,8 @@ alone prints the group's help.
 > connection against the same `keys.db`. A client presents the full key in the HTTP
 > `Authorization: Bearer <key>` header (see [`raxd serve`](#raxd-serve)). The **same** key
 > authenticates the **MCP server** on the `/mcp` route (see [`mcp.md`](mcp.md)), including the
-> `execute_command` tool. Treat any key that can reach `execute_command` like an SSH private key — it
-> grants remote command execution on the host.
+> `execute_command` and `upload_file` tools. Treat any key that can reach those tools like an SSH
+> private key — it grants remote command execution and file writes on the host.
 
 ### How a key is stored (security model)
 
@@ -409,7 +411,7 @@ not derived from the key body, so it is safe to show in confirmations, errors, a
 > connection against the live `keys.db`, and `Verify` only considers active records. A key that you
 > revoke stops authenticating on its very next request — there is no cache or restart delay. This
 > applies to MCP requests on `/mcp` too: a revoked key gets `401` before any tool runs (so it can no
-> longer run `execute_command`).
+> longer run `execute_command` or `upload_file`).
 
 > **Audit line (stderr).** Like `key create`, a successful `key delete` also writes a single audit
 > record to **stderr** via `charmbracelet/log`, for example
@@ -479,9 +481,9 @@ receives `SIGINT` (Ctrl+C) or `SIGTERM`. It takes **no flags or positional argum
 [`configuration.md`](configuration.md#networking-and-serve-fields)).
 
 > **Run it in Docker.** Like all of `raxd`, `serve` is built and run inside a container only
-> (security baseline §6). It opens a network listener **and** can run commands on the host via the
-> MCP `execute_command` tool, so running it on the host is out of scope. See
-> [`development.md`](development.md).
+> (security baseline §6). It opens a network listener **and** can run commands and write files on the
+> host via the MCP `execute_command` and `upload_file` tools, so running it on the host is out of
+> scope. See [`development.md`](development.md).
 
 ### What `serve` does (scope)
 
@@ -505,36 +507,45 @@ authentication**, and, behind that transport, two working endpoints: a **health 
   an environment variable.
 - **Host / Origin checks, rate limiting, and an audit log** run as part of the same fixed
   middleware chain (described below).
+- **Upload root.** On startup `serve` resolves the upload root for the `upload_file` tool (the
+  configured `upload.root`, or the default `<state directory>/uploads`) and creates it with `0700`
+  permissions. A failure here is a startup error (see below).
 - **Two operations behind authentication:**
   - **Health check** — `GET /healthz` returns `pong`.
   - **MCP server** — the `/mcp` route serves the Model Context Protocol over Streamable HTTP, behind
-    the same authentication, `Host`/`Origin` checks, rate limiting, and audit. It exposes three
-    tools: two read-only (`ping`, `server_info`) and **`execute_command`**, which runs a command on
-    the host (no shell, mandatory timeout, optional allowlist, output/argument limits, controlled
-    `cwd`/environment, per-call audit). See [`mcp.md`](mcp.md) for the full integration guide and
-    [`execute-command-security.md`](execute-command-security.md) for the security warnings.
+    the same authentication, `Host`/`Origin` checks, rate limiting, and audit. It exposes four
+    tools: two read-only (`ping`, `server_info`), **`execute_command`** (runs a command on the host
+    — no shell, mandatory timeout, optional allowlist, output/argument limits, controlled
+    `cwd`/environment, per-call audit), and **`upload_file`** (writes one regular file into the
+    upload root — `os.Root`-confined, size-limited, controlled mode, no-overwrite default, atomic
+    write, per-call audit). See [`mcp.md`](mcp.md) for the full integration guide,
+    [`execute-command-security.md`](execute-command-security.md) and
+    [`file-upload-security.md`](file-upload-security.md) for the security warnings.
 
 Every **other** path still returns `501 Not Implemented`.
 
-> **Command execution lives behind `/mcp`, not behind a separate route.** `execute_command` is an MCP
-> tool, reached by a JSON-RPC `tools/call` on `/mcp` — there is no `/exec` HTTP endpoint and no
-> `raxd exec` CLI sub-command. A request to `/exec` (or any other unimplemented path) still answers
-> `501`.
+> **Command execution and file upload live behind `/mcp`, not behind separate routes.**
+> `execute_command` and `upload_file` are MCP tools, reached by a JSON-RPC `tools/call` on `/mcp` —
+> there is no `/exec` or `/upload` HTTP endpoint and no `raxd exec` / `raxd upload` CLI sub-command. A
+> request to `/exec`, `/upload`, or any other unimplemented path still answers `501`.
 
 **Out of scope for `serve` today (not implemented):**
 
-- File upload.
-- MCP tools beyond `ping` / `server_info` / `execute_command`, and MCP Resources / Prompts.
+- File **download** / host filesystem read / file deletion (`upload_file` is upload-only).
+- MCP tools beyond `ping` / `server_info` / `execute_command` / `upload_file`, and MCP Resources /
+  Prompts.
 - Interactive / PTY command sessions and real-time output streaming (`execute_command` is
   non-interactive and returns output in full after the command finishes).
+- Chunked / streaming / resumable upload of files larger than the body limit (`upload_file` ships one
+  whole file per request).
 - Command sandboxing (cgroups/rlimits/seccomp/namespaces) — isolation relies on a non-root user
   inside a container.
 - mTLS / client certificates.
 - Registering `raxd` as a systemd/launchd service (`serve` is foreground only — there is no
   `--daemon` mode and `raxd` does not install a service).
 
-The catch-all route remains the extension point where file upload will attach; until then any route
-other than `/healthz` and `/mcp` answers `501`.
+The catch-all route remains an extension point for future tools; until then any route other than
+`/healthz` and `/mcp` answers `501`.
 
 ### The request pipeline
 
@@ -555,7 +566,8 @@ TLS 1.3 handshake
 
 The MCP server sits **behind** the entire chain: a request to `/mcp` must pass Host/Origin, auth, and
 rate-limit just like any other, and only then reaches the MCP handler. This applies to
-`execute_command` too — an unauthenticated or rate-limited call never runs a command.
+`execute_command` and `upload_file` too — an unauthenticated or rate-limited call never runs a command
+and never writes a file.
 
 The audit stream records exactly **one** record per request that reaches the audit-aware chain
 (Host/Origin, auth, rate-limit, or the success path), plus — for a `/mcp` tool call — one additional
@@ -573,7 +585,7 @@ response-codes note below).
 | `Host` header not in the host allowlist | `403 Forbidden` |
 | `Origin` header present and not in the origin allowlist | `403 Forbidden` |
 | Per-key or per-IP rate limit exceeded | `429 Too Many Requests` |
-| Request body larger than `max_body_bytes` | `413` (via `http.MaxBytesReader`) |
+| Request body larger than `max_body_bytes` | `413` (via `http.MaxBytesReader`); **but** an oversized `upload_file` body on `/mcp` surfaces as `400` ("failed to read body") from the MCP SDK — see [`mcp.md`](mcp.md#upload_file) |
 | Authenticated `GET /healthz` | `200 OK` (body `pong`) |
 | Authenticated `POST /mcp` (valid JSON-RPC) | `200 OK` (JSON-RPC response) |
 | Authenticated `GET /mcp` (no SSE stream offered) | `405 Method Not Allowed` |
@@ -581,24 +593,26 @@ response-codes note below).
 
 > **MCP protocol errors are JSON-RPC, not HTTP status codes.** Inside an authenticated `POST /mcp`,
 > a malformed body or an unknown tool name is reported as a JSON-RPC error (`-32700` / `-32600` /
-> `-32601` / `-32602`) with HTTP `200`, not as a `4xx`/`501`. An `execute_command` tool error
-> (allowlist deny, missing binary, limits, `deny_root`) is reported as `isError: true` **inside** the
-> JSON-RPC `result`, also with HTTP `200`. See [`mcp.md`](mcp.md#behaviour-and-error-handling).
+> `-32601` / `-32602`) with HTTP `200`, not as a `4xx`/`501`. An `execute_command` or `upload_file`
+> tool error (allowlist deny, missing binary, limits, `deny_root`, traversal, too-large, bad mode) is
+> reported as `isError: true` **inside** the JSON-RPC `result`, also with HTTP `200`. See
+> [`mcp.md`](mcp.md#behaviour-and-error-handling).
 
-> **The `413` from the body limit is not audited.** The body-size limit
+> **The `413`/`400` from the body limit is not audited.** The body-size limit
 > (`bodyLimitMiddleware`) is the **outermost** layer in the chain — it runs before the auth and
-> audit middlewares. When a body exceeds `max_body_bytes`, the `413` is produced by the standard
-> library's `http.MaxBytesReader` and the request never reaches the audit-aware chain, so **no**
-> audit record (no `FAIL` / `DENY` / `RATE` line) is written for it. This is unlike `401`
-> (`FAIL`), `403` (`DENY`), and `429` (`RATE`), which always emit exactly one audit line. In short:
-> a `413` is silent in the audit stream — confirm an oversized request another way (for example by
-> observing the `413` on the client) rather than by grepping the audit log.
+> audit middlewares. When a body exceeds `max_body_bytes`, the rejection is produced by the standard
+> library's `http.MaxBytesReader` (surfacing as `413` on a plain route, or `400` "failed to read
+> body" from the MCP SDK on an oversized `upload_file` request) and the request never reaches the
+> audit-aware chain, so **no** audit record (no `FAIL` / `DENY` / `RATE` line) is written for it. This
+> is unlike `401` (`FAIL`), `403` (`DENY`), and `429` (`RATE`), which always emit exactly one audit
+> line. In short: an oversized body is silent in the audit stream — confirm it another way (for
+> example by observing the response code on the client) rather than by grepping the audit log.
 
 For security, error responses carry an **empty body**: the server does not tell the client *why* a
 request was rejected (whether a key is unknown vs. revoked, for instance). The reason is recorded
-only in the server's own audit stream (below), and — as noted — the `413` case is not even recorded
-there. See [`configuration.md`](configuration.md#networking-and-serve-fields) for the allowlists,
-rate-limit, and body-size settings.
+only in the server's own audit stream (below), and — as noted — the body-limit case is not even
+recorded there. See [`configuration.md`](configuration.md#networking-and-serve-fields) for the
+allowlists, rate-limit, and body-size settings.
 
 ### Startup output
 
@@ -687,24 +701,41 @@ time=<UTC ISO-8601> level=WARN msg=FAIL fp=<fingerprint> remote=<IP:port> tool=e
 time=<UTC ISO-8601> level=WARN msg=WARN fp=<fingerprint> remote=<IP:port> tool=execute_command reason=running-as-root command=<bin> args=[…]
 ```
 
-- `tool` is the tool name (`ping`, `server_info`, or `execute_command`). The `tool=` field appears
-  **only** on `MCP`/`DENY`/`FAIL`/`WARN` records that come from the tool layer; the connection
-  records (`AUTH`/`FAIL`/`DENY`/`RATE`) for transport rejections never carry it.
+For **`upload_file`**, the tool also writes its own record, carrying the destination path and the
+size (the upload-specific fields appear only when `tool=upload_file`):
+
+```
+time=<UTC ISO-8601> level=INFO msg=MCP  fp=<fingerprint> remote=<IP:port> tool=upload_file result=ok path=<rel> size=<n>
+time=<UTC ISO-8601> level=WARN msg=DENY fp=<fingerprint> remote=<IP:port> tool=upload_file reason=<text> [path=<rel>]
+time=<UTC ISO-8601> level=WARN msg=FAIL fp=<fingerprint> remote=<IP:port> tool=upload_file reason=<text> [path=<rel>]
+time=<UTC ISO-8601> level=WARN msg=WARN fp=<fingerprint> remote=<IP:port> tool=upload_file reason=running-as-root… [path=<rel>]
+```
+
+- `tool` is the tool name (`ping`, `server_info`, `execute_command`, or `upload_file`). The `tool=`
+  field appears **only** on `MCP`/`DENY`/`FAIL`/`WARN` records that come from the tool layer; the
+  connection records (`AUTH`/`FAIL`/`DENY`/`RATE`) for transport rejections never carry it.
 - For `execute_command`, a successful call (any exit code, including a timeout) is `msg=MCP
   result=ok`; a rejected call (allowlist, limits, `deny_root`) is `msg=DENY`; a call that could not
   start (missing binary, bad `cwd`) is `msg=FAIL`; and an extra `msg=WARN reason=running-as-root`
   record is written on **every** call when the daemon is root.
+- For `upload_file`, a successful write is `msg=MCP result=ok path= size=`; a control rejection
+  (traversal, exists, is-a-directory, too-large, bad base64, bad mode, `deny_root`) is `msg=DENY`; an
+  I/O failure is `msg=FAIL`; and an extra `msg=WARN reason=running-as-root` record is written on
+  **every** call when the daemon is root. `size=` (a plain integer) appears only on the success
+  record; `path=` is the **relative** path, never an absolute host path.
 - Same `fp` and `remote` as the `AUTH` line for the same request — the key body is never logged.
 
-> **`execute_command` arguments are logged verbatim** (`args=[…]`), with no masking. **Do not put
-> secrets in arguments.** See
-> [`execute-command-security.md`](execute-command-security.md#1-do-not-pass-secrets-in-command-arguments-argv).
+> **`execute_command` arguments and the `upload_file` destination path are logged verbatim**
+> (`args=[…]` / `path=`), with no masking. **Do not put secrets in `args` or in `path`.** (The
+> `upload_file` file **content** is never logged.) See
+> [`execute-command-security.md`](execute-command-security.md#1-do-not-pass-secrets-in-command-arguments-argv)
+> and [`file-upload-security.md`](file-upload-security.md#2-do-not-put-secrets-in-the-destination-path).
 
 So one authenticated `tools/call` produces **two** lines (the `AUTH` connection record and the tool
-record) — or three for `execute_command` when the daemon is root (the extra `WARN`). See
-[`mcp.md`](mcp.md#audit) for the MCP audit details.
+record) — or three when the daemon is root (the extra `WARN`). See [`mcp.md`](mcp.md#audit) for the
+MCP audit details.
 
-> **The body-size `413` has no audit line.** The `413` returned when a request body exceeds
+> **The body-size `413`/`400` has no audit line.** The rejection returned when a request body exceeds
 > `max_body_bytes` is generated by the outermost `http.MaxBytesReader` layer, which sits **before**
 > the audit-aware middlewares. Unlike the `401` / `403` / `429` cases above, it does **not** produce
 > a `FAIL`, `DENY`, or `RATE` record — there is no `msg` value for it. Do not expect an oversized
@@ -716,6 +747,7 @@ Examples:
 time=2026-05-21T14:32:01Z level=INFO msg=AUTH fp=a3f9c1d2e847 remote=127.0.0.1:54312
 time=2026-05-21T14:32:01Z level=INFO msg=MCP  fp=a3f9c1d2e847 remote=127.0.0.1:54312 tool=ping result=ok
 time=2026-05-21T14:32:02Z level=INFO msg=MCP  fp=a3f9c1d2e847 remote=127.0.0.1:54312 tool=execute_command result=ok command=ls args=[-la] exit_code=0 duration=3ms timed_out=false
+time=2026-05-21T14:32:03Z level=INFO msg=MCP  fp=a3f9c1d2e847 remote=127.0.0.1:54312 tool=upload_file result=ok path=notes/hello.txt size=6
 time=2026-05-21T14:32:05Z level=WARN msg=FAIL fp=- remote=127.0.0.1:54401 reason="no authorization header"
 time=2026-05-21T14:32:07Z level=WARN msg=FAIL fp=b7d2a0c19f3e remote=127.0.0.1:54402 reason="authentication failed"
 time=2026-05-21T14:32:09Z level=WARN msg=DENY fp=- remote=127.0.0.1:54403 reason="key store unavailable"
@@ -739,6 +771,9 @@ raxd serve 2>&1 | grep "msg=MCP"
 
 # Watch only command execution:
 raxd serve 2>&1 | grep "tool=execute_command"
+
+# Watch only file uploads:
+raxd serve 2>&1 | grep "tool=upload_file"
 ```
 
 ### Calling the endpoints
@@ -772,7 +807,8 @@ curl -k https://127.0.0.1:7822/mcp \
 > On a successful tool result the `isError` field is **omitted** (the SDK serializes it with
 > `omitempty` and the server does not set it on success), so it does **not** appear in the response
 > above. It is present, set to `true`, only when a tool reports its own error (for example an
-> `execute_command` deny). See [`mcp.md`](mcp.md#behaviour-and-error-handling).
+> `execute_command` deny or an `upload_file` traversal). See
+> [`mcp.md`](mcp.md#behaviour-and-error-handling).
 
 To run a command via the MCP `execute_command` tool (see [`mcp.md`](mcp.md#execute_command) for the
 full contract and the [security guide](execute-command-security.md) first):
@@ -786,9 +822,21 @@ curl -k https://127.0.0.1:7822/mcp \
   -d '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"execute_command","arguments":{"command":"ls","args":["-la"],"timeout_ms":5000}}}'
 ```
 
+To write a file via the MCP `upload_file` tool (see [`mcp.md`](mcp.md#upload_file) for the full
+contract and the [security guide](file-upload-security.md) first; `content` is base64):
+
+```sh
+curl -k https://127.0.0.1:7822/mcp \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
+  -d '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"upload_file","arguments":{"path":"notes/hello.txt","content":"aGVsbG8K"}}}'
+```
+
 - A `GET /mcp` returns `405` (the server is stateless and offers no server→client stream).
-- Any other path (for example `/exec`) still returns `501` with the body `not implemented` — command
-  execution is the MCP tool above, not a `/exec` route.
+- Any other path (for example `/exec` or `/upload`) still returns `501` with the body `not
+  implemented` — command execution and file upload are the MCP tools above, not separate routes.
 
 ### Graceful shutdown
 
@@ -819,12 +867,12 @@ with code `1`.
 > **No startup block on a failed start.** The startup block (`cert` / `key` / `tls` /
 > `listening …` / `press Ctrl+C`) is printed **only after the TCP listener is successfully bound**,
 > via an `OnListen` hook in `internal/server`. If the start fails for any reason — port already in
-> use, no permission to create the TLS directory, a corrupt certificate, a corrupt `keys.db`, or a
-> bad `config.yaml` — `serve` prints **only** the `error:` / `hint:` lines to stderr and exits `1`.
-> Neither the startup block nor the shutdown block appears, so there is never a misleading
-> `listening …` line for a server that did not start. This behaviour matches the cert/permission
-> errors too: they are detected before the bind, so the startup block is never reached. See
-> [`troubleshooting.md`](troubleshooting.md#raxd-serve) for the per-error details.
+> use, no permission to create the TLS directory or the upload root, a corrupt certificate, a corrupt
+> `keys.db`, or a bad `config.yaml` — `serve` prints **only** the `error:` / `hint:` lines to stderr
+> and exits `1`. Neither the startup block nor the shutdown block appears, so there is never a
+> misleading `listening …` line for a server that did not start. This behaviour matches the
+> cert/permission errors too: they are detected before the bind, so the startup block is never
+> reached. See [`troubleshooting.md`](troubleshooting.md#raxd-serve) for the per-error details.
 
 Port already in use:
 
@@ -841,6 +889,13 @@ Cannot create the TLS directory (no write permission):
 ```
 error: cannot create TLS directory: permission denied
   hint: check that the current user has write access to ~/.local/state/raxd/
+```
+
+Cannot create the upload root (no write permission). The upload root is created before the listener
+binds, so this is a startup failure:
+
+```
+error: cannot create upload root directory: permission denied
 ```
 
 Certificate generation failed (disk full / no write permission):
@@ -865,11 +920,12 @@ error: key store is corrupted or unreadable
   hint: do not attempt to repair the file manually — contact support if data recovery is needed
 ```
 
-**Configuration load failure (invalid bind address *or* invalid `config.yaml`).** Both kinds of
-config-load failure are handled by a **single** error path in `serve`, and that path prints **one
-generic hint** that references `bind_addr` / `config.yaml`. The `error:` line still reports what
-actually went wrong (it carries the underlying message from `config.Load`), but the `hint:` line is
-**not specialised per cause** — it always points you at the bind address in `config.yaml`.
+**Configuration load failure (invalid bind address, invalid `config.yaml`, or invalid `upload.*`).**
+The bind-address and YAML-syntax failures are handled by a **single** error path in `serve`, and that
+path prints **one generic hint** that references `bind_addr` / `config.yaml`. An invalid
+`upload.max_file_bytes` or `upload.default_mode` is also a config-load failure; the `error:` line
+names the upload field. The `error:` line always reports what actually went wrong (it carries the
+underlying message from `config.Load`), but the `hint:` line is **not specialised per cause**.
 
 For an invalid bind address the pair reads naturally, because the cause and the hint line up:
 
@@ -894,23 +950,28 @@ In this YAML case the `bind_addr` reference is incidental: the actionable part i
 ### Security summary for `serve`
 
 - TLS 1.3 is mandatory; TLS 1.2 and lower are rejected at the handshake.
-- The private TLS key is `0600`; the certificate `0644`; the TLS directory `0700`.
+- The private TLS key is `0600`; the certificate `0644`; the TLS directory `0700`; the upload root
+  `0700`.
 - An existing certificate is reused and never silently overwritten.
 - The default bind address is `127.0.0.1` (loopback only).
 - Every connection is authenticated before any handler runs — including `/mcp` and therefore
-  `execute_command`; the key is taken only from the `Authorization: Bearer` header, never from argv
-  or the environment.
+  `execute_command` and `upload_file`; the key is taken only from the `Authorization: Bearer` header,
+  never from argv or the environment.
 - Rejections return an empty body; the reason lives only in the audit stream (except the body-limit
-  `413`, which is not audited at all).
+  `413`/`400`, which is not audited at all).
 - The audit stream logs the fingerprint, never the key body or the raw `Authorization` header.
-  `execute_command` records also carry the command and arguments **verbatim** (no secrets in argv).
-- Rate limiting applies per-key and per-IP, including to `execute_command`.
+  `execute_command` records also carry the command and arguments **verbatim**, and `upload_file`
+  records carry the destination **path** (never the file content) — no secrets in argv or in path.
+- Rate limiting applies per-key and per-IP, including to `execute_command` and `upload_file`.
 - The operations behind authentication are the health check and the MCP server (`ping`,
-  `server_info`, `execute_command`); everything else is `501`.
+  `server_info`, `execute_command`, `upload_file`); everything else is `501`.
 - `execute_command` runs commands without a shell, with a mandatory timeout, an optional allowlist,
-  output/argument limits, and a controlled `cwd`/environment. It does **not** elevate privileges (it
-  inherits the daemon's UID/GID); run `raxd` as a non-root user. See
-  [`execute-command-security.md`](execute-command-security.md).
+  output/argument limits, and a controlled `cwd`/environment. `upload_file` writes a single regular
+  file confined to the upload root (`os.Root`), size-limited, with a controlled mode (no
+  setuid/setgid/sticky/world-writable). Neither tool elevates privileges (they inherit the daemon's
+  UID/GID); run `raxd` as a non-root user. See
+  [`execute-command-security.md`](execute-command-security.md) and
+  [`file-upload-security.md`](file-upload-security.md).
 
 ---
 
@@ -958,17 +1019,18 @@ error: config port: not implemented yet
 | `raxd key create` | stdout (key) + stderr (decor) | yes | validation / store error | working |
 | `raxd key list` | stdout | yes (incl. empty store) | — | working |
 | `raxd key delete` | stderr | yes | not found / already revoked / missing id | working |
-| `raxd serve` | stderr | graceful shutdown | startup error (port/cert/db/bind/config) | working |
+| `raxd serve` | stderr | graceful shutdown | startup error (port/cert/db/bind/config/upload-root) | working |
 | `raxd config port` | stderr | — | yes | stub |
 
 > Not a CLI command: the **MCP server** is hosted by `raxd serve` on `/mcp`, exposing `ping`,
-> `server_info`, and `execute_command` — see [`mcp.md`](mcp.md). Command execution is the MCP
-> `execute_command` tool, not a CLI sub-command.
+> `server_info`, `execute_command`, and `upload_file` — see [`mcp.md`](mcp.md). Command execution and
+> file upload are the MCP `execute_command` / `upload_file` tools, not CLI sub-commands.
 
-See also: [`mcp.md`](mcp.md) for the MCP integration guide (including `execute_command`);
-[`execute-command-security.md`](execute-command-security.md) for the command-execution security
-warnings; [`configuration.md`](configuration.md) for paths, `keys.db`, `config.yaml`, the
-networking/`serve` fields, and the `exec` fields; [`development.md`](development.md) for building and
-testing in Docker; [`troubleshooting.md`](troubleshooting.md) for common `serve` and
-`execute_command` problems.
+See also: [`mcp.md`](mcp.md) for the MCP integration guide (including `execute_command` and
+`upload_file`); [`execute-command-security.md`](execute-command-security.md) and
+[`file-upload-security.md`](file-upload-security.md) for the command-execution and file-upload
+security warnings; [`configuration.md`](configuration.md) for paths, `keys.db`, `config.yaml`, the
+networking/`serve` fields, and the `exec` / `upload` fields; [`development.md`](development.md) for
+building and testing in Docker; [`troubleshooting.md`](troubleshooting.md) for common `serve`,
+`execute_command`, and `upload_file` problems.
 </content>

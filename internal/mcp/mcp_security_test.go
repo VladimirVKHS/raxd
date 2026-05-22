@@ -388,8 +388,9 @@ func TestToolsListSchemas(t *testing.T) {
 	if _, present := toolMap["execute_command"]; !present {
 		t.Errorf("AC1/command-exec: execute_command must be in tools/list after command-exec task")
 	}
-	if _, bad := toolMap["upload_file"]; bad {
-		t.Errorf("AC13/SR-37: upload_file must NOT be in tools/list")
+	// upload_file IS now registered (file-upload task; AC1/SR-68).
+	if _, present := toolMap["upload_file"]; !present {
+		t.Errorf("AC1/file-upload: upload_file must be in tools/list after file-upload task")
 	}
 }
 
@@ -503,7 +504,7 @@ func TestInvalidJSONReturnsParseError(t *testing.T) {
 // ============================================================================
 
 // TestUnknownToolNotExecuted verifies AC7/SR-37:
-//   execute_command is not registered → JSON-RPC error code -32601 or -32602.
+//   truly unknown tools return JSON-RPC error code -32601 or -32602.
 //   Server alive after error.
 func TestUnknownToolNotExecuted(t *testing.T) {
 	baseURL, keyStr, client, _ := startMCPServer(t)
@@ -515,8 +516,9 @@ func TestUnknownToolNotExecuted(t *testing.T) {
 	}), nil)
 	readBody(t, initResp)
 
+	// Use a genuinely unknown tool name (not any registered tool).
 	resp := postMCP(t, client, baseURL, keyStr, jsonrpcBody(5, "tools/call", map[string]interface{}{
-		"name": "upload_file", "arguments": map[string]interface{}{},
+		"name": "nonexistent_tool_xyz", "arguments": map[string]interface{}{},
 	}), map[string]string{"MCP-Protocol-Version": "2025-11-25"})
 	body := readBody(t, resp)
 
@@ -646,7 +648,7 @@ func TestMCPKeystoreCorruptReturns403(t *testing.T) {
 	auditBuf := &bytes.Buffer{}
 	logger := newTestLogger(auditBuf)
 	auditFn := server.NewAuditFnForTest(logger)
-	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg())
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg(), defaultUplCfg(t))
 	if err != nil {
 		t.Fatalf("SR-27/ErrCorrupt: mcp.NewHandler: %v", err)
 	}
@@ -859,7 +861,7 @@ func startMCPServerWithTLSKey(t *testing.T) (baseURL, keyStr string, client *htt
 	auditBuf = &bytes.Buffer{}
 	logger := newTestLogger(auditBuf)
 	auditFn := server.NewAuditFnForTest(logger)
-	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg())
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg(), defaultUplCfg(t))
 	if err != nil {
 		t.Fatalf("mcp.NewHandler: %v", err)
 	}
