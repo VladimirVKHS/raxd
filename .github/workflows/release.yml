@@ -124,6 +124,7 @@ jobs:
           gh release create "${{ needs.build-release.outputs.version }}" \
             dist/raxd_*.tar.gz \
             dist/SHA256SUMS \
+            install.sh \
             --title "raxd ${{ needs.build-release.outputs.version }}" \
             --notes "## Установка
 
