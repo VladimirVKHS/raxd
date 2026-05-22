@@ -24,14 +24,18 @@ the rest of the server. There is one listener, one port, one certificate, one se
 | MCP protocol version | `2025-11-25` |
 | SDK | official Go MCP SDK (`github.com/modelcontextprotocol/go-sdk/mcp`) |
 | Session mode | stateless — no `MCP-Session-Id` is issued, no server→client SSE |
-| Tools | `ping`, `server_info` (read-only), **`execute_command`** (runs a command on the host) |
+| Tools | `ping`, `server_info` (read-only), **`execute_command`** (runs a command on the host), **`upload_file`** (writes a file on the host) |
 | Authentication | inherited from the transport (`Authorization: Bearer rax_live_…`) |
 
-> **`execute_command` is dangerous.** Unlike `ping` and `server_info`, the third tool actually runs a
-> binary on the host on behalf of an authenticated client — remote code execution of the SSH class.
-> Read the [`execute_command` security guide](execute-command-security.md) before enabling it against
-> any real host, and note in particular that command **arguments are logged verbatim** (do not pass
-> secrets in `args` — see [§ secrets in arguments](execute-command-security.md#1-do-not-pass-secrets-in-command-arguments-argv)).
+> **`execute_command` and `upload_file` are dangerous.** Unlike `ping` and `server_info`, these two
+> tools change the host on behalf of an authenticated client: `execute_command` runs a binary (remote
+> code execution of the SSH class), and `upload_file` writes a file into the host's filesystem. Read the
+> [`execute_command` security guide](execute-command-security.md) and the
+> [`upload_file` security guide](file-upload-security.md) before enabling either against a real host. In
+> particular: for `execute_command`, command **arguments are logged verbatim** (do not pass secrets in
+> `args` — see [§ secrets in arguments](execute-command-security.md#1-do-not-pass-secrets-in-command-arguments-argv));
+> for `upload_file`, the destination **path is logged** (do not put secrets in `path` — see
+> [§ secrets in the path](file-upload-security.md#2-do-not-put-secrets-in-the-destination-path)).
 
 Before the MCP server existed, `/mcp` returned `501 Not Implemented` like every other non-health route.
 That is **no longer true**: a POST to `/mcp` with a valid key now gets a real JSON-RPC response. The
@@ -88,9 +92,8 @@ client that verifies certificates will reject it by default. You have two option
 
 ## Tools
 
-`tools/list` returns **three** tools: `ping`, `server_info` (both read-only, no input), and
-`execute_command` (runs a command on the host). There is no `upload_file` and no file transfer (see
-[Scope and limitations](#scope-and-limitations)).
+`tools/list` returns **four** tools: `ping`, `server_info` (both read-only, no input),
+`execute_command` (runs a command on the host), and `upload_file` (writes a file on the host).
 
 ### `ping`
 
@@ -379,6 +382,240 @@ curl -k https://127.0.0.1:<port>/mcp \
 
 (The exact text comes from the SDK; the point is `isError: true` and "nothing ran".)
 
+### `upload_file`
+
+- **Description:** write **one regular file** to the `raxd` host inside a configured **upload root**. The
+  path is **relative** to the upload root; the write can only land **inside** the root — any attempt to
+  escape via `..`, an absolute path, or an out-of-root symlink is rejected. The content is sent as
+  base64. By default an existing file is **not** overwritten. The created file's mode is controlled
+  (default `0600`; setuid/setgid/sticky and world-writable bits are forbidden). The tool creates only a
+  regular file, never elevates privileges, and never changes ownership. It returns the written relative
+  path, the size, an overwrite flag, and the final mode.
+
+> **Read the [security guide](file-upload-security.md) first.** This tool is a deliberate "dangerous
+> primitive": a network write into the host's filesystem. The safety controls below (root confinement
+> via `os.Root`, size limit, mode policy, no-overwrite default, atomic write, root detection, audit) are
+> enforced **on the server**, not in the schema. The warnings you must not skip: **do not put secrets in
+> the `path`** (it is logged), and **do not place a bind-mount inside the upload root** (`os.Root` does
+> not block mount points).
+
+#### What it does
+
+The handler decodes `content` from base64 and then writes the bytes through Go's `os.Root`, opened on
+the configured upload root (`os.OpenRoot(uploadRoot)`). Every filesystem operation — directory
+creation, the existence check, the temp-file create, the rename — goes through `os.Root` methods on the
+**relative** path, so the write is confined to the root. Missing intermediate sub-directories inside the
+root are created automatically (`0700`). The write is **atomic**: the bytes go into a temp file (a
+`crypto/rand` name, created with `O_CREATE|O_EXCL`) in the same directory, the mode is applied with
+`chmod` on the file descriptor **before** writing, the data is synced, and the temp file is renamed onto
+the target. On any error before the rename, the temp file is removed — no partial target and no stray
+temp file is left behind. Every call is authenticated by the transport before it runs and is recorded in
+the audit stream.
+
+The file is created under the daemon's UID/GID as-is. The tool does **not** `chown`/`setuid`/`sudo` and
+creates **only** a regular file (never a symlink, hard link, FIFO, or device).
+
+#### Input — `UploadInput`
+
+The input schema is **strict**: unknown input fields are rejected, the call failing validation with
+`isError: true` **before** anything is written. This strictness is **not** a hand-written JSON Schema
+property — the SDK derives a strict schema (no additional properties) by inference from the typed
+handler (`ToolHandlerFor[UploadInput, UploadOutput]`), so any field other than the four below is
+refused. There is **no absolute-path field and no owner/uid/gid field** — by construction the tool
+accepts only a relative path and never changes ownership.
+
+| Field | Type | Required | Meaning |
+|-------|------|----------|---------|
+| `path` | string | **yes** | relative destination path inside the upload root (for example `scripts/deploy.sh`). An absolute path, a `..`-escape, or an out-of-root symlink is **rejected**. Missing intermediate sub-directories inside the root are created automatically. **The path is logged to the audit stream — do not put a secret in it** |
+| `content` | string | **yes** | the file content as **base64** (standard encoding, with padding). Invalid base64 is rejected. The decoded size must be ≤ `upload.max_file_bytes` (default 700 KiB) |
+| `overwrite` | boolean | no | allow replacing an existing file. Omitted → `false`. With `false` and an existing target, the write is rejected and the existing file is left unchanged. With `true`, the file is replaced atomically |
+| `mode` | string | no | the created file's permissions as an octal string (for example `"0600"`). Omitted → the server's `upload.default_mode` (default `0600`). Only permission bits in the `0777` mask are allowed; any bit outside `0777` (setuid `04000`, setgid `02000`, sticky `01000`, or higher), and the world-writable bit (`0002`), are **rejected** |
+
+#### Output — `UploadOutput`
+
+A successful write returns **structured content** with **exactly four** fields, plus a short
+human-readable text summary. The result is **not** an error in this case (`isError` is absent or
+`false`).[^iserror]
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `path` | string | the written **relative** path inside the upload root, as accepted by the server. The **absolute** host path is **never** returned |
+| `size` | integer | the number of bytes written (the decoded content size), as a plain integer |
+| `overwritten` | boolean | `true` if an existing file was replaced (`overwrite: true`) |
+| `mode` | string | the actual mode of the created file, as an octal string (for example `"0600"`) |
+
+The text summary block has the form `path=<rel> size=<N>B overwritten=<bool> mode=<oct>` — for example
+`path=scripts/deploy.sh size=8B overwritten=false mode=0700`. **The `B` suffix (`size=8B`) appears only
+in this human-readable text block**; in `structuredContent.size` and in the audit log the size is a
+plain integer (`8`). The full result is in `structuredContent`.
+
+> **No content and no absolute path are returned.** The result carries only the four fields above. The
+> file content is never echoed back, and the absolute host path is never exposed — only the relative
+> path you sent (as accepted/cleaned by the server).
+
+#### Behaviour and error mapping
+
+The same three layers as `execute_command`:
+
+- **Transport rejections (HTTP status, before the tool runs).** No/invalid/revoked key → `401`; corrupt
+  key store → `403`; bad `Host`/`Origin` → `403`; rate limit exceeded → `429`; `GET /mcp` → `405`. The
+  file is **not** written; see [Authentication](#authentication). The body-size limit also lives here —
+  see the size-limit note below.
+- **Protocol errors (JSON-RPC, HTTP 200).** Malformed body → `-32700`; not a valid JSON-RPC request →
+  `-32600`; unknown method → `-32601`; **unknown tool name** in `tools/call` (for example `upload`
+  instead of `upload_file`) → `-32602` (`Invalid params`). The file is **not** written.
+- **Tool results.** Once the SDK dispatches to the tool, the outcome is in the `result`:
+
+| Situation | Result | Audit |
+|-----------|--------|-------|
+| **Successful write/replace** | **not an error** — `isError` absent/false; `structuredContent` has `path/size/overwritten/mode` | `MCP … result=ok path= size=` |
+| Extra/unknown input field, wrong type, or a missing required `path`/`content` | `isError: true` (input validation, by the SDK, before the handler) | none (handler not reached) |
+| `path` traversal — `..`-escape, absolute path, or out-of-root symlink | `isError: true`, message `path is outside the upload root`; **not** written | `DENY … reason=traversal` |
+| Target exists and `overwrite: false` | `isError: true`, message `file already exists (set overwrite to replace)`; existing file unchanged | `DENY … reason="file already exists"` |
+| Target path is an existing **directory** | `isError: true`, message `target path is a directory`; directory unchanged | `DENY … reason="target is a directory"` |
+| Decoded size over `upload.max_file_bytes` | `isError: true`, message `file too large: exceeds max_file_bytes`; **not** written | `DENY … reason="file too large"` |
+| Invalid base64 `content` | `isError: true`, message `invalid base64 content`; **not** written | `DENY … reason="invalid base64 content"` |
+| Invalid `mode` (unparseable, or any bit outside `0777`, or world-writable) | `isError: true`, message `invalid file mode`; **not** written | `DENY … reason="invalid file mode"` |
+| `upload.deny_root: true` and the daemon is root | `isError: true`, `upload as root is forbidden by policy`; **not** written | `WARN reason=running-as-root` then `DENY` |
+| `deny_root: false` and the daemon is root | **not an error** — the file **is** written | `WARN reason=running-as-root` then the primary record |
+| I/O error during the write (for example a full disk) | `isError: true`, message `write failed`; the temp file is cleaned up | `FAIL … reason="write failed"` |
+
+The key idea for an agent: `isError: true` means the write was rejected by a control (traversal, exists,
+is-a-directory, too-large, bad base64, bad mode, `deny_root`) **or** failed mid-write (I/O). The
+messages are neutral by design — they never leak an absolute host path or internal detail. After any
+rejected or failed call the server stays up: the next valid call still works.
+
+> **Size limit vs the transport body limit (a real caveat, read this).** The content travels as base64
+> inside the JSON-RPC request body, so it first passes the **transport** body-size limit
+> (`max_body_bytes`, default 1 MiB) **before** the tool sees it. There are two distinct cases, and they
+> produce **different** results:
+>
+> 1. **The whole request body exceeds `max_body_bytes`.** This is caught by the outermost body-size
+>    limiter (`http.MaxBytesReader`), **before** the MCP layer. The client gets an **HTTP 4xx** and the
+>    file is **not** written. **Note:** in this build the status is actually **`400` ("failed to read
+>    body")** produced by the Go MCP SDK on the truncated `MaxBytesReader`, **not `413`** — the project's
+>    spec/mcp-spec mention `413`, but the SDK returns `400` here. This is a documentation caveat, **not**
+>    a security defect: the security contract holds (the body is rejected before the handler and **no
+>    file is created**, confirmed by test). Because this is a transport-level rejection, it writes **no**
+>    audit line (just like the `413`/`max_body_bytes` case for any other request).
+> 2. **The body fits within `max_body_bytes`, but the *decoded* content exceeds `upload.max_file_bytes`.**
+>    This reaches the handler, which denies it: `isError: true` with `file too large: exceeds
+>    max_file_bytes`, a `DENY` audit record, and **no file written**.
+>
+> The default `upload.max_file_bytes` (700 KiB) is deliberately set **below** the body-limit ceiling, so
+> files near the `max_file_bytes` limit are denied by the tool (case 2, with a clear message), not cut
+> off by the transport (case 1). Uploading files larger than this ceiling is out of scope for this
+> version (it would need a chunked/streaming channel).
+
+#### curl examples
+
+Run these from inside the container running `raxd serve`, with `KEY` set to a key from
+`raxd key create` and `<port>` set to your port (default `7822`). `-k` skips certificate verification
+for this local test. The `result` / `error` shapes match what the Go MCP SDK produces.
+
+**Success — a new file is written with mode `0600`.** Here `content` is `aGVsbG8K`, the standard base64
+of the six bytes `hello\n` — encode your own content the same way (for example
+`printf 'hello\n' | base64`):
+
+```sh
+curl -k https://127.0.0.1:<port>/mcp \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
+  -d '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"upload_file","arguments":{"path":"notes/hello.txt","content":"aGVsbG8K"}}}'
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 20,
+  "result": {
+    "content": [
+      { "type": "text", "text": "path=notes/hello.txt size=6B overwritten=false mode=0600" }
+    ],
+    "structuredContent": {
+      "path": "notes/hello.txt",
+      "size": 6,
+      "overwritten": false,
+      "mode": "0600"
+    }
+  }
+}
+```
+
+(`isError` is omitted on success — see the note below. `mode` is `0600` because no `mode` was given and
+the default is `0600`. The `B` suffix is only in the text block; `structuredContent.size` is the plain
+integer `6`.)
+
+**Traversal — denied.** A `..`-escape (or an absolute path, or an out-of-root symlink) is rejected; no
+file is written outside the root:
+
+```sh
+curl -k https://127.0.0.1:<port>/mcp \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
+  -d '{"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"upload_file","arguments":{"path":"../etc/passwd","content":"eA=="}}}'
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 21,
+  "result": {
+    "content": [ { "type": "text", "text": "path is outside the upload root" } ],
+    "isError": true
+  }
+}
+```
+
+(The same applies to `"/etc/passwd"`, `"a/../../b"`, and a symlink that points outside the root.)
+
+**Too large — denied.** The decoded content exceeds `upload.max_file_bytes`; no file is written. (Send a
+base64 string whose decoded length is above the limit; the result is:)
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 22,
+  "result": {
+    "content": [ { "type": "text", "text": "file too large: exceeds max_file_bytes" } ],
+    "isError": true
+  }
+}
+```
+
+(This is case 2 from the size-limit note above. If instead the **whole request body** exceeds
+`max_body_bytes`, you get a transport **`400`** before the tool — see that note.)
+
+**Invalid mode (setuid) — denied.** Any bit outside the `0777` mask — here setuid `04000` — is rejected;
+no file is written:
+
+```sh
+curl -k https://127.0.0.1:<port>/mcp \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
+  -d '{"jsonrpc":"2.0","id":23,"method":"tools/call","params":{"name":"upload_file","arguments":{"path":"tool","content":"eA==","mode":"04000"}}}'
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 23,
+  "result": {
+    "content": [ { "type": "text", "text": "invalid file mode" } ],
+    "isError": true
+  }
+}
+```
+
+(The same denial applies to `"02000"` (setgid), `"01000"` (sticky), `"010000"`, and world-writable
+values such as `"0666"` / `"0002"`.)
+
 [^iserror]: The `isError` field is serialized with `omitempty`, so for a successful tool result (where
 the server does not set it) it is **absent** from the JSON. It appears, set to `true`, only when a
 tool reports its own error. See [Behaviour and error handling](#behaviour-and-error-handling).
@@ -386,8 +623,8 @@ tool reports its own error. See [Behaviour and error handling](#behaviour-and-er
 ## Authentication
 
 Authentication is **inherited from the transport** and happens **before** any MCP processing. The MCP
-layer has no authentication of its own. This applies to `execute_command` exactly as to `ping` — an
-unauthenticated call never runs a command.
+layer has no authentication of its own. This applies to `execute_command` and `upload_file` exactly as
+to `ping` — an unauthenticated call never runs a command and never writes a file.
 
 - The transport's auth middleware reads `Authorization: Bearer rax_live_…`, verifies it against
   `keys.db` (constant-time), and only then lets the request reach `/mcp`. The MCP layer never sees the
@@ -406,11 +643,13 @@ the same HTTP status:
 | `Host` not in the host allowlist | `403 Forbidden` | No |
 | `Origin` present and not in the origin allowlist | `403 Forbidden` | No |
 | Per-key or per-IP rate limit exceeded | `429 Too Many Requests` | No |
+| Request body over `max_body_bytes` | `400` ("failed to read body"; see the `upload_file` size note) | No |
 
-When the transport rejects a request (`401`/`403`/`429`), **no tool runs** — the request never reaches
-the SDK dispatcher, so no command is executed. The reason is recorded in the audit stream, not in the
-response body (rejection bodies are empty by design). For the full transport reference, see
-[`commands.md`](commands.md#raxd-serve), and the allowlist/rate-limit settings in
+When the transport rejects a request (`401`/`403`/`429`/`400`), **no tool runs** — the request never
+reaches the SDK dispatcher, so no command is executed and no file is written. The reason for
+`401`/`403`/`429` is recorded in the audit stream, not in the response body (rejection bodies are empty
+by design); the `400` body-limit rejection writes **no** audit line. For the full transport reference,
+see [`commands.md`](commands.md#raxd-serve), and the allowlist/rate-limit settings in
 [`configuration.md`](configuration.md#networking-and-serve-fields).
 
 > **`Origin` for browser-based clients.** A request with **no** `Origin` header (the normal case for
@@ -430,16 +669,16 @@ Once a request passes the transport gates and reaches `/mcp`, the SDK handles th
 | Malformed JSON in the body | JSON-RPC error `-32700` (Parse error) |
 | Valid JSON but not a valid JSON-RPC request | JSON-RPC error `-32600` (Invalid Request) |
 | Unknown method | JSON-RPC error `-32601` (Method not found) |
-| Unknown tool name in `tools/call` (a typo, e.g. `exec`) / bad params | JSON-RPC error `-32602` (Invalid params) |
+| Unknown tool name in `tools/call` (a typo, e.g. `exec` or `upload`) / bad params | JSON-RPC error `-32602` (Invalid params) |
 | A tool's own input-validation error (e.g. an extra field) | `isError: true` inside the `result` (a *tool* error, not a protocol error) |
-| A tool's own execution error (e.g. `execute_command` deny / not found) | `isError: true` inside the `result` |
+| A tool's own execution error (e.g. `execute_command` deny, or `upload_file` traversal) | `isError: true` inside the `result` |
 
 Two points worth stressing:
 
-- **An unknown tool name is never executed.** Only `ping`, `server_info`, and `execute_command` are
-  registered. Calling any other name (for example a typo, or `upload_file`, which is not implemented)
-  returns a JSON-RPC error and runs nothing. After such an error the server stays up, and a valid
-  `ping` still returns `pong`.
+- **An unknown tool name is never executed.** Only `ping`, `server_info`, `execute_command`, and
+  `upload_file` are registered. Calling any other name (for example a typo, or `exec`/`upload`) returns
+  a JSON-RPC error and runs nothing. After such an error the server stays up, and a valid `ping` still
+  returns `pong`.
 - **`/mcp` never returns `501`.** The old `501` stub on `/mcp` is gone. Every MCP request gets either
   a correct JSON-RPC response or a correct JSON-RPC error.
 
@@ -507,7 +746,8 @@ curl -k https://127.0.0.1:<port>/mcp \
 }
 ```
 
-For `execute_command`, see the [examples above](#curl-examples).
+For `execute_command`, see the [examples above](#curl-examples); for `upload_file`, see
+[its curl examples](#curl-examples-1).
 
 > On a successful tool result the `isError` field is **omitted** (it is serialized with `omitempty`
 > and the server does not set it), which is why it does not appear in the responses above. It shows up,
@@ -564,9 +804,9 @@ time=<UTC> level=INFO msg=MCP fp=<fingerprint> remote=<IP:port> tool=<name> resu
 
 ### `execute_command` audit records
 
-`execute_command` writes its **own** audit record (it is the one tool that owns its audit path, so that
-the record can carry the command, arguments, exit code, and duration). It writes **exactly one** primary
-record per call, in one of these forms — plus an extra `WARN` record when the daemon is root:
+`execute_command` writes its **own** audit record (it is one of two tools that own their audit path, so
+that the record can carry the command, arguments, exit code, and duration). It writes **exactly one**
+primary record per call, in one of these forms — plus an extra `WARN` record when the daemon is root:
 
 | `msg` | level | When | Extra fields |
 |-------|-------|------|--------------|
@@ -612,6 +852,62 @@ field ever contains the key body, the raw `Authorization` header, the stored has
 private TLS key. For the non-MCP audit lines (`AUTH`/`FAIL`/`DENY`/`RATE`), see
 [`commands.md`](commands.md#audit-stream).
 
+### `upload_file` audit records
+
+`upload_file` is the **second** tool that owns its audit path, so that the record can carry the
+destination path and the size. It writes **exactly one** primary record per call, in one of these forms
+— plus an extra `WARN` record when the daemon is root:
+
+| `msg` | level | When | Extra fields |
+|-------|-------|------|--------------|
+| `MCP` | `INFO` | the file was written or replaced | `tool=upload_file result=ok path=<rel> size=<N>` |
+| `DENY` | `WARN` | traversal, existing file (no overwrite), target is a directory, too-large, invalid base64, invalid mode, or `deny_root` — **nothing written** | `tool=upload_file reason=<text>` (and `path=<rel>` when known) |
+| `FAIL` | `WARN` | an I/O error during the write — the write started but failed; temp cleaned up | `tool=upload_file reason=<text>` (and `path=<rel>` when known) |
+| `WARN` | `WARN` | extra record on **every** call when the daemon is root | `tool=upload_file reason=running-as-root…` (`[path=<rel>]` only if the path is already known — see the note below) |
+
+Notes:
+
+- **The root `WARN` record carries no `path=`.** The root check runs at the very start of the call,
+  **before** the path is parsed/validated, so the daemon emits the `WARN` record with an empty path —
+  in practice the root `WARN` line has **no** `path=` field. When `upload.deny_root: true`, the `WARN`
+  record is followed by a **separate** `DENY` record, and that `DENY` record **does** carry `path=<rel>`.
+- The upload fields (`path=`, `size=`) appear **only** when `tool=upload_file`. The `ping`/`server_info`
+  `MCP` records, the `execute_command` records, and the connection records (`AUTH`/`FAIL`/`DENY`/`RATE`)
+  are unchanged.
+- `path=` is the **relative** path inside the upload root — **never** an absolute host path. (`path=` is
+  logged only when it is already known, hence it is shown as optional on the `DENY`/`FAIL`/`WARN` rows.)
+- `size=` appears **only** on the success (`MCP`) record (a plain integer, no `B` suffix). On
+  `DENY`/`FAIL` nothing was written, so `size=` is absent.
+- The `result=ok` key appears **only** on the success (`MCP`) record. `DENY`/`FAIL`/`WARN` carry the
+  label in `msg=` and the text in `reason=` — they do **not** carry a `result=` key.
+- **The destination path is logged** (as a logfmt value, auto-quoted/escaped). **Do not put a secret in
+  `path`.** The file **content** is **never** logged. See the
+  [security guide](file-upload-security.md#2-do-not-put-secrets-in-the-destination-path).
+
+Example, with the transport `AUTH` line that precedes the MCP record on the same request:
+
+```
+time=2026-05-21T14:40:01Z level=INFO msg=AUTH fp=a3f9c1d2e847 remote=127.0.0.1:54501
+time=2026-05-21T14:40:01Z level=INFO msg=MCP  fp=a3f9c1d2e847 remote=127.0.0.1:54501 tool=upload_file result=ok path=notes/hello.txt size=6
+```
+
+A denied traversal call:
+
+```
+time=2026-05-21T14:40:05Z level=WARN msg=DENY fp=a3f9c1d2e847 remote=127.0.0.1:54510 tool=upload_file reason=traversal path=../etc/passwd
+```
+
+A root daemon (extra `WARN` record before the primary record; note the `WARN` line has **no** `path=`):
+
+```
+time=2026-05-21T14:40:09Z level=WARN msg=WARN fp=a3f9c1d2e847 remote=127.0.0.1:54520 tool=upload_file reason="running-as-root: raxd writing files as root (euid==0); ensure raxd runs as non-root"
+time=2026-05-21T14:40:09Z level=INFO msg=MCP  fp=a3f9c1d2e847 remote=127.0.0.1:54520 tool=upload_file result=ok path=notes/hello.txt size=6
+```
+
+(When `upload.deny_root: true` and the daemon is root, the order is the `WARN` record then a `DENY`
+record — `reason="upload as root is forbidden by policy…"`, carrying `path=<rel>` — and no file is
+written.)
+
 ## Scope and limitations
 
 What this build does **and does not** include:
@@ -627,32 +923,49 @@ What this build does **and does not** include:
     server-side whitelist.
   - **No sandboxing.** No cgroups/rlimits/seccomp/namespaces — isolation relies on running the daemon
     as a non-root user inside a container.
-- **`upload_file` / file transfer** — not implemented. (Planned in the `file-upload` task.)
+- **`upload_file`** — **implemented.** An authenticated client can write **one regular file** into a
+  configured upload root (relative path, base64 content), confined by `os.Root`, with a per-file size
+  limit, a controlled file mode (no setuid/setgid/sticky/world-writable; default `0600`), a
+  no-overwrite default, an atomic write, root detection, and a per-call audit record that never logs the
+  content. See the [tool reference above](#upload_file) and the
+  [security guide](file-upload-security.md). What it does **not** do, by design for this version:
+  - **Upload only.** No `download_file`, no host filesystem read, and no file deletion.
+  - **One whole file per request.** No chunked/streaming/resumable upload; the file ships in one request
+    body, bounded by `max_body_bytes` (see the size-limit note above).
+  - **No directories, archives, or special files.** It creates a single regular file — never a
+    directory, a symlink/hard link, a FIFO, or a device.
+  - **No ownership change and no privilege escalation.** No `chown`/`setuid`/`sudo`; the file inherits
+    the daemon's UID/GID.
+  - **No total-size / disk quota and no content inspection.** A per-file limit exists; the total bytes
+    written are not capped, and there is no antivirus/content-type check.
 - **MCP Resources and Prompts** — not advertised and not implemented. `initialize` advertises **only**
   the `tools` capability.
 - **mTLS / client certificates** — out of scope. Authentication is by API key only.
 - **Sessions / server→client streaming** — the server is stateless; `GET /mcp` returns `405`.
 
 `ping` and `server_info` remain intentionally minimal: they prove the protocol, transport,
-authentication, and audit work end to end. `execute_command` is registered at the **same** extension
-point, behind the **same** authentication, rate limiting, and audit, without changing the route or the
-transport.
+authentication, and audit work end to end. `execute_command` and `upload_file` are registered at the
+**same** extension point, behind the **same** authentication, rate limiting, and audit, without changing
+the route or the transport.
 
 > **Run it in Docker.** Like all of `raxd`, `serve` (and therefore the MCP server) is built and run
-> inside a container only (security baseline §6). It opens a network listener and runs commands on the
-> host, so running it on the host is out of scope.
+> inside a container only (security baseline §6). It opens a network listener, runs commands on the
+> host, and writes files to the host, so running it on the host is out of scope.
 
 ## Related documents
 
 - [`execute-command-security.md`](execute-command-security.md) — **mandatory** security warnings for
   `execute_command` (secrets in argv, allowlist semantics, `deny_root`/root, isolation, residual risks).
+- [`file-upload-security.md`](file-upload-security.md) — **mandatory** security warnings for
+  `upload_file` (mount points in the upload root, secrets in the path, `deny_root`/root, the mode policy,
+  no disk quota, residual risks).
 - [`commands.md`](commands.md#raxd-serve) — the `serve` command, the request pipeline, response codes,
   the audit stream, and startup/shutdown output.
-- [`configuration.md`](configuration.md#command-execution-exec-fields) — the `exec.*` settings (allowlist,
-  timeouts, limits, working directory, environment whitelist, `deny_root`) that `execute_command` reads
-  from `config.yaml`, plus the networking/`serve` fields.
-- [`troubleshooting.md`](troubleshooting.md) — common `serve`, TLS, key, connection, and
-  `execute_command` problems.
+- [`configuration.md`](configuration.md#command-execution-exec-fields) — the `exec.*` settings that
+  `execute_command` reads, the [`upload.*` settings](configuration.md#file-upload-upload-fields) that
+  `upload_file` reads, and the networking/`serve` fields.
+- [`troubleshooting.md`](troubleshooting.md) — common `serve`, TLS, key, connection, `execute_command`,
+  and `upload_file` problems.
 - [`development.md`](development.md) — building and testing in Docker.
 
 ## Author

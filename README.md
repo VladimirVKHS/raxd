@@ -7,12 +7,12 @@ agents, all at once.
 > **Project status: early.** The command tree, configuration/path resolution, build metadata, a
 > product banner, a reproducible Docker dev/test environment, **API key management**
 > (`key create` / `key list` / `key delete`), the **TLS network server** (`raxd serve`), the first
-> **MCP server** (the `ping` and `server_info` tools), and **command execution over MCP** (the
-> `execute_command` tool on the `/mcp` route) are in place and working. The server provides a TLS 1.3
-> transport with per-connection API-key authentication, rate limiting, and an audit log; the MCP
-> endpoint runs behind that same transport. The features that still run *behind* authentication —
-> file upload, registering `raxd` as a system service, and `curl | sh` installation — are **not
-> implemented yet**; see [Coming next](#coming-next).
+> **MCP server** (the `ping` and `server_info` tools), **command execution over MCP** (the
+> `execute_command` tool), and **file upload over MCP** (the `upload_file` tool) — all on the `/mcp`
+> route — are in place and working. The server provides a TLS 1.3 transport with per-connection
+> API-key authentication, rate limiting, and an audit log; the MCP endpoint runs behind that same
+> transport. The features that still run *behind* authentication — registering `raxd` as a system
+> service, and `curl | sh` installation — are **not implemented yet**; see [Coming next](#coming-next).
 
 Author: **Vladimir Kovalev, OEM TECH**.
 
@@ -33,9 +33,9 @@ Target platforms: **macOS and Linux**, architectures **amd64 and arm64**. Window
 At this stage the binary provides a stable command tree, the local foundation (API keys stored
 securely on disk), and the networked core: `raxd serve` opens a TLS 1.3 listener, authenticates every
 connection against those keys, and serves an MCP endpoint on `/mcp` with two read-only tools (`ping`,
-`server_info`) and the security-critical `execute_command` tool, which runs a command on the host. The
-remaining heavy work — file upload — is left for a later task and will attach to the same extension
-point.
+`server_info`), the security-critical `execute_command` tool (runs a command on the host), and the
+`upload_file` tool (writes a file on the host). Both `execute_command` and `upload_file` are
+registered at the same extension point, behind the same authentication, rate limiting, and audit.
 
 ## What works today
 
@@ -55,15 +55,17 @@ point.
 | Authenticated health check (`GET /healthz` → `pong`) | **Working** |
 | **MCP server** on `/mcp` (Streamable HTTP, protocol `2025-11-25`) with `ping` + `server_info` tools | **Working** |
 | **MCP `execute_command`** — run a command on the host (no shell, timeout, optional allowlist, limits, audit) | **Working** |
-| MCP audit (one line per tool call; for `execute_command`: command, args, exit code, duration) | **Working** |
+| **MCP `upload_file`** — write a file on the host (`os.Root`-confined, size limit, controlled mode, no-overwrite default, atomic, audit) | **Working** |
+| MCP audit (one line per tool call; for `execute_command`: command, args, exit code, duration; for `upload_file`: path, size) | **Working** |
 | `raxd --help` and the full command tree | **Working** |
 | Product banner with author (printed to stderr) | **Working** |
 | XDG-based config/state path resolution (`~/.config/raxd`, `XDG_*` overrides) | **Working** |
 | Directory creation with `0700` permissions | **Working** |
-| `config.yaml` loading via viper (networking and `exec` fields read by `serve`) | **Working** |
-| File upload | **Not implemented** |
-| MCP tools beyond `ping` / `server_info` / `execute_command`; MCP Resources / Prompts | **Not implemented** |
+| `config.yaml` loading via viper (networking, `exec`, and `upload` fields read by `serve`) | **Working** |
+| File **download** / host filesystem read / file deletion over MCP | **Not implemented** |
+| MCP tools beyond `ping` / `server_info` / `execute_command` / `upload_file`; MCP Resources / Prompts | **Not implemented** |
 | Interactive / PTY command sessions and real-time output streaming | **Not implemented** |
+| Chunked / streaming / resumable upload of large files | **Not implemented** (`upload_file` ships one whole file per request) |
 | Command sandboxing (cgroups/rlimits/seccomp/namespaces) | **Not implemented** (isolation via non-root + container) |
 | mTLS / client certificates | **Not implemented** (API-key auth only) |
 | `raxd config port` | **Stub** (`not implemented yet`) |
@@ -71,16 +73,18 @@ point.
 | Running as a registered system service (systemd/launchd) | **Not implemented** (`serve` is foreground only) |
 
 Behind authentication, the working routes today are the health check (`GET /healthz`) and the MCP
-server (`/mcp`, with `ping`, `server_info`, and `execute_command`). Every other route returns
-`501 Not Implemented`. Everything in the [Coming next](#coming-next) section is **not implemented
-yet**.
+server (`/mcp`, with `ping`, `server_info`, `execute_command`, and `upload_file`). Every other route
+returns `501 Not Implemented`. Everything in the [Coming next](#coming-next) section is **not
+implemented yet**.
 
-> **`execute_command` is dangerous.** It runs an arbitrary binary on the host on behalf of an
-> authenticated client — remote code execution of the SSH class. Read the
-> [`execute_command` security guide](docs/execute-command-security.md) before enabling it against a
-> real host. The allowlist is **off by default** (any command is allowed), command arguments are
-> **logged verbatim** (do not pass secrets in `args`), and you should run `raxd` as a **non-root**
-> user inside a container.
+> **`execute_command` and `upload_file` are dangerous.** `execute_command` runs an arbitrary binary
+> on the host on behalf of an authenticated client — remote code execution of the SSH class.
+> `upload_file` writes a file into the host's filesystem. Read the
+> [`execute_command` security guide](docs/execute-command-security.md) and the
+> [`upload_file` security guide](docs/file-upload-security.md) before enabling either against a real
+> host. The allowlist is **off by default** (any command is allowed), command arguments and the upload
+> destination path are **logged verbatim** (do not pass secrets in `args` or in `path`), and you
+> should run `raxd` as a **non-root** user inside a container.
 
 ## Requirements
 
@@ -138,8 +142,8 @@ raxd
 
 A full reference with usage strings, exit codes, and output examples is in
 [`docs/commands.md`](docs/commands.md). The MCP server is not a CLI command — it is hosted by
-`raxd serve` on the `/mcp` route; see [`docs/mcp.md`](docs/mcp.md). Command execution is **not** a CLI
-sub-command either — it is the MCP `execute_command` tool.
+`raxd serve` on the `/mcp` route; see [`docs/mcp.md`](docs/mcp.md). Command execution and file upload
+are **not** CLI sub-commands either — they are the MCP `execute_command` and `upload_file` tools.
 
 ### Example: API keys
 
@@ -221,8 +225,9 @@ response codes, and configuration fields, see [`docs/commands.md`](docs/commands
 [`docs/configuration.md`](docs/configuration.md#networking-and-serve-fields).
 
 > **Scope:** `serve` today provides the secure transport, authentication, the health check, and the
-> MCP server (`ping` / `server_info` / `execute_command`). File upload is not implemented (every route
-> other than `/healthz` and `/mcp` returns `501`). `serve` is foreground only and does **not** register
+> MCP server (`ping` / `server_info` / `execute_command` / `upload_file`). On startup it also creates
+> the upload root (default `~/.local/state/raxd/uploads`, `0700`) for `upload_file`. Every route
+> other than `/healthz` and `/mcp` returns `501`. `serve` is foreground only and does **not** register
 > itself as a system service.
 
 ### Example: connecting to the MCP server
@@ -245,11 +250,12 @@ curl -k https://127.0.0.1:7822/mcp \
 > above. It shows up, set to `true`, only when a tool reports its own error. See
 > [`docs/mcp.md`](docs/mcp.md#behaviour-and-error-handling).
 
-The server speaks Streamable HTTP, MCP protocol `2025-11-25`, and exposes three tools: `ping` (returns
-`pong`), `server_info` (returns `{name, version, protocolVersion}`, no secrets), and `execute_command`
-(runs a command on the host). Use the official Go MCP SDK on the server side. For connection
-parameters, the full smoke-test, MCP client config, the self-signed-TLS caveat, the audit format, and
-the `execute_command` contract, see [`docs/mcp.md`](docs/mcp.md).
+The server speaks Streamable HTTP, MCP protocol `2025-11-25`, and exposes four tools: `ping` (returns
+`pong`), `server_info` (returns `{name, version, protocolVersion}`, no secrets), `execute_command`
+(runs a command on the host), and `upload_file` (writes a file on the host). Use the official Go MCP
+SDK on the server side. For connection parameters, the full smoke-test, MCP client config, the
+self-signed-TLS caveat, the audit format, and the `execute_command` / `upload_file` contracts, see
+[`docs/mcp.md`](docs/mcp.md).
 
 ### Example: running a command over MCP
 
@@ -277,6 +283,35 @@ see [`docs/mcp.md`](docs/mcp.md#execute_command).
 > secrets in `args`); the allowlist match is **exact** (`ls` ≠ `/bin/ls`); and you should run `raxd`
 > as a **non-root** user in a container. The `exec.*` settings are documented in
 > [`docs/configuration.md`](docs/configuration.md#command-execution-exec-fields).
+
+### Example: uploading a file over MCP
+
+`upload_file` writes one regular file into the upload root, given a relative `path` and base64
+`content`. The write is confined to the upload root (no `..`-escape, no absolute path, no out-of-root
+symlink), size-limited, with a controlled file mode (default `0600`), atomic, and not overwriting an
+existing file unless `overwrite: true`. Call it as a JSON-RPC `tools/call` on `/mcp`:
+
+```sh
+curl -k https://127.0.0.1:7822/mcp \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
+  -d '{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"upload_file","arguments":{"path":"notes/hello.txt","content":"aGVsbG8K"}}}'
+```
+
+A successful write returns `path`, `size`, `overwritten`, and `mode` (no absolute path, no content);
+a rejected write (traversal, an existing file without `overwrite`, too-large, bad base64, a forbidden
+mode) comes back with `isError: true`. For the full response shapes and error mapping, see
+[`docs/mcp.md`](docs/mcp.md#upload_file).
+
+> **Before you enable this against a real host:** read the
+> [`upload_file` security guide](docs/file-upload-security.md). Key points: keep the upload root a
+> dedicated directory **free of bind-mounts** (`os.Root` does not block mount points); the destination
+> **path is logged** (do not put secrets in `path` — the content is never logged); setuid/setgid/sticky
+> and world-writable file modes are **forbidden**; and you should run `raxd` as a **non-root** user.
+> The `upload.*` settings are documented in
+> [`docs/configuration.md`](docs/configuration.md#file-upload-upload-fields).
 
 ### Example: `raxd version`
 
@@ -339,23 +374,27 @@ config path on both Linux and macOS:
 | State directory | `~/.local/state/raxd` | `$XDG_STATE_HOME/raxd` |
 | Keys database | `~/.local/state/raxd/keys.db` | follows state directory |
 | TLS directory | `~/.local/state/raxd/tls` | follows state directory |
+| Upload root (default) | `~/.local/state/raxd/uploads` | follows state directory (or `upload.root`) |
 
 Directories are created with `0700` permissions when `raxd` runs. The `keys.db` file is created with
 `0600` permissions the first time you run `key create`. The TLS certificate (`cert.pem`, `0644`) and
 private key (`key.pem`, `0600`) are created in the TLS directory the first time you run `raxd serve`,
-and reused afterward. Full details, including the networking fields and the `exec` fields that `serve`
-reads from `config.yaml`, are in [`docs/configuration.md`](docs/configuration.md).
+and reused afterward. The upload root is created with `0700` on `raxd serve`. Full details, including
+the networking fields and the `exec` / `upload` fields that `serve` reads from `config.yaml`, are in
+[`docs/configuration.md`](docs/configuration.md).
 
 ## Coming next
 
 The following capabilities are **planned and not implemented yet**. They are listed so you know what
 the binary is being built toward; do not treat them as available today.
 
-- **File upload** — transferring files over the authenticated connection (file-upload task).
-- **More MCP tools and resources** — the MCP server today exposes `ping`, `server_info`, and
-  `execute_command`; the file-upload task will add a file tool to the same `/mcp` endpoint behind the
-  same authentication, and MCP Resources / Prompts may follow. `initialize` currently advertises the
-  `tools` capability only.
+- **File download / read / delete** — `upload_file` is upload-only; reading or deleting host files
+  over MCP is a separate task.
+- **More MCP tools and resources** — the MCP server today exposes `ping`, `server_info`,
+  `execute_command`, and `upload_file`; further tools and MCP Resources / Prompts may follow.
+  `initialize` currently advertises the `tools` capability only.
+- **Chunked / streaming upload** — `upload_file` ships one whole file per request, bounded by
+  `max_body_bytes`; uploading larger files would need a chunked/streaming channel.
 - **Command sandboxing** — cgroups/rlimits/seccomp/namespaces for `execute_command`. Today isolation
   relies on running `raxd` as a non-root user inside a container; the tool already kills the whole
   process tree on timeout, caps output, and limits argument count/length.
@@ -374,15 +413,18 @@ the binary is being built toward; do not treat them as available today.
 - [`docs/commands.md`](docs/commands.md) — full command reference (`version`, `status`, the `key`
   group, `serve`, and the `config port` stub).
 - [`docs/mcp.md`](docs/mcp.md) — MCP integration guide: the `/mcp` endpoint, connection parameters,
-  the `ping` / `server_info` / `execute_command` tools, authentication, the curl smoke-test, MCP
-  client config, and audit.
+  the `ping` / `server_info` / `execute_command` / `upload_file` tools, authentication, the curl
+  smoke-test, MCP client config, and audit.
 - [`docs/execute-command-security.md`](docs/execute-command-security.md) — mandatory security warnings
   for `execute_command` (secrets in arguments, allowlist semantics, `deny_root`/root, isolation,
   residual risks).
+- [`docs/file-upload-security.md`](docs/file-upload-security.md) — mandatory security warnings for
+  `upload_file` (mount points in the upload root, secrets in the path, `deny_root`/root, the mode
+  policy, no disk quota, residual risks).
 - [`docs/configuration.md`](docs/configuration.md) — paths, `keys.db`, the TLS directory, and the
-  `config.yaml` networking and `exec` fields.
+  `config.yaml` networking, `exec`, and `upload` fields.
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — common problems with `serve`, the TLS
-  certificate, keys, the config file, and `execute_command`.
+  certificate, keys, the config file, `execute_command`, and `upload_file`.
 - [`docs/development.md`](docs/development.md) — building and testing in Docker, project layout, and
   build metadata.
 

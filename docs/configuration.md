@@ -18,9 +18,12 @@ identically.
 | State directory | `~/.local/state/raxd` | `$XDG_STATE_HOME/raxd` if `XDG_STATE_HOME` is set, otherwise `$HOME/.local/state/raxd` |
 | Keys database | `~/.local/state/raxd/keys.db` | `<state directory>/keys.db` |
 | TLS directory | `~/.local/state/raxd/tls` | `<state directory>/tls` |
+| Upload root (default) | `~/.local/state/raxd/uploads` | `<state directory>/uploads` (used when `upload.root` is empty — see [the `upload` fields](#file-upload-upload-fields)) |
 
 These paths come from `internal/config.PathSet`, resolved by `config.Paths()`. You can see the
-resolved values at any time with [`raxd status`](commands.md#raxd-status).
+resolved values at any time with [`raxd status`](commands.md#raxd-status). (`raxd status` shows the
+config, keys, and TLS paths; the upload root is created by `raxd serve` from the state directory and is
+not listed by `status`.)
 
 > Path resolution is implemented explicitly in the standard library (reading `XDG_CONFIG_HOME` /
 > `XDG_STATE_HOME` and falling back to `$HOME`). The `adrg/xdg` library is intentionally **not**
@@ -36,7 +39,7 @@ is always appended.
 # Config goes to /custom/config/raxd/config.yaml
 export XDG_CONFIG_HOME=/custom/config
 
-# State (keys.db, tls/) goes under /custom/state/raxd/
+# State (keys.db, tls/, uploads/) goes under /custom/state/raxd/
 export XDG_STATE_HOME=/custom/state
 ```
 
@@ -48,7 +51,9 @@ When a variable is empty or unset, the corresponding default (`$HOME/.config` or
 When `raxd` runs, it ensures the config directory, the state directory, and the TLS directory exist.
 They are created with **`0700`** permissions (owner-only access). The permissions are set
 explicitly and do not depend on the process `umask`. Creating directories that already exist is
-safe and does not widen their permissions (the operation is idempotent).
+safe and does not widen their permissions (the operation is idempotent). `raxd serve` additionally
+creates the **upload root** (default `<state directory>/uploads`) with `0700` permissions on startup
+(see [the `upload` fields](#file-upload-upload-fields)).
 
 The only condition under which path resolution fails is when the home directory cannot be
 determined (`$HOME` is not set). In that case commands that need the paths (such as `status`)
@@ -196,7 +201,7 @@ max_body_bytes:   1048576   # 1 MiB
 | `write_timeout` | duration | `30s` | Maximum time to write the response |
 | `idle_timeout` | duration | `120s` | Maximum idle time for a keep-alive connection |
 | `max_header_bytes` | integer | `1048576` (1 MiB) | Maximum size of request headers |
-| `max_body_bytes` | integer | `1048576` (1 MiB) | Maximum size of the request body (enforced via `http.MaxBytesReader`; exceeding it yields `413`) |
+| `max_body_bytes` | integer | `1048576` (1 MiB) | Maximum size of the request body (enforced via `http.MaxBytesReader`; exceeding it rejects the request before any tool runs — see the note below). Also caps the `upload_file` body and constrains `upload.max_file_bytes` |
 
 Notes on the values:
 
@@ -213,6 +218,11 @@ Notes on the values:
   uses only the host part (any port is stripped).
 - **Rate-limiter cleanup** is not configurable: idle per-key/per-IP limiters are garbage-collected
   after a fixed 10-minute TTL.
+- **`max_body_bytes` and the body-limit rejection.** A request body larger than `max_body_bytes` is
+  rejected by the outermost limiter (`http.MaxBytesReader`) **before** auth and audit, so it writes
+  **no** audit line. For an oversized `upload_file` body this surfaces (in this build) as an HTTP
+  `400` from the MCP SDK ("failed to read body"), **not** a `413` — see
+  [`mcp.md`](mcp.md#upload_file) for that caveat and [`troubleshooting.md`](troubleshooting.md#a-request-returns-413-and-nothing-shows-up-in-the-audit-stream).
 
 ### Command execution (`exec`) fields
 
@@ -298,26 +308,126 @@ Notes on the values, with the security implications spelled out:
 For the tool's input/output contract, error mapping, and curl examples, see
 [`mcp.md`](mcp.md#execute_command).
 
+### File upload (`upload`) fields
+
+The `upload` section configures the MCP **`upload_file`** tool — the capability that writes a file
+into the host's filesystem. These keys are read by `raxd serve` at startup and supplied to the tool.
+Every key has a safe built-in default, so an absent `config.yaml` (or one that omits the `upload`
+section) runs with the defaults below.
+
+> **Read the [`upload_file` security guide](file-upload-security.md) before changing these.** Keep the
+> upload root a dedicated directory free of bind-mounts, run `raxd` as a non-root user, and remember
+> that `max_file_bytes` is constrained by `max_body_bytes`.
+
+A full `upload` section with the default values:
+
+```yaml
+# ~/.config/raxd/config.yaml (upload section)
+
+upload:
+  # Upload root: the directory writes are confined to (via os.Root).
+  # Empty = use the safe default <state directory>/uploads (created with 0700).
+  # A relative path is NOT recommended; use an absolute path or leave empty.
+  root: ""
+
+  # Maximum DECODED size of a single uploaded file, in bytes.
+  # Default 716800 = 700 KiB. Must be > 0 and <= the ceiling derived from
+  # max_body_bytes (see the validation note below), or serve fails at startup.
+  max_file_bytes: 716800
+
+  # Default file mode (octal string) used when the client omits `mode`.
+  # Only 0777 permission bits are allowed; setuid/setgid/sticky and
+  # world-writable (0002) are forbidden and rejected at startup.
+  default_mode: "0600"
+
+  # Default overwrite policy. false = an existing target is NOT overwritten
+  # unless the client explicitly sends overwrite:true.
+  overwrite_default: false
+
+  # Root policy: false = WARN only (the file is still written as root);
+  # true = refuse to write when euid==0. Separate from exec.deny_root.
+  deny_root: false
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `upload.root` | string | `""` → `<state directory>/uploads` | The directory all writes are confined to (via `os.Root`). When empty, `serve` resolves the **safe default** `<state directory>/uploads` (by default `~/.local/state/raxd/uploads`) and creates it with `0700`. A relative `path` from a client is always taken **relative to this root** |
+| `upload.max_file_bytes` | integer | `716800` (700 KiB) | Maximum **decoded** size of a single uploaded file. Exceeding it is denied (`isError: true`); the file is not written. Validated at startup against `max_body_bytes` — see the note below |
+| `upload.default_mode` | string | `"0600"` | File mode used when the client omits `mode`. Octal string. Validated at startup against the mode policy (only `0777` bits; no setuid/setgid/sticky; no world-writable) |
+| `upload.overwrite_default` | boolean | `false` | The default overwrite policy. The `overwrite` field defaults to `false`, so an existing target is preserved unless the client sends `overwrite: true` |
+| `upload.deny_root` | boolean | `false` | `false` = when the daemon runs as root, log a `WARN` on every call but write the file anyway; `true` = refuse to write when the daemon is root (`isError: true`, `DENY` audit). **Separate** from `exec.deny_root` |
+
+Startup validation (a misconfiguration fails `serve` at startup with exit `1`, before the listener
+binds):
+
+- **`max_file_bytes` is bounded by `max_body_bytes`.** It must be `> 0` and `<= floor((max_body_bytes
+  − 1024) × 3/4)`. The ceiling accounts for base64 inflation (≈ +33%) plus a 1024-byte reserve for the
+  JSON-RPC/base64 overhead. With the default `max_body_bytes` of 1 MiB the ceiling is roughly 785 KiB,
+  so the default `max_file_bytes` of 700 KiB sits safely below it. A value of `0`, a negative value, or
+  one above the ceiling is rejected:
+
+  ```
+  upload.max_file_bytes=… is invalid: must be > 0 and ≤ … (derived from max_body_bytes=…; SR-76)
+  ```
+
+  Setting `max_file_bytes` near or above the ceiling would mean files at the top of the range are cut
+  off by the transport body limit (an HTTP `400`, see [`mcp.md`](mcp.md#upload_file)) before the tool
+  sees them — keeping it below the ceiling makes the tool itself return a clean "file too large" deny.
+- **`default_mode` must pass the mode policy.** It must be a parseable octal string with **only**
+  `0777` permission bits — no setuid (`04000`), setgid (`02000`), sticky (`01000`), any higher bit, or
+  world-writable (`0002`). An invalid value is rejected:
+
+  ```
+  upload.default_mode="…" is invalid: …
+  ```
+
+Notes on the values, with the security implications spelled out:
+
+- **The upload root is confined by `os.Root`.** Writes cannot escape the root via `..`, an absolute
+  client path, or an out-of-root symlink — those are denied. The one limitation is that `os.Root` does
+  **not** block **mount points**: do **not** place a bind-mount inside the upload root. See
+  [the security guide](file-upload-security.md#1-do-not-place-a-bind-mount-or-external-filesystem-inside-the-upload-root).
+- **The default root is safe.** When `upload.root` is empty, `serve` uses `<state directory>/uploads`
+  (created `0700`) — never `/`, `/root`, or a root home directory.
+- **The mode policy blocks privilege/integrity bits.** setuid/setgid/sticky and world-writable are
+  rejected for both `default_mode` and a client-supplied `mode`. The created file inherits the daemon's
+  UID/GID; the tool never `chown`s or elevates. See
+  [the security guide](file-upload-security.md#4-file-mode-policy--only-0777-permission-bits-default-0600).
+- **The destination path is logged.** The relative path is written to the audit log (the file
+  **content** is never logged). **Do not put secrets in `path`.** See
+  [the security guide](file-upload-security.md#2-do-not-put-secrets-in-the-destination-path).
+- **No total-size / disk quota.** There is a per-file limit but no cap on the total bytes written.
+  Mitigate with a filesystem/container quota on the upload root.
+- **No environment variable overrides.** Like the `exec` section, the `upload` keys are read **only**
+  from `config.yaml`; there is no env-var override.
+
+For the tool's input/output contract, error mapping, and curl examples, see
+[`mcp.md`](mcp.md#upload_file).
+
 ### General behaviour
 
-- **Missing file is not an error.** If `config.yaml` does not exist, every default above (networking
-  and `exec`) is applied. `raxd status` shows the file path with the suffix
+- **Missing file is not an error.** If `config.yaml` does not exist, every default above (networking,
+  `exec`, and `upload`) is applied. `raxd status` shows the file path with the suffix
   `(not found, defaults applied)` and exits with code `0`.
 - **Malformed YAML is an error.** If the file exists but is not valid YAML, the config loader
   returns an explicit error (`config file is not valid YAML`). For `raxd serve` this is a startup
   error (exit `1`).
+- **Invalid `upload` values fail at startup.** An out-of-range `upload.max_file_bytes` or an invalid
+  `upload.default_mode` makes `serve` exit `1` with the messages shown above.
 - **`config port` does not write the file yet.** `raxd config port <PORT>` is still a stub. To
-  change the port (or any other field, including `exec.*`) today, edit `config.yaml` directly; `raxd
-  serve` reads it on the next start.
+  change the port (or any other field, including `exec.*` / `upload.*`) today, edit `config.yaml`
+  directly; `raxd serve` reads it on the next start.
 
 ## Related documents
 
 - [`commands.md`](commands.md) — full command reference, including `raxd status`, `raxd key`, and
   `raxd serve`.
-- [`mcp.md`](mcp.md) — the MCP integration guide, including the `execute_command` tool reference.
+- [`mcp.md`](mcp.md) — the MCP integration guide, including the `execute_command` and `upload_file`
+  tool references.
 - [`execute-command-security.md`](execute-command-security.md) — mandatory security warnings for
   `execute_command`.
+- [`file-upload-security.md`](file-upload-security.md) — mandatory security warnings for `upload_file`.
 - [`troubleshooting.md`](troubleshooting.md) — common problems with `serve`, the TLS certificate,
-  the config file, and `execute_command`.
+  the config file, `execute_command`, and `upload_file`.
 - [`development.md`](development.md) — building and testing in Docker.
 </content>
