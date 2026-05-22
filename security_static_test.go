@@ -75,11 +75,17 @@ func grepFiles(t *testing.T, files []string, pattern string) []string {
 // Security requirement: "ни одна команда/заглушка каркаса не вызывает exec.Command/sh -c/os/exec"
 // baseline §3. Единственное исключение: internal/cmdexec (spec.md command-exec AC2).
 func TestStaticNoExecCommand(t *testing.T) {
-	// Collect all production (non-test) sources EXCEPT the authorized cmdexec package.
+	// Collect all production (non-test) sources EXCEPT the authorized packages for exec usage.
+	// internal/cmdexec: authorized for user command execution (command-exec task).
+	// internal/service: authorized for OS service manager calls (systemctl/launchctl/useradd),
+	//   as specified in plan.md §Modules exec.go (service-install task, SR-91).
 	var files []string
 	for _, f := range append(goSourceFiles(t, "internal"), goSourceFiles(t, "cmd")...) {
-		// internal/cmdexec is the single authorized package for os/exec usage.
-		if strings.Contains(filepath.ToSlash(f), "internal/cmdexec") {
+		fSlash := filepath.ToSlash(f)
+		if strings.Contains(fSlash, "internal/cmdexec") {
+			continue
+		}
+		if strings.Contains(fSlash, "internal/service") {
 			continue
 		}
 		files = append(files, f)
