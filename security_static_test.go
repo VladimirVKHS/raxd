@@ -69,14 +69,21 @@ func grepFiles(t *testing.T, files []string, pattern string) []string {
 }
 
 // TestStaticNoExecCommand verifies that no production source file in internal/
-// or cmd/ imports or calls exec.Command / os/exec.
+// or cmd/ imports or calls exec.Command / os/exec — EXCEPT internal/cmdexec,
+// which is the single authorized package for subprocess execution (command-exec task).
+//
 // Security requirement: "ни одна команда/заглушка каркаса не вызывает exec.Command/sh -c/os/exec"
-// baseline §3.
+// baseline §3. Единственное исключение: internal/cmdexec (spec.md command-exec AC2).
 func TestStaticNoExecCommand(t *testing.T) {
-	files := append(
-		goSourceFiles(t, "internal"),
-		goSourceFiles(t, "cmd")...,
-	)
+	// Collect all production (non-test) sources EXCEPT the authorized cmdexec package.
+	var files []string
+	for _, f := range append(goSourceFiles(t, "internal"), goSourceFiles(t, "cmd")...) {
+		// internal/cmdexec is the single authorized package for os/exec usage.
+		if strings.Contains(filepath.ToSlash(f), "internal/cmdexec") {
+			continue
+		}
+		files = append(files, f)
+	}
 
 	forbiddenPatterns := []string{
 		`"os/exec"`,
@@ -86,7 +93,7 @@ func TestStaticNoExecCommand(t *testing.T) {
 
 	for _, pat := range forbiddenPatterns {
 		if matches := grepFiles(t, files, pat); len(matches) > 0 {
-			t.Errorf("SECURITY: forbidden pattern %q found in production sources:\n  %s",
+			t.Errorf("SECURITY: forbidden pattern %q found in production sources outside internal/cmdexec:\n  %s",
 				pat, strings.Join(matches, "\n  "))
 		}
 	}

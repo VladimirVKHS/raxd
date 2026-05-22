@@ -214,22 +214,110 @@ Notes on the values:
 - **Rate-limiter cleanup** is not configurable: idle per-key/per-IP limiters are garbage-collected
   after a fixed 10-minute TTL.
 
+### Command execution (`exec`) fields
+
+The `exec` section configures the MCP **`execute_command`** tool — the security-critical capability
+that runs commands on the host. These keys are read by `raxd serve` at startup and supplied to the
+tool. Every key has a safe built-in default, so an absent `config.yaml` (or one that omits the `exec`
+section) runs with the defaults below.
+
+> **Read the [`execute_command` security guide](execute-command-security.md) before changing these.**
+> The defaults are deliberately conservative on everything **except** the allowlist, which is **off by
+> default** (any command is allowed). For production, turn the allowlist on and run `raxd` as a
+> non-root user.
+
+A full `exec` section with the default values:
+
+```yaml
+# ~/.config/raxd/config.yaml (exec section)
+
+exec:
+  # Command allowlist. Empty = DISABLED = any command may run.
+  # When non-empty, only commands whose `command` string matches an entry
+  # EXACTLY (no regex, no prefix, case-sensitive) may run.
+  allowlist: []
+
+  # Timeouts (milliseconds)
+  default_timeout_ms: 30000     # 30s — used when the client omits timeout_ms
+  max_timeout_ms:     300000    # 5m  — a requested timeout_ms above this is rejected
+
+  # Working directory used when the client omits cwd (must exist; a client cwd is validated)
+  default_cwd: "/tmp"
+
+  # Child-process environment: an explicit whitelist of variables copied from the daemon.
+  # Dangerous loader/shell variables (LD_PRELOAD, LD_LIBRARY_PATH, DYLD_INSERT_LIBRARIES, IFS)
+  # are intentionally absent and are NOT passed to the child.
+  env_whitelist: ["PATH", "HOME", "LANG", "TERM"]
+
+  # Input limits checked before the command starts (argv-DoS protection)
+  max_args:    256              # maximum number of arguments
+  max_arg_len: 131072           # 128 KiB — maximum length of a single argument
+
+  # Output limit per stream (OOM protection); output beyond this is truncated
+  max_output_bytes: 1048576     # 1 MiB per stream (stdout and stderr separately)
+
+  # Root policy: false = WARN only (command still runs as root); true = refuse to run when euid==0
+  deny_root: false
+```
+
+| Key | Type | Default | Meaning |
+|-----|------|---------|---------|
+| `exec.allowlist` | list of strings | `[]` (empty = **disabled**) | When non-empty, a command runs only if its `command` string matches an entry **exactly** — not regex, not prefix, case-sensitive, compared **before** `PATH` resolution. Empty = allowlist off = **any command allowed**. See the warning below |
+| `exec.default_timeout_ms` | integer | `30000` (30s) | Timeout applied when the client omits `timeout_ms` (or sends `0`) |
+| `exec.max_timeout_ms` | integer | `300000` (5m) | Hard cap. A `timeout_ms` above this is rejected (`isError: true`); the command does not run |
+| `exec.default_cwd` | string | `/tmp` | Working directory used when the client omits `cwd`. A client-supplied `cwd` is validated (must exist and be a directory) |
+| `exec.env_whitelist` | list of strings | `["PATH", "HOME", "LANG", "TERM"]` | Environment variables copied from the daemon into the child process. Anything not listed (including `LD_PRELOAD`, `LD_LIBRARY_PATH`, `DYLD_INSERT_LIBRARIES`, `IFS`) is **not** passed |
+| `exec.max_args` | integer | `256` | Maximum number of `args`. Exceeding it is denied before the command runs |
+| `exec.max_arg_len` | integer | `131072` (128 KiB) | Maximum byte length of a single argument. Exceeding it is denied before the command runs |
+| `exec.max_output_bytes` | integer | `1048576` (1 MiB) | Maximum captured bytes **per stream** (stdout and stderr each). Output beyond this is truncated and the matching `*_truncated` flag is set |
+| `exec.deny_root` | boolean | `false` | `false` = when the daemon runs as root, log a `WARN` on every call but run the command anyway; `true` = refuse to run when the daemon is root (`isError: true`, `DENY` audit) |
+
+Notes on the values, with the security implications spelled out:
+
+- **The allowlist is off by default — and matched exactly.** With the default empty list, **any**
+  command an authenticated client requests will run. That is the intended SSH-class behaviour, but it
+  means a single valid key can run anything the daemon user can. When you enable it, list commands
+  **exactly the way clients call them**: because the match is on the raw `command` string (before
+  `PATH` resolution), **`ls` and `/bin/ls` are different entries** — listing one does not permit the
+  other. There is no regex, prefix, or case-insensitive matching. See
+  [the security guide](execute-command-security.md#2-the-allowlist-is-strict-and-exact--and-off-by-default).
+- **No client-supplied environment.** There is intentionally no `env` field in the tool input, and no
+  `config.yaml` key to accept one. The child environment is built only from `exec.env_whitelist`. This
+  blocks loader-injection attacks (`LD_PRELOAD` and friends).
+- **`deny_root` is a hard lever, not the primary defence.** The primary defence against running as
+  root is to **run `raxd` as a non-root user**. `deny_root: true` is the operator's lever to refuse
+  execution if the daemon ever finds itself running as root. See
+  [the security guide](execute-command-security.md#3-the-deny_root-policy-and-running-as-root).
+- **Arguments are logged verbatim.** The `args` a client sends are written to the audit log without
+  masking. **Do not pass secrets in arguments.** See
+  [the security guide](execute-command-security.md#1-do-not-pass-secrets-in-command-arguments-argv).
+- **Audit-log rotation is not built in.** The audit stream (including `execute_command` records) goes
+  to `stderr`. Rotation is delegated to the system (`journald` / `logrotate`); configure it for a
+  file-output deployment.
+
+For the tool's input/output contract, error mapping, and curl examples, see
+[`mcp.md`](mcp.md#execute_command).
+
 ### General behaviour
 
-- **Missing file is not an error.** If `config.yaml` does not exist, every default above is applied.
-  `raxd status` shows the file path with the suffix `(not found, defaults applied)` and exits with
-  code `0`.
+- **Missing file is not an error.** If `config.yaml` does not exist, every default above (networking
+  and `exec`) is applied. `raxd status` shows the file path with the suffix
+  `(not found, defaults applied)` and exits with code `0`.
 - **Malformed YAML is an error.** If the file exists but is not valid YAML, the config loader
   returns an explicit error (`config file is not valid YAML`). For `raxd serve` this is a startup
   error (exit `1`).
 - **`config port` does not write the file yet.** `raxd config port <PORT>` is still a stub. To
-  change the port (or any other field) today, edit `config.yaml` directly; `raxd serve` reads it on
-  the next start.
+  change the port (or any other field, including `exec.*`) today, edit `config.yaml` directly; `raxd
+  serve` reads it on the next start.
 
 ## Related documents
 
 - [`commands.md`](commands.md) — full command reference, including `raxd status`, `raxd key`, and
   `raxd serve`.
+- [`mcp.md`](mcp.md) — the MCP integration guide, including the `execute_command` tool reference.
+- [`execute-command-security.md`](execute-command-security.md) — mandatory security warnings for
+  `execute_command`.
 - [`troubleshooting.md`](troubleshooting.md) — common problems with `serve`, the TLS certificate,
-  and the config file.
+  the config file, and `execute_command`.
 - [`development.md`](development.md) — building and testing in Docker.
+</content>

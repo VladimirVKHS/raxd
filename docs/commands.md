@@ -9,9 +9,9 @@ one remaining feature command, `config port`, is present as an honest stub that 
 All CLI text (usage strings, messages, the banner, errors) is in English.
 
 > Where to run these commands: per the security baseline, `raxd` is built and run **inside Docker
-> only**. This applies in particular to `raxd serve`, which opens a TLS listener. Examples below
-> show the command and its output; for how to actually invoke them in a container, see
-> [`development.md`](development.md).
+> only**. This applies in particular to `raxd serve`, which opens a TLS listener and (through the MCP
+> `execute_command` tool) runs commands on the host. Examples below show the command and its output;
+> for how to actually invoke them in a container, see [`development.md`](development.md).
 
 ## Command tree
 
@@ -34,6 +34,8 @@ raxd
 > **MCP is not a CLI command.** The MCP server is not a separate command — it is hosted by
 > `raxd serve` on the `/mcp` route. To use it, run `raxd serve` and connect an MCP client to
 > `https://127.0.0.1:<port>/mcp`. See [`mcp.md`](mcp.md) and [`raxd serve`](#raxd-serve) below.
+> Command execution is **not** a CLI sub-command either: it is the MCP `execute_command` tool, run by
+> an MCP client over `/mcp`.
 
 ## Global behaviour
 
@@ -226,10 +228,9 @@ alone prints the group's help.
 > **Scope note.** Keys created here are consumed over the network: `raxd serve` authenticates every
 > connection against the same `keys.db`. A client presents the full key in the HTTP
 > `Authorization: Bearer <key>` header (see [`raxd serve`](#raxd-serve)). The **same** key
-> authenticates the **MCP server** on the `/mcp` route (see [`mcp.md`](mcp.md)). What is still
-> missing is what runs *behind* this transport for general work — command execution and file upload
-> are not implemented yet, and any route other than the health check and `/mcp` answers `501 Not
-> Implemented`. See the README's "Coming next".
+> authenticates the **MCP server** on the `/mcp` route (see [`mcp.md`](mcp.md)), including the
+> `execute_command` tool. Treat any key that can reach `execute_command` like an SSH private key — it
+> grants remote command execution on the host.
 
 ### How a key is stored (security model)
 
@@ -407,7 +408,8 @@ not derived from the key body, so it is safe to show in confirmations, errors, a
 > **Revocation takes effect immediately on the network.** A running `raxd serve` verifies every
 > connection against the live `keys.db`, and `Verify` only considers active records. A key that you
 > revoke stops authenticating on its very next request — there is no cache or restart delay. This
-> applies to MCP requests on `/mcp` too: a revoked key gets `401` before any tool runs.
+> applies to MCP requests on `/mcp` too: a revoked key gets `401` before any tool runs (so it can no
+> longer run `execute_command`).
 
 > **Audit line (stderr).** Like `key create`, a successful `key delete` also writes a single audit
 > record to **stderr** via `charmbracelet/log`, for example
@@ -477,8 +479,9 @@ receives `SIGINT` (Ctrl+C) or `SIGTERM`. It takes **no flags or positional argum
 [`configuration.md`](configuration.md#networking-and-serve-fields)).
 
 > **Run it in Docker.** Like all of `raxd`, `serve` is built and run inside a container only
-> (security baseline §6). It opens a network listener, so running it on the host is out of scope.
-> See [`development.md`](development.md).
+> (security baseline §6). It opens a network listener **and** can run commands on the host via the
+> MCP `execute_command` tool, so running it on the host is out of scope. See
+> [`development.md`](development.md).
 
 ### What `serve` does (scope)
 
@@ -505,23 +508,33 @@ authentication**, and, behind that transport, two working endpoints: a **health 
 - **Two operations behind authentication:**
   - **Health check** — `GET /healthz` returns `pong`.
   - **MCP server** — the `/mcp` route serves the Model Context Protocol over Streamable HTTP, behind
-    the same authentication, `Host`/`Origin` checks, rate limiting, and audit. It exposes two
-    read-only tools (`ping`, `server_info`). See [`mcp.md`](mcp.md) for the full integration guide.
+    the same authentication, `Host`/`Origin` checks, rate limiting, and audit. It exposes three
+    tools: two read-only (`ping`, `server_info`) and **`execute_command`**, which runs a command on
+    the host (no shell, mandatory timeout, optional allowlist, output/argument limits, controlled
+    `cwd`/environment, per-call audit). See [`mcp.md`](mcp.md) for the full integration guide and
+    [`execute-command-security.md`](execute-command-security.md) for the security warnings.
 
 Every **other** path still returns `501 Not Implemented`.
 
+> **Command execution lives behind `/mcp`, not behind a separate route.** `execute_command` is an MCP
+> tool, reached by a JSON-RPC `tools/call` on `/mcp` — there is no `/exec` HTTP endpoint and no
+> `raxd exec` CLI sub-command. A request to `/exec` (or any other unimplemented path) still answers
+> `501`.
+
 **Out of scope for `serve` today (not implemented):**
 
-- Command execution over the network (no shell, no `exec`).
 - File upload.
-- MCP tools beyond `ping` / `server_info`, and MCP Resources / Prompts.
+- MCP tools beyond `ping` / `server_info` / `execute_command`, and MCP Resources / Prompts.
+- Interactive / PTY command sessions and real-time output streaming (`execute_command` is
+  non-interactive and returns output in full after the command finishes).
+- Command sandboxing (cgroups/rlimits/seccomp/namespaces) — isolation relies on a non-root user
+  inside a container.
 - mTLS / client certificates.
 - Registering `raxd` as a systemd/launchd service (`serve` is foreground only — there is no
   `--daemon` mode and `raxd` does not install a service).
 
-These are future tasks. The catch-all route exists precisely as the extension point where command
-execution and file upload will attach; until then any route other than `/healthz` and `/mcp`
-answers `501`.
+The catch-all route remains the extension point where file upload will attach; until then any route
+other than `/healthz` and `/mcp` answers `501`.
 
 ### The request pipeline
 
@@ -541,7 +554,8 @@ TLS 1.3 handshake
 ```
 
 The MCP server sits **behind** the entire chain: a request to `/mcp` must pass Host/Origin, auth, and
-rate-limit just like any other, and only then reaches the MCP handler.
+rate-limit just like any other, and only then reaches the MCP handler. This applies to
+`execute_command` too — an unauthenticated or rate-limited call never runs a command.
 
 The audit stream records exactly **one** record per request that reaches the audit-aware chain
 (Host/Origin, auth, rate-limit, or the success path), plus — for a `/mcp` tool call — one additional
@@ -566,8 +580,10 @@ response-codes note below).
 | Authenticated request to any other route | `501 Not Implemented` (body `not implemented`) |
 
 > **MCP protocol errors are JSON-RPC, not HTTP status codes.** Inside an authenticated `POST /mcp`,
-> a malformed body or an unknown tool is reported as a JSON-RPC error (`-32700` / `-32600` /
-> `-32601` / `-32602`) with HTTP `200`, not as a `4xx`/`501`. See [`mcp.md`](mcp.md#behaviour-and-error-handling).
+> a malformed body or an unknown tool name is reported as a JSON-RPC error (`-32700` / `-32600` /
+> `-32601` / `-32602`) with HTTP `200`, not as a `4xx`/`501`. An `execute_command` tool error
+> (allowlist deny, missing binary, limits, `deny_root`) is reported as `isError: true` **inside** the
+> JSON-RPC `result`, also with HTTP `200`. See [`mcp.md`](mcp.md#behaviour-and-error-handling).
 
 > **The `413` from the body limit is not audited.** The body-size limit
 > (`bodyLimitMiddleware`) is the **outermost** layer in the chain — it runs before the auth and
@@ -654,18 +670,39 @@ time=<UTC ISO-8601> level=<INFO|WARN> msg=<AUTH|FAIL|DENY|RATE> fp=<fingerprint>
 | `DENY` | `WARN` | Corrupt key store (`403`), bad `Host` (`403`), or bad `Origin` (`403`) |
 | `RATE` | `WARN` | Rate limit exceeded (`429`), per-key or per-IP |
 
-**MCP records** — one additional line per `/mcp` tool call (`tools/call`), written by the MCP layer:
+**MCP records** — one additional line per `/mcp` tool call (`tools/call`), written by the MCP layer.
+For the read-only tools (`ping`, `server_info`):
 
 ```
 time=<UTC ISO-8601> level=INFO msg=MCP fp=<fingerprint> remote=<IP:port> tool=<name> result=ok
 ```
 
-- `tool` is the tool name (`ping` or `server_info`). The `tool=` field appears **only** on `MCP`
-  records; the connection records (`AUTH`/`FAIL`/`DENY`/`RATE`) never carry it.
+For **`execute_command`**, the tool writes its own record, carrying the command, arguments, exit
+code, and duration (the command-specific fields appear only when `tool=execute_command`):
+
+```
+time=<UTC ISO-8601> level=INFO msg=MCP  fp=<fingerprint> remote=<IP:port> tool=execute_command result=ok command=<bin> args=[…] exit_code=<n> duration=<d> timed_out=<bool>
+time=<UTC ISO-8601> level=WARN msg=DENY fp=<fingerprint> remote=<IP:port> tool=execute_command reason=<text> command=<bin> args=[…]
+time=<UTC ISO-8601> level=WARN msg=FAIL fp=<fingerprint> remote=<IP:port> tool=execute_command reason=<text> command=<bin> args=[…]
+time=<UTC ISO-8601> level=WARN msg=WARN fp=<fingerprint> remote=<IP:port> tool=execute_command reason=running-as-root command=<bin> args=[…]
+```
+
+- `tool` is the tool name (`ping`, `server_info`, or `execute_command`). The `tool=` field appears
+  **only** on `MCP`/`DENY`/`FAIL`/`WARN` records that come from the tool layer; the connection
+  records (`AUTH`/`FAIL`/`DENY`/`RATE`) for transport rejections never carry it.
+- For `execute_command`, a successful call (any exit code, including a timeout) is `msg=MCP
+  result=ok`; a rejected call (allowlist, limits, `deny_root`) is `msg=DENY`; a call that could not
+  start (missing binary, bad `cwd`) is `msg=FAIL`; and an extra `msg=WARN reason=running-as-root`
+  record is written on **every** call when the daemon is root.
 - Same `fp` and `remote` as the `AUTH` line for the same request — the key body is never logged.
 
-So one authenticated `tools/call` produces **two** lines: the `AUTH` connection record and the `MCP`
-tool record. See [`mcp.md`](mcp.md#audit) for the MCP audit details.
+> **`execute_command` arguments are logged verbatim** (`args=[…]`), with no masking. **Do not put
+> secrets in arguments.** See
+> [`execute-command-security.md`](execute-command-security.md#1-do-not-pass-secrets-in-command-arguments-argv).
+
+So one authenticated `tools/call` produces **two** lines (the `AUTH` connection record and the tool
+record) — or three for `execute_command` when the daemon is root (the extra `WARN`). See
+[`mcp.md`](mcp.md#audit) for the MCP audit details.
 
 > **The body-size `413` has no audit line.** The `413` returned when a request body exceeds
 > `max_body_bytes` is generated by the outermost `http.MaxBytesReader` layer, which sits **before**
@@ -678,6 +715,7 @@ Examples:
 ```
 time=2026-05-21T14:32:01Z level=INFO msg=AUTH fp=a3f9c1d2e847 remote=127.0.0.1:54312
 time=2026-05-21T14:32:01Z level=INFO msg=MCP  fp=a3f9c1d2e847 remote=127.0.0.1:54312 tool=ping result=ok
+time=2026-05-21T14:32:02Z level=INFO msg=MCP  fp=a3f9c1d2e847 remote=127.0.0.1:54312 tool=execute_command result=ok command=ls args=[-la] exit_code=0 duration=3ms timed_out=false
 time=2026-05-21T14:32:05Z level=WARN msg=FAIL fp=- remote=127.0.0.1:54401 reason="no authorization header"
 time=2026-05-21T14:32:07Z level=WARN msg=FAIL fp=b7d2a0c19f3e remote=127.0.0.1:54402 reason="authentication failed"
 time=2026-05-21T14:32:09Z level=WARN msg=DENY fp=- remote=127.0.0.1:54403 reason="key store unavailable"
@@ -698,6 +736,9 @@ raxd serve 2>&1 | grep -E "FAIL|DENY|RATE"
 
 # Watch only MCP tool calls:
 raxd serve 2>&1 | grep "msg=MCP"
+
+# Watch only command execution:
+raxd serve 2>&1 | grep "tool=execute_command"
 ```
 
 ### Calling the endpoints
@@ -725,11 +766,29 @@ curl -k https://127.0.0.1:7822/mcp \
   -H "Content-Type: application/json" \
   -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ping","arguments":{}}}'
-# → {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}
+# → {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"pong"}]}}
+```
+
+> On a successful tool result the `isError` field is **omitted** (the SDK serializes it with
+> `omitempty` and the server does not set it on success), so it does **not** appear in the response
+> above. It is present, set to `true`, only when a tool reports its own error (for example an
+> `execute_command` deny). See [`mcp.md`](mcp.md#behaviour-and-error-handling).
+
+To run a command via the MCP `execute_command` tool (see [`mcp.md`](mcp.md#execute_command) for the
+full contract and the [security guide](execute-command-security.md) first):
+
+```sh
+curl -k https://127.0.0.1:7822/mcp \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -H "MCP-Protocol-Version: 2025-11-25" \
+  -d '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"execute_command","arguments":{"command":"ls","args":["-la"],"timeout_ms":5000}}}'
 ```
 
 - A `GET /mcp` returns `405` (the server is stateless and offers no server→client stream).
-- Any other path (for example `/exec`) still returns `501` with the body `not implemented`.
+- Any other path (for example `/exec`) still returns `501` with the body `not implemented` — command
+  execution is the MCP tool above, not a `/exec` route.
 
 ### Graceful shutdown
 
@@ -838,14 +897,20 @@ In this YAML case the `bind_addr` reference is incidental: the actionable part i
 - The private TLS key is `0600`; the certificate `0644`; the TLS directory `0700`.
 - An existing certificate is reused and never silently overwritten.
 - The default bind address is `127.0.0.1` (loopback only).
-- Every connection is authenticated before any handler runs — including `/mcp`; the key is taken only
-  from the `Authorization: Bearer` header, never from argv or the environment.
+- Every connection is authenticated before any handler runs — including `/mcp` and therefore
+  `execute_command`; the key is taken only from the `Authorization: Bearer` header, never from argv
+  or the environment.
 - Rejections return an empty body; the reason lives only in the audit stream (except the body-limit
   `413`, which is not audited at all).
 - The audit stream logs the fingerprint, never the key body or the raw `Authorization` header.
-- Rate limiting applies per-key and per-IP.
+  `execute_command` records also carry the command and arguments **verbatim** (no secrets in argv).
+- Rate limiting applies per-key and per-IP, including to `execute_command`.
 - The operations behind authentication are the health check and the MCP server (`ping`,
-  `server_info`); everything else is `501`.
+  `server_info`, `execute_command`); everything else is `501`.
+- `execute_command` runs commands without a shell, with a mandatory timeout, an optional allowlist,
+  output/argument limits, and a controlled `cwd`/environment. It does **not** elevate privileges (it
+  inherits the daemon's UID/GID); run `raxd` as a non-root user. See
+  [`execute-command-security.md`](execute-command-security.md).
 
 ---
 
@@ -896,9 +961,14 @@ error: config port: not implemented yet
 | `raxd serve` | stderr | graceful shutdown | startup error (port/cert/db/bind/config) | working |
 | `raxd config port` | stderr | — | yes | stub |
 
-> Not a CLI command: the **MCP server** is hosted by `raxd serve` on `/mcp` — see [`mcp.md`](mcp.md).
+> Not a CLI command: the **MCP server** is hosted by `raxd serve` on `/mcp`, exposing `ping`,
+> `server_info`, and `execute_command` — see [`mcp.md`](mcp.md). Command execution is the MCP
+> `execute_command` tool, not a CLI sub-command.
 
-See also: [`mcp.md`](mcp.md) for the MCP integration guide;
-[`configuration.md`](configuration.md) for paths, `keys.db`, `config.yaml`, and the
-networking/`serve` fields; [`development.md`](development.md) for building and testing in Docker;
-[`troubleshooting.md`](troubleshooting.md) for common `serve` problems.
+See also: [`mcp.md`](mcp.md) for the MCP integration guide (including `execute_command`);
+[`execute-command-security.md`](execute-command-security.md) for the command-execution security
+warnings; [`configuration.md`](configuration.md) for paths, `keys.db`, `config.yaml`, the
+networking/`serve` fields, and the `exec` fields; [`development.md`](development.md) for building and
+testing in Docker; [`troubleshooting.md`](troubleshooting.md) for common `serve` and
+`execute_command` problems.
+</content>

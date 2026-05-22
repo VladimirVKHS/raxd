@@ -59,6 +59,41 @@ type Config struct {
 	// MaxBodyBytes is the maximum size of the request body.
 	// SR-25: protection against large-body flooding; enforced via http.MaxBytesReader.
 	MaxBodyBytes int64
+
+	// Exec содержит параметры безопасного выполнения команд (command-exec task).
+	// SR-66: все параметры с безопасными дефолтами; без env-оверрайдов.
+	Exec ExecConfig
+}
+
+// ExecConfig — параметры секции exec (command-exec task).
+// SR-66: безопасные дефолты; без env-оверрайдов.
+type ExecConfig struct {
+	// Allowlist — список разрешённых команд. Пустой = выключен (AC7/SR-48).
+	Allowlist []string
+
+	// DefaultTimeoutMs — таймаут по умолчанию в мс (дефолт 30000; AC5/SR-46).
+	DefaultTimeoutMs int
+
+	// MaxTimeoutMs — жёсткий максимум таймаута (дефолт 300000; AC5/ADR-003).
+	MaxTimeoutMs int
+
+	// DefaultCwd — рабочая директория по умолчанию (дефолт /tmp; AC10/SR-50).
+	DefaultCwd string
+
+	// EnvWhitelist — разрешённые переменные окружения (дефолт PATH/HOME/LANG/TERM; AC10/SR-49).
+	EnvWhitelist []string
+
+	// MaxArgs — максимальное число аргументов (дефолт 256; SR-52/ADR-003).
+	MaxArgs int
+
+	// MaxArgLen — максимальная длина аргумента в байтах (дефолт 131072; SR-52/ADR-003).
+	MaxArgLen int
+
+	// MaxOutputBytes — лимит вывода на поток в байтах (дефолт 1048576; AC11/SR-53).
+	MaxOutputBytes int
+
+	// DenyRoot — hard-fail при euid==0 (дефолт false = только WARN; SR-56/AC9).
+	DenyRoot bool
 }
 
 // LimiterTTL returns the idle TTL for rate-limiter GC entries.
@@ -79,16 +114,28 @@ func Load(p PathSet) (*Config, error) {
 	// Defaults (non-sensitive values only — SECURITY §4).
 	v.SetDefault("port", 7822)
 	v.SetDefault("bind_addr", "127.0.0.1")
-	v.SetDefault("rate_limit", 10.0)   // 10 req/s per key and per IP
-	v.SetDefault("rate_burst", 20)     // burst of 20
+	v.SetDefault("rate_limit", 10.0)        // 10 req/s per key and per IP
+	v.SetDefault("rate_burst", 20)          // burst of 20
 	v.SetDefault("origin_allow", []string{"localhost", "127.0.0.1", "::1"})
 	v.SetDefault("host_allow", []string{"localhost", "127.0.0.1", "::1"})
 	v.SetDefault("read_timeout", "30s")
 	v.SetDefault("read_header_timeout", "10s")
 	v.SetDefault("write_timeout", "30s")
 	v.SetDefault("idle_timeout", "120s")
-	v.SetDefault("max_header_bytes", 1<<20) // 1 MiB
+	v.SetDefault("max_header_bytes", 1<<20)      // 1 MiB
 	v.SetDefault("max_body_bytes", int64(1<<20)) // 1 MiB
+
+	// Exec-дефолты (SR-66/ADR-003): безопасные значения для command-exec.
+	// Без env-оверрайдов — конфиг только через config.yaml.
+	v.SetDefault("exec.allowlist", []string{})           // пустой = allowlist выключен (AC7)
+	v.SetDefault("exec.default_timeout_ms", 30000)       // 30s (AC5)
+	v.SetDefault("exec.max_timeout_ms", 300000)          // 5 мин (AC5/ADR-003)
+	v.SetDefault("exec.default_cwd", "/tmp")             // безопасная директория (AC10)
+	v.SetDefault("exec.env_whitelist", []string{"PATH", "HOME", "LANG", "TERM"}) // (AC10/SR-49)
+	v.SetDefault("exec.max_args", 256)                   // (SR-52/ADR-003)
+	v.SetDefault("exec.max_arg_len", 131072)             // 128 KiB (SR-52/ADR-003)
+	v.SetDefault("exec.max_output_bytes", 1048576)       // 1 MiB на поток (AC11/SR-53)
+	v.SetDefault("exec.deny_root", false)                // WARN-дефолт (SR-56/ADR-003)
 
 	if err := v.ReadInConfig(); err != nil {
 		// File not found → use defaults, no error.
@@ -142,6 +189,17 @@ func buildConfig(v *viper.Viper) (*Config, error) {
 		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    v.GetInt("max_header_bytes"),
 		MaxBodyBytes:      v.GetInt64("max_body_bytes"),
+		Exec: ExecConfig{
+			Allowlist:        v.GetStringSlice("exec.allowlist"),
+			DefaultTimeoutMs: v.GetInt("exec.default_timeout_ms"),
+			MaxTimeoutMs:     v.GetInt("exec.max_timeout_ms"),
+			DefaultCwd:       v.GetString("exec.default_cwd"),
+			EnvWhitelist:     v.GetStringSlice("exec.env_whitelist"),
+			MaxArgs:          v.GetInt("exec.max_args"),
+			MaxArgLen:        v.GetInt("exec.max_arg_len"),
+			MaxOutputBytes:   v.GetInt("exec.max_output_bytes"),
+			DenyRoot:         v.GetBool("exec.deny_root"),
+		},
 	}, nil
 }
 
