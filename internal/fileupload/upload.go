@@ -130,7 +130,7 @@ func Write(cfg Config, in Input) (Result, error) {
 	// --- Создать temp-файл в том же каталоге что и цель (ADR-002/SR-74) ---
 	// Root.CreateTemp ОТСУТСТВУЕТ в os.Root (ADR-001/ADR-002 верифицировано).
 	// Генерируем уникальное имя через crypto/rand + O_EXCL.
-	tmpName, err := randomTmpName(dir)
+	tmpName, err := randomTmpName()
 	if err != nil {
 		return Result{}, fmt.Errorf("generate temp name: %w", err)
 	}
@@ -193,16 +193,14 @@ func Write(cfg Config, in Input) (Result, error) {
 	}, nil
 }
 
-// randomTmpName генерирует уникальное имя temp-файла в каталоге dir.
+// randomTmpName генерирует уникальное имя temp-файла.
 // Формат: ".raxd-upload-<16-hex>".
 // O_EXCL гарантирует атомарное создание без коллизий (ADR-002).
 // SECURITY (SR-74): crypto/rand для непредсказуемого имени.
-func randomTmpName(dir string) (string, error) {
+func randomTmpName() (string, error) {
 	b := make([]byte, 8)
 	if _, err := rand.Read(b); err != nil {
 		return "", fmt.Errorf("crypto/rand: %w", err)
 	}
-	name := ".raxd-upload-" + hex.EncodeToString(b)
-	_ = dir // dir используется только для формирования tmpRel выше
-	return name, nil
+	return ".raxd-upload-" + hex.EncodeToString(b), nil
 }

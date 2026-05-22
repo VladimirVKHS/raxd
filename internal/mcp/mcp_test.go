@@ -50,7 +50,7 @@ func defaultExecCfg() cmdexec.Config {
 }
 
 // defaultUplCfg возвращает безопасный fileupload.Config для тестов.
-// UploadRoot будет пустым — каждый тест, кому нужен реальный UploadRoot, задаёт его сам.
+// UploadRoot выставляется в t.TempDir(); тесты, которым нужен другой корень, создают свой Config.
 func defaultUplCfg(t *testing.T) fileupload.Config {
 	t.Helper()
 	return fileupload.Config{
