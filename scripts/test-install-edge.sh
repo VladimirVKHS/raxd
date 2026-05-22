@@ -527,6 +527,58 @@ UNAME_SHIM_B
         "${install_script}" \
         "TEST8: curl -fsSL для скачивания (SR-99)"
 
+    # ── Проверка отсутствия генерации unit/plist (AC1) ────────────────────────
+    # AC1/spec: install.sh ставит ТОЛЬКО бинарь; собственной логики генерации/
+    # регистрации unit-файлов (systemd .service) или plist-файлов (launchd) нет.
+    # Регистрация сервиса — Out of Scope (задача service-install, команда raxd service install).
+    # install.sh может лишь выводить hint "raxd service install" — это не генерация.
+    #
+    # Доказательство не-тавтологичности каждого паттерна:
+    #   - На текущем install.sh: паттерны НЕ найдены → PASS (подтверждено локально).
+    #   - Если добавить генерацию unit/plist (любой из сценариев ниже) → FAIL:
+    #     * запись в /etc/systemd/system → паттерн 1 поймает
+    #     * запись в /Library/LaunchDaemons|LaunchAgents → паттерн 2 поймает
+    #     * упоминание файла *.service или *.plist → паттерны 3/4 поймают
+    #     * содержимое unit-файла ([Unit]/[Service]/ExecStart=) → паттерн 5 поймает
+    #     * содержимое plist-файла (<key>Label</key>/RunAtLoad) → паттерн 6 поймает
+
+    # Паттерн 1: запись в каталог systemd-юнитов
+    assert_no_grep \
+        '/etc/systemd/system' \
+        "${install_script}" \
+        "TEST8/AC1: нет записи в /etc/systemd/system в install.sh"
+
+    # Паттерн 2: запись в каталоги launchd-plist macOS
+    assert_no_grep \
+        '/Library/Launch(Daemons|Agents)' \
+        "${install_script}" \
+        "TEST8/AC1: нет записи в /Library/Launch{Daemons,Agents} в install.sh"
+
+    # Паттерн 3: упоминание файла *.service (генерация/копирование unit-файла)
+    # Примечание: hint 'raxd service install' не содержит '.service' — PASS на корректном коде.
+    assert_no_grep \
+        '\.service\b' \
+        "${install_script}" \
+        "TEST8/AC1: нет упоминания .service-файла в install.sh"
+
+    # Паттерн 4: упоминание файла *.plist (генерация/копирование plist-файла)
+    assert_no_grep \
+        '\.plist\b' \
+        "${install_script}" \
+        "TEST8/AC1: нет упоминания .plist-файла в install.sh"
+
+    # Паттерн 5: характерное содержимое systemd unit-файла
+    assert_no_grep \
+        '\[Unit\]|\[Service\]|ExecStart=' \
+        "${install_script}" \
+        "TEST8/AC1: нет содержимого unit-файла ([Unit]/[Service]/ExecStart=) в install.sh"
+
+    # Паттерн 6: характерное содержимое launchd plist-файла
+    assert_no_grep \
+        '<key>Label</key>|RunAtLoad' \
+        "${install_script}" \
+        "TEST8/AC1: нет содержимого plist-файла (<key>Label</key>/RunAtLoad) в install.sh"
+
     # ══════════════════════════════════════════════════════════════════════════
     # TEST 9: согласованность имён артефактов (AC16, SR-101)
     # Проверяет: шаблон имени в install.sh совпадает с шаблоном в release.sh
@@ -589,7 +641,10 @@ UNAME_SHIM_B
             pass "TEST9: все 4 цели присутствуют в SHA256SUMS (согласованность install.sh↔release.sh↔SHA256SUMS)"
         fi
     else
-        echo "warning: TEST9: ${dist_dir}/SHA256SUMS не найден — пропускаем SHA256SUMS-часть"
+        # Эта ветка недостижима: выше (строка ~122) скрипт уже завершается с exit 1
+        # если SHA256SUMS отсутствует. Заменяем graceful-warning на честный fail —
+        # чтобы не создавать ложного ощущения допустимой деградации (Н-1 guardian).
+        fail "TEST9: ${dist_dir}/SHA256SUMS не найден — невозможно проверить согласованность имён"
     fi
 
     # ── Итог ──────────────────────────────────────────────────────────────────

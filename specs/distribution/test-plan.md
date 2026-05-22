@@ -26,7 +26,7 @@ Go-тесты (`go test`) — не применимы к bash-скриптам: 
 
 | AC | Описание | Уровень | Тест (файл::кейс) | Статус |
 |----|----------|---------|-------------------|--------|
-| AC1 | install.sh ставит только бинарь; нет логики регистрации сервиса | install-flow + статический | test-install.sh::TEST1 (бинарь установлен); test-install-edge.sh::TEST8 (grep: нет unit/plist генерации) | зелено (docker-verification.md) |
+| AC1 | install.sh ставит только бинарь; нет логики генерации/регистрации unit/plist | install-flow + статический | test-install.sh::TEST1 (бинарь установлен в RAXD_PREFIX); test-install-edge.sh::TEST8 (6× assert_no_grep: нет systemctl/launchctl start; нет /etc/systemd/system, /Library/Launch{Daemons,Agents}; нет *.service, *.plist; нет [Unit]/ExecStart=; нет <key>Label</key>/RunAtLoad) | зелено + NEW static |
 | AC2 | set -euo pipefail; тело в main(); вызов в конце; trap cleanup | статический + install-flow | test-install-edge.sh::TEST4 (статика); test-install-edge.sh::TEST5 (усечённый скрипт) | NEW — тест-edge |
 | AC3 | SHA256 проверяется ДО установки; несовпадение → код 3; бинарь не ставится | install-flow | test-install.sh::TEST3 (подмена → код 3, нет бинаря) | зелено (docker-verification.md) |
 | AC4 | Детект OS/arch; неподдерживаемая платформа → код 2; нормализация x86_64/aarch64 | install-flow | test-install-edge.sh::TEST4 (uname-shim i686 → код 2, нет бинаря) | NEW — тест-edge |
