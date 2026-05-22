@@ -3,8 +3,10 @@ package config
 import (
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/spf13/viper"
@@ -63,6 +65,10 @@ type Config struct {
 	// Exec содержит параметры безопасного выполнения команд (command-exec task).
 	// SR-66: все параметры с безопасными дефолтами; без env-оверрайдов.
 	Exec ExecConfig
+
+	// Upload содержит параметры загрузки файлов (file-upload task).
+	// SR-81: безопасные дефолты; невалидные значения отвергаются на старте.
+	Upload UploadConfig
 }
 
 // ExecConfig — параметры секции exec (command-exec task).
@@ -93,6 +99,29 @@ type ExecConfig struct {
 	MaxOutputBytes int
 
 	// DenyRoot — hard-fail при euid==0 (дефолт false = только WARN; SR-56/AC9).
+	DenyRoot bool
+}
+
+// UploadConfig — параметры секции upload (file-upload task).
+// SR-81: безопасные дефолты; без env-оверрайдов.
+type UploadConfig struct {
+	// Root — корень записи файлов.
+	// Пусто → serve.go резолвит к <StateDir>/uploads (0700; AC5a/SR-71).
+	Root string
+
+	// MaxFileBytes — максимальный декодированный размер файла.
+	// Дефолт 716800 (700 KiB; SR-76/AC7/AC16).
+	MaxFileBytes int64
+
+	// DefaultMode — режим файла по умолчанию в восьмеричной строке.
+	// Дефолт "0600" (AC9/SR-73/ADR-003).
+	DefaultMode string
+
+	// OverwriteDefault — политика перезаписи по умолчанию.
+	// Дефолт false (AC8/AC15).
+	OverwriteDefault bool
+
+	// DenyRoot — жёсткий отказ при euid==0 (дефолт false = только WARN; SR-77/AC11).
 	DenyRoot bool
 }
 
@@ -137,6 +166,14 @@ func Load(p PathSet) (*Config, error) {
 	v.SetDefault("exec.max_output_bytes", 1048576)       // 1 MiB на поток (AC11/SR-53)
 	v.SetDefault("exec.deny_root", false)                // WARN-дефолт (SR-56/ADR-003)
 
+	// Upload-дефолты (SR-81/AC15/plan §Config): безопасные значения для file-upload.
+	// Без env-оверрайдов — конфиг только через config.yaml.
+	v.SetDefault("upload.root", "")                          // пусто → serve.go резолвит к <StateDir>/uploads (AC5a)
+	v.SetDefault("upload.max_file_bytes", int64(716800))     // 700 KiB (SR-76/AC7/AC16)
+	v.SetDefault("upload.default_mode", "0600")              // (AC9/SR-73/ADR-003)
+	v.SetDefault("upload.overwrite_default", false)          // deny overwrite по умолчанию (AC8/AC15)
+	v.SetDefault("upload.deny_root", false)                  // WARN-дефолт (SR-77/AC11)
+
 	if err := v.ReadInConfig(); err != nil {
 		// File not found → use defaults, no error.
 		// When SetConfigFile is used, viper returns a path error (fs.ErrNotExist)
@@ -176,6 +213,25 @@ func buildConfig(v *viper.Viper) (*Config, error) {
 		return nil, err
 	}
 
+	// --- Upload-валидация (SR-81/AC15) ---
+	maxBodyBytes := v.GetInt64("max_body_bytes")
+	maxFileBytes := v.GetInt64("upload.max_file_bytes")
+
+	// SR-76: max_file_bytes должен быть > 0 и ≤ потолка (max_body_bytes−reserve)×3/4.
+	// reserve = 1024 байт (base64-паддинг + JSON-RPC overhead).
+	const reserve = int64(1024)
+	ceiling := (maxBodyBytes - reserve) * 3 / 4
+	if maxFileBytes <= 0 || maxFileBytes > ceiling {
+		return nil, fmt.Errorf("upload.max_file_bytes=%d is invalid: must be > 0 and ≤ %d (derived from max_body_bytes=%d; SR-76)",
+			maxFileBytes, ceiling, maxBodyBytes)
+	}
+
+	// SR-81/ADR-003: default_mode парсится и проходит mode-политику.
+	uploadDefaultModeStr := v.GetString("upload.default_mode")
+	if _, err := parseModeStr(uploadDefaultModeStr); err != nil {
+		return nil, fmt.Errorf("upload.default_mode=%q is invalid: %w", uploadDefaultModeStr, err)
+	}
+
 	return &Config{
 		Port:              v.GetInt("port"),
 		BindAddr:          bindAddr,
@@ -200,7 +256,37 @@ func buildConfig(v *viper.Viper) (*Config, error) {
 			MaxOutputBytes:   v.GetInt("exec.max_output_bytes"),
 			DenyRoot:         v.GetBool("exec.deny_root"),
 		},
+		Upload: UploadConfig{
+			Root:             v.GetString("upload.root"),
+			MaxFileBytes:     maxFileBytes,
+			DefaultMode:      uploadDefaultModeStr,
+			OverwriteDefault: v.GetBool("upload.overwrite_default"),
+			DenyRoot:         v.GetBool("upload.deny_root"),
+		},
 	}, nil
+}
+
+// parseModeStr парсит восьмеричную строку и применяет mode-политику ADR-003.
+// Дублирует логику fileupload.ParseMode, чтобы избежать циклической зависимости.
+// SECURITY (SR-73/ADR-003): запрет setuid/setgid/sticky/world-writable.
+func parseModeStr(s string) (fs.FileMode, error) {
+	if s == "" {
+		return 0, fmt.Errorf("empty mode string")
+	}
+	val, err := strconv.ParseInt(s, 8, 32)
+	if err != nil || val < 0 {
+		return 0, fmt.Errorf("cannot parse %q as octal mode", s)
+	}
+	mode := fs.FileMode(val)
+	const specialBits = fs.FileMode(0o7000)
+	if mode&specialBits != 0 {
+		return 0, fmt.Errorf("mode %s contains forbidden special bits (setuid/setgid/sticky)", s)
+	}
+	const worldWritable = fs.FileMode(0o002)
+	if mode&worldWritable != 0 {
+		return 0, fmt.Errorf("mode %s is world-writable (bit 0002 forbidden)", s)
+	}
+	return mode, nil
 }
 
 // parseDuration reads a viper key as either a time.Duration or a string
