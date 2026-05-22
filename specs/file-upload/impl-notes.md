@@ -48,7 +48,20 @@
 - `TestUploadFile_NoSecretsInAuditOrResponse` — AC13/SR-80;
 - `TestUploadFile_TargetIsDirectory/NoRequiredFields` — AC14;
 - `TestUploadFile_ExactlyOneAuditRecord` — SR-78;
-- `TestUploadFile_PathLogfmtInjection` — SR-79.
+- `TestUploadFile_PathLogfmtInjection` (3 вектора: space+eq, quote, newline) — SR-79 (F-1).
+
+**Пакет `internal/config` (дополнительно после F-3):**
+- `TestUploadConfigDefaults` — SR-81 (дефолты без config.yaml);
+- `TestUploadMaxFileBytesZeroIsError/NegativeIsError` — SR-76 (max_file_bytes ≤ 0);
+- `TestUploadMaxFileBytesExceedsCeilingIsError` — SR-76 (max_file_bytes > потолка);
+- `TestUploadMaxFileBytesAtCeilingIsOK` — SR-76 (граничное значение);
+- `TestUploadDefaultModeSetuidIsError/SetgidIsError/WorldWritableIsError/WorldWritable0777IsError` — ADR-003;
+- `TestUploadDefaultModeValidIsOK` — ADR-003 (валидные моды).
+
+**Пакет `internal/mcp` (дополнительно после F-2):**
+- `TestUploadRootWarnAuditRecord/unit_warn_writeAudit` — SR-77 (unit);
+- `TestUploadRootWarnAuditRecord/warn_when_root` — SR-77 (реальный MCP при euid==0);
+- `TestUploadRootWarnAuditRecord/deny_root_upload` — SR-77 (deny_root=true+euid==0).
 
 **Команда запуска (только в Docker):**
 ```
@@ -58,16 +71,17 @@ docker build --target test -t raxd-test . && docker run --rm raxd-test
 **Результат:** все пакеты PASS, включая race-прогон; нет `skip`/`t.Skip`/закомментированных тестов.
 
 ```
-ok  github.com/vladimirvkhs/raxd                       0.008s
+ok  github.com/vladimirvkhs/raxd                       0.023s
 ok  github.com/vladimirvkhs/raxd/internal/banner       0.001s
-ok  github.com/vladimirvkhs/raxd/internal/cli          0.076s
-ok  github.com/vladimirvkhs/raxd/internal/cmdexec      1.186s
-ok  github.com/vladimirvkhs/raxd/internal/config       0.003s
-ok  github.com/vladimirvkhs/raxd/internal/fileupload   0.031s
-ok  github.com/vladimirvkhs/raxd/internal/keystore     0.155s
-ok  github.com/vladimirvkhs/raxd/internal/mcp          3.673s
-ok  github.com/vladimirvkhs/raxd/internal/server       2.190s
+ok  github.com/vladimirvkhs/raxd/internal/cli          0.055s
+ok  github.com/vladimirvkhs/raxd/internal/cmdexec      1.185s
+ok  github.com/vladimirvkhs/raxd/internal/config       0.005s
+ok  github.com/vladimirvkhs/raxd/internal/fileupload   0.027s
+ok  github.com/vladimirvkhs/raxd/internal/keystore     0.102s
+ok  github.com/vladimirvkhs/raxd/internal/mcp          3.732s
+ok  github.com/vladimirvkhs/raxd/internal/server       2.213s
 ok  github.com/vladimirvkhs/raxd/internal/version      0.001s
+(+ race-прогон: cmdexec 2.181s, keystore 1.151s, server 3.977s, mcp 5.344s)
 ```
 
 ## Безопасность
