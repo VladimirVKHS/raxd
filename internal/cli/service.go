@@ -207,7 +207,8 @@ Requires root or sudo.`,
 				fmt.Fprintf(stderr, "  %-14s system user \"raxd\" (no shell, no home, not running)\n", "kept")
 				fmt.Fprintf(stderr, "  hint: to also remove the user: sudo dscl . -delete /Users/raxd\n")
 			}
-			fmt.Fprintf(stderr, "  hint: data in /var/lib/raxd is preserved — remove manually if no longer needed\n")
+			stateDir := service.DefaultConfigForGOOS(runtime.GOOS).StateDir
+			fmt.Fprintf(stderr, "  hint: data in %s is preserved — remove manually if no longer needed\n", stateDir)
 
 			logger := log.New(stderr)
 			logger.Info("service uninstalled",

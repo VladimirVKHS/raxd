@@ -19,6 +19,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -342,6 +343,34 @@ func TestServiceInstall_Success_HintPresent(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "hint:") {
 		t.Errorf("install success must show 'hint:', got:\n%s", stderr)
+	}
+}
+
+// TestServiceUninstall_Success_HintContainsPlatformStateDir verifies that the uninstall
+// success hint shows the platform-correct state directory path (OQ-1 fix).
+//
+// On linux (Docker): StateDir = /var/lib/raxd.
+// The test is not false-green: it asserts the concrete path that DefaultConfigForGOOS
+// returns for the current GOOS, so it would fail if the path were wrong or still
+// hardcoded as /var/lib/raxd on darwin.
+func TestServiceUninstall_Success_HintContainsPlatformStateDir(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+
+	_, stderr, err := executeServiceCmd("", "service", "uninstall")
+	if err != nil {
+		t.Errorf("uninstall success must exit 0, got: %v", err)
+	}
+
+	// The hint must contain the platform-specific StateDir, not a hardcoded Linux path.
+	wantStateDir := service.DefaultConfigForGOOS(runtime.GOOS).StateDir
+	if !strings.Contains(stderr, wantStateDir) {
+		t.Errorf("uninstall hint must contain platform StateDir %q (OQ-1):\n%s", wantStateDir, stderr)
+	}
+
+	// Confirm the full hint line is present and well-formed.
+	wantHint := "data in " + wantStateDir + " is preserved"
+	if !strings.Contains(stderr, wantHint) {
+		t.Errorf("uninstall hint line missing or malformed, want substring %q:\n%s", wantHint, stderr)
 	}
 }
 
