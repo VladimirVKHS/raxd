@@ -39,6 +39,9 @@ You have no active API keys, or you are not sending the key correctly.
   Revocation takes effect immediately — a key you delete with `raxd key delete` stops working on its
   next request. Confirm the key is still active with `raxd key list`.
 
+This applies to the MCP endpoint too: a `401` on `/mcp` means the same thing, and no tool runs. See
+[MCP server (`/mcp`)](#mcp-server-mcp) below.
+
 Note: response bodies for rejected requests are intentionally empty; the reason is only in the
 server's audit stream. That is by design (it avoids telling a caller whether a key is unknown or
 revoked).
@@ -55,7 +58,7 @@ error: cannot bind to 127.0.0.1:7822: address already in use
 - Find and stop the other process (`lsof -i :7822`), or
 - Change the port. `raxd config port` is still a stub, so edit `config.yaml` directly: set the
   `port:` key (see [`configuration.md`](configuration.md#networking-and-serve-fields)) and start
-  `serve` again.
+  `serve` again. The MCP endpoint follows the same port.
 
 > **What you will (and will not) see.** When the port is in use, the bind fails before the server
 > ever starts, so `serve` prints **only** the `error:` / `hint:` lines above and exits `1`. The
@@ -169,7 +172,7 @@ error — the defaults are applied (and `raxd status` shows `(not found, default
 > a stray tab, an unterminated string, etc.) and start `serve` again. This is the same `error:` you
 > would see from any tool that fails to parse the file.
 
-### `curl` to `/healthz` fails with a TLS / certificate error
+### `curl` to `/healthz` or `/mcp` fails with a TLS / certificate error
 
 The server uses a **self-signed** certificate, so a client that verifies certificates will reject it
 by default. There is no built-in trust anchor and no mTLS in this build.
@@ -178,13 +181,21 @@ by default. There is no built-in trust anchor and no mTLS in this build.
   https://127.0.0.1:7822/healthz`.
 - Otherwise, add the generated `cert.pem` to your client's trust store. The certificate's SAN covers
   `127.0.0.1` and `localhost`, so connect using one of those names/addresses.
+- For Node-based MCP clients (MCP Inspector and similar) in development, set
+  `NODE_TLS_REJECT_UNAUTHORIZED=0` in the client's environment (insecure — dev only). See
+  [`mcp.md`](mcp.md#self-signed-tls).
 
 ### A request returns `501 Not Implemented`
 
-This is expected. After authentication, the only route that does real work is `GET /healthz`. Every
-other path (for example `/exec`, `/mcp`) returns `501` with the body `not implemented`, because
-command execution, the MCP server, and file upload are not implemented yet. There is nothing to fix —
-those features arrive in later tasks.
+This is expected for an **unimplemented** route. After authentication, the routes that do real work
+are `GET /healthz` (returns `pong`) and `/mcp` (the MCP server). Every other path (for example
+`/exec`) returns `501` with the body `not implemented`, because command execution and file upload are
+not implemented yet. There is nothing to fix — those features arrive in later tasks.
+
+> **`/mcp` no longer returns `501`.** If you used an older build, the MCP route was a `501` stub. In
+> the current build, `POST /mcp` with a valid key returns a real JSON-RPC response. If you still get
+> `501` on `/mcp`, you are running an old binary — rebuild. (A `GET /mcp` returns `405`, not `501` —
+> see the MCP section below.)
 
 ### A request returns `413` (and nothing shows up in the audit stream)
 
@@ -208,7 +219,8 @@ time=… level=WARN msg=RATE fp=- remote=… reason="rate limit exceeded (ip)"
 ```
 
 Slow down, or raise `rate_limit` / `rate_burst` in `config.yaml` (see
-[`configuration.md`](configuration.md#networking-and-serve-fields)).
+[`configuration.md`](configuration.md#networking-and-serve-fields)). This rate limit also applies to
+MCP calls on `/mcp`.
 
 ### A request returns `403 Forbidden`
 
@@ -230,6 +242,46 @@ and connect using a host the certificate covers (`127.0.0.1` or `localhost`).
 That is the normal, healthy state. `raxd serve` is a long-running process: after the startup block it
 blocks and prints **only** an audit line per connection. Silence means no connections are arriving;
 there are no heartbeat messages. Press Ctrl+C to stop it (graceful shutdown, exit `0`).
+
+## MCP server (`/mcp`)
+
+The MCP server runs inside `raxd serve` on the `/mcp` route. Most MCP problems are the transport
+problems above (auth, TLS, Origin, rate limit), because MCP sits behind the same chain. The MCP-only
+cases:
+
+### `GET /mcp` returns `405 Method Not Allowed`
+
+Expected. The server is **stateless** and does not offer a server→client SSE stream, so it answers
+`GET /mcp` with `405`. MCP requests use `POST`. Send a JSON-RPC request with `POST`:
+
+```sh
+curl -k https://127.0.0.1:7822/mcp \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ping","arguments":{}}}'
+```
+
+### A `tools/call` returns a JSON-RPC error instead of running
+
+- **Unknown tool** (for example `execute_command` or `upload_file`) → error code `-32601`
+  (`Method not found`) or `-32602` (`Invalid params`), depending on the SDK version. Those tools are
+  not implemented in this build; only `ping` and `server_info` exist. No command runs. See
+  [`mcp.md`](mcp.md#scope-and-limitations).
+- **Unknown method** → `-32601`. **Malformed JSON** → `-32700`. **Not a valid JSON-RPC request** →
+  `-32600`.
+
+These are JSON-RPC errors returned with HTTP `200`, not transport `4xx`/`501`. After such an error
+the server stays up, and a valid `ping` still returns `pong`.
+
+### An MCP client cannot connect even though `curl` works
+
+Some MCP clients/versions do not forward custom headers (such as `Authorization`) during their
+initial health/`initialize` step. If `curl` (which sends the header reliably) succeeds but a client
+does not, the issue is likely on the client side. Verify the channel with the `curl` smoke-test in
+[`mcp.md`](mcp.md#curl-smoke-test) first. Also confirm the client is configured as a
+**streamable-http** (remote) server with the `url` and `Authorization` header, **not** as a stdio
+command, and that it trusts the self-signed certificate (or has verification disabled for dev).
 
 ## Key management
 
@@ -290,6 +342,8 @@ sure the user running `raxd` has a home directory set.
 ## Related documents
 
 - [`commands.md`](commands.md) — full command reference, including all `serve` error cases.
+- [`mcp.md`](mcp.md) — MCP integration guide: the `/mcp` endpoint, connection parameters, tools, and
+  audit.
 - [`configuration.md`](configuration.md) — paths, `keys.db`, the TLS directory, and the
   `config.yaml` networking fields.
 - [`development.md`](development.md) — building and testing in Docker.

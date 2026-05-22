@@ -31,6 +31,10 @@ raxd
 `raxd --help` lists the root command and all sub-commands. Each command also responds to
 `raxd <command> --help` with its own usage and description.
 
+> **MCP is not a CLI command.** The MCP server is not a separate command — it is hosted by
+> `raxd serve` on the `/mcp` route. To use it, run `raxd serve` and connect an MCP client to
+> `https://127.0.0.1:<port>/mcp`. See [`mcp.md`](mcp.md) and [`raxd serve`](#raxd-serve) below.
+
 ## Global behaviour
 
 These rules apply to the whole command tree.
@@ -152,6 +156,9 @@ raxd 1.0.0 (commit abc1234, built 2025-06-01)
 The version is printed exactly as provided by the build metadata (no hard-coded `v` prefix), which
 avoids producing `vdev` for development builds.
 
+> The same version string is what the MCP `server_info` tool reports as its `version` field (see
+> [`mcp.md`](mcp.md#server_info)).
+
 ### `raxd status`
 
 Display the current state of the raxd daemon and the filesystem paths used for configuration, key
@@ -216,12 +223,13 @@ alone prints the group's help.
 - **Short:** `Manage API keys`
 - **Long:** Create, list, and delete API keys used to authenticate remote access.
 
-> **Scope note.** Keys created here are now consumed over the network: `raxd serve` authenticates
-> every connection against the same `keys.db`. A client presents the full key in the HTTP
-> `Authorization: Bearer <key>` header (see [`raxd serve`](#raxd-serve)). What is still missing is
-> what runs *behind* authentication — command execution, the MCP server, and file upload are not
-> implemented yet (the server answers any route other than the health check with `501 Not
-> Implemented`). See the README's "Coming next".
+> **Scope note.** Keys created here are consumed over the network: `raxd serve` authenticates every
+> connection against the same `keys.db`. A client presents the full key in the HTTP
+> `Authorization: Bearer <key>` header (see [`raxd serve`](#raxd-serve)). The **same** key
+> authenticates the **MCP server** on the `/mcp` route (see [`mcp.md`](mcp.md)). What is still
+> missing is what runs *behind* this transport for general work — command execution and file upload
+> are not implemented yet, and any route other than the health check and `/mcp` answers `501 Not
+> Implemented`. See the README's "Coming next".
 
 ### How a key is stored (security model)
 
@@ -281,7 +289,8 @@ When `--name` is not provided, the label is shown as `-`:
 **Key format.** The key body is `rax_live_` followed by a base64url-encoded random value with no
 padding. The random part is 32 bytes (256 bits) of cryptographically secure randomness, so the full
 key is roughly 52 characters long (`rax_live_` plus 43 base64url characters). This is the exact
-string a network client sends to `raxd serve` as `Authorization: Bearer rax_live_…`.
+string a network client sends to `raxd serve` as `Authorization: Bearer rax_live_…` — including an
+MCP client connecting to `/mcp` (see [`mcp.md`](mcp.md#connection-parameters)).
 
 **Capturing only the key (scripts/CI).** Because the key body is the only thing on stdout, you can
 redirect it to a file or capture it in a variable. The banner, warning, and metadata are on stderr:
@@ -353,8 +362,7 @@ Column rules:
 - **CREATED** is `YYYY-MM-DD`.
 - **LAST USED** is `YYYY-MM-DD`, or `never` if the key has not been used. Today keys typically show
   `never`: the network server records authentication in its audit stream (see [`raxd serve`](#raxd-serve)),
-  but the per-key last-used timestamp is only persisted by `FlushUsage` on a graceful shutdown, and
-  the health check is the only request that reaches a handler.
+  but the per-key last-used timestamp is only persisted by `FlushUsage` on a graceful shutdown.
 
 **Revoked keys are not shown.** A key that has been revoked with `key delete` disappears from this
 list. There is no flag to include revoked keys; the record is retained only for audit purposes.
@@ -398,7 +406,8 @@ not derived from the key body, so it is safe to show in confirmations, errors, a
 
 > **Revocation takes effect immediately on the network.** A running `raxd serve` verifies every
 > connection against the live `keys.db`, and `Verify` only considers active records. A key that you
-> revoke stops authenticating on its very next request — there is no cache or restart delay.
+> revoke stops authenticating on its very next request — there is no cache or restart delay. This
+> applies to MCP requests on `/mcp` too: a revoked key gets `401` before any tool runs.
 
 > **Audit line (stderr).** Like `key create`, a successful `key delete` also writes a single audit
 > record to **stderr** via `charmbracelet/log`, for example
@@ -473,8 +482,9 @@ receives `SIGINT` (Ctrl+C) or `SIGTERM`. It takes **no flags or positional argum
 
 ### What `serve` does (scope)
 
-This is the first networked piece of `raxd`. In its current form `serve` provides exactly two
-things: a **secure transport** and **per-connection authentication**.
+`serve` is the networked core of `raxd`. It provides a **secure transport**, **per-connection
+authentication**, and, behind that transport, two working endpoints: a **health check** and the
+**MCP server**.
 
 - **TLS 1.3 transport.** The TCP listener is wrapped in `crypto/tls` with `MinVersion =
   tls.VersionTLS13`. A client that offers only TLS 1.2 or lower fails the handshake. TLS 1.3
@@ -492,20 +502,26 @@ things: a **secure transport** and **per-connection authentication**.
   an environment variable.
 - **Host / Origin checks, rate limiting, and an audit log** run as part of the same fixed
   middleware chain (described below).
-- **One real operation: a health check.** After successful authentication, the only route that does
-  real work is `GET /healthz`, which returns `pong`. Every other path returns `501 Not Implemented`.
+- **Two operations behind authentication:**
+  - **Health check** — `GET /healthz` returns `pong`.
+  - **MCP server** — the `/mcp` route serves the Model Context Protocol over Streamable HTTP, behind
+    the same authentication, `Host`/`Origin` checks, rate limiting, and audit. It exposes two
+    read-only tools (`ping`, `server_info`). See [`mcp.md`](mcp.md) for the full integration guide.
+
+Every **other** path still returns `501 Not Implemented`.
 
 **Out of scope for `serve` today (not implemented):**
 
 - Command execution over the network (no shell, no `exec`).
-- The MCP server and its tools/resources.
 - File upload.
+- MCP tools beyond `ping` / `server_info`, and MCP Resources / Prompts.
 - mTLS / client certificates.
 - Registering `raxd` as a systemd/launchd service (`serve` is foreground only — there is no
   `--daemon` mode and `raxd` does not install a service).
 
-These are future tasks. The catch-all route exists precisely as the extension point where they will
-attach; until then it answers `501`.
+These are future tasks. The catch-all route exists precisely as the extension point where command
+execution and file upload will attach; until then any route other than `/healthz` and `/mcp`
+answers `501`.
 
 ### The request pipeline
 
@@ -520,12 +536,18 @@ TLS 1.3 handshake
   → authentication (Bearer → Verify) → 401 / 403 if rejected
   → rate limit (per-key + per-IP)    → 429 if exceeded
   → router:  GET /healthz → 200 pong
+             /mcp         → MCP server (Streamable HTTP)
              anything else → 501 not implemented
 ```
 
+The MCP server sits **behind** the entire chain: a request to `/mcp` must pass Host/Origin, auth, and
+rate-limit just like any other, and only then reaches the MCP handler.
+
 The audit stream records exactly **one** record per request that reaches the audit-aware chain
-(Host/Origin, auth, rate-limit, or the success path). The outermost layer — the body-size limit — is
-the one exception: a `413` produced there is **not** audited (see the response-codes note below).
+(Host/Origin, auth, rate-limit, or the success path), plus — for a `/mcp` tool call — one additional
+MCP record written by the tool layer (see [Audit stream](#audit-stream)). The outermost layer — the
+body-size limit — is the one exception: a `413` produced there is **not** audited (see the
+response-codes note below).
 
 ### Response codes
 
@@ -539,7 +561,13 @@ the one exception: a `413` produced there is **not** audited (see the response-c
 | Per-key or per-IP rate limit exceeded | `429 Too Many Requests` |
 | Request body larger than `max_body_bytes` | `413` (via `http.MaxBytesReader`) |
 | Authenticated `GET /healthz` | `200 OK` (body `pong`) |
+| Authenticated `POST /mcp` (valid JSON-RPC) | `200 OK` (JSON-RPC response) |
+| Authenticated `GET /mcp` (no SSE stream offered) | `405 Method Not Allowed` |
 | Authenticated request to any other route | `501 Not Implemented` (body `not implemented`) |
+
+> **MCP protocol errors are JSON-RPC, not HTTP status codes.** Inside an authenticated `POST /mcp`,
+> a malformed body or an unknown tool is reported as a JSON-RPC error (`-32700` / `-32600` /
+> `-32601` / `-32602`) with HTTP `200`, not as a `4xx`/`501`. See [`mcp.md`](mcp.md#behaviour-and-error-handling).
 
 > **The `413` from the body limit is not audited.** The body-size limit
 > (`bodyLimitMiddleware`) is the **outermost** layer in the chain — it runs before the auth and
@@ -600,11 +628,15 @@ but it warns that every connection will be rejected with `401`:
 
 ```
 
+> The `listening https://127.0.0.1:7822` address is also the base for the MCP endpoint: connect an
+> MCP client to `https://127.0.0.1:7822/mcp` (see [`mcp.md`](mcp.md#connection-parameters)).
+
 ### Audit stream
 
-Once running, `serve` writes **one structured line per request** to stderr, using
-`charmbracelet/log` in `key=value` form. Silence means health: there are no heartbeat lines. The
-format is:
+Once running, `serve` writes structured lines to stderr, using `charmbracelet/log` in `key=value`
+form. Silence means health: there are no heartbeat lines.
+
+**Connection records** — one per request that reaches the audit-aware chain:
 
 ```
 time=<UTC ISO-8601> level=<INFO|WARN> msg=<AUTH|FAIL|DENY|RATE> fp=<fingerprint> remote=<IP:port> [reason="<text>"]
@@ -622,6 +654,19 @@ time=<UTC ISO-8601> level=<INFO|WARN> msg=<AUTH|FAIL|DENY|RATE> fp=<fingerprint>
 | `DENY` | `WARN` | Corrupt key store (`403`), bad `Host` (`403`), or bad `Origin` (`403`) |
 | `RATE` | `WARN` | Rate limit exceeded (`429`), per-key or per-IP |
 
+**MCP records** — one additional line per `/mcp` tool call (`tools/call`), written by the MCP layer:
+
+```
+time=<UTC ISO-8601> level=INFO msg=MCP fp=<fingerprint> remote=<IP:port> tool=<name> result=ok
+```
+
+- `tool` is the tool name (`ping` or `server_info`). The `tool=` field appears **only** on `MCP`
+  records; the connection records (`AUTH`/`FAIL`/`DENY`/`RATE`) never carry it.
+- Same `fp` and `remote` as the `AUTH` line for the same request — the key body is never logged.
+
+So one authenticated `tools/call` produces **two** lines: the `AUTH` connection record and the `MCP`
+tool record. See [`mcp.md`](mcp.md#audit) for the MCP audit details.
+
 > **The body-size `413` has no audit line.** The `413` returned when a request body exceeds
 > `max_body_bytes` is generated by the outermost `http.MaxBytesReader` layer, which sits **before**
 > the audit-aware middlewares. Unlike the `401` / `403` / `429` cases above, it does **not** produce
@@ -632,6 +677,7 @@ Examples:
 
 ```
 time=2026-05-21T14:32:01Z level=INFO msg=AUTH fp=a3f9c1d2e847 remote=127.0.0.1:54312
+time=2026-05-21T14:32:01Z level=INFO msg=MCP  fp=a3f9c1d2e847 remote=127.0.0.1:54312 tool=ping result=ok
 time=2026-05-21T14:32:05Z level=WARN msg=FAIL fp=- remote=127.0.0.1:54401 reason="no authorization header"
 time=2026-05-21T14:32:07Z level=WARN msg=FAIL fp=b7d2a0c19f3e remote=127.0.0.1:54402 reason="authentication failed"
 time=2026-05-21T14:32:09Z level=WARN msg=DENY fp=- remote=127.0.0.1:54403 reason="key store unavailable"
@@ -649,13 +695,17 @@ raxd serve 2>server.log
 
 # Watch only failures:
 raxd serve 2>&1 | grep -E "FAIL|DENY|RATE"
+
+# Watch only MCP tool calls:
+raxd serve 2>&1 | grep "msg=MCP"
 ```
 
-### Calling the health check
+### Calling the endpoints
 
-The health check is the only working endpoint. It requires a valid key. Because the certificate is
-self-signed, a client must trust it or skip verification — the example below uses `curl -k` for a
-controlled local test:
+Both working endpoints require a valid key. Because the certificate is self-signed, a client must
+trust it or skip verification — the examples below use `curl -k` for a controlled local test.
+
+**Health check** (`GET /healthz`):
 
 ```sh
 # From inside the container running `raxd serve`, with KEY set to a created key:
@@ -665,7 +715,21 @@ curl -k -H "Authorization: Bearer $KEY" https://127.0.0.1:7822/healthz
 
 - Without the header you get `401` (and a `FAIL` audit line); the body is empty.
 - With a valid key, `/healthz` returns `200` and the body `pong`.
-- Any other path (for example `/exec`, `/mcp`) returns `501` with the body `not implemented`.
+
+**MCP server** (`POST /mcp`): a JSON-RPC `initialize`/`tools/list`/`tools/call` request. See the
+full smoke-test and client setup in [`mcp.md`](mcp.md#curl-smoke-test). A quick `ping`:
+
+```sh
+curl -k https://127.0.0.1:7822/mcp \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"ping","arguments":{}}}'
+# → {"jsonrpc":"2.0","id":3,"result":{"content":[{"type":"text","text":"pong"}],"isError":false}}
+```
+
+- A `GET /mcp` returns `405` (the server is stateless and offers no server→client stream).
+- Any other path (for example `/exec`) still returns `501` with the body `not implemented`.
 
 ### Graceful shutdown
 
@@ -774,13 +838,14 @@ In this YAML case the `bind_addr` reference is incidental: the actionable part i
 - The private TLS key is `0600`; the certificate `0644`; the TLS directory `0700`.
 - An existing certificate is reused and never silently overwritten.
 - The default bind address is `127.0.0.1` (loopback only).
-- Every connection is authenticated before any handler runs; the key is taken only from the
-  `Authorization: Bearer` header, never from argv or the environment.
+- Every connection is authenticated before any handler runs — including `/mcp`; the key is taken only
+  from the `Authorization: Bearer` header, never from argv or the environment.
 - Rejections return an empty body; the reason lives only in the audit stream (except the body-limit
   `413`, which is not audited at all).
 - The audit stream logs the fingerprint, never the key body or the raw `Authorization` header.
 - Rate limiting applies per-key and per-IP.
-- The only operation behind authentication is the health check; everything else is `501`.
+- The operations behind authentication are the health check and the MCP server (`ping`,
+  `server_info`); everything else is `501`.
 
 ---
 
@@ -814,7 +879,7 @@ error: config port: not implemented yet
 > The help text notes that the default port is `7822`. This command does **not** write anything to
 > `config.yaml` yet — actually persisting the port is planned (see the README's "Coming next"). To
 > change the port today, edit the `port:` key in `config.yaml` by hand; `raxd serve` reads it on the
-> next start.
+> next start, and the MCP endpoint follows the same port.
 
 ---
 
@@ -831,6 +896,9 @@ error: config port: not implemented yet
 | `raxd serve` | stderr | graceful shutdown | startup error (port/cert/db/bind/config) | working |
 | `raxd config port` | stderr | — | yes | stub |
 
-See also: [`configuration.md`](configuration.md) for paths, `keys.db`, `config.yaml`, and the
+> Not a CLI command: the **MCP server** is hosted by `raxd serve` on `/mcp` — see [`mcp.md`](mcp.md).
+
+See also: [`mcp.md`](mcp.md) for the MCP integration guide;
+[`configuration.md`](configuration.md) for paths, `keys.db`, `config.yaml`, and the
 networking/`serve` fields; [`development.md`](development.md) for building and testing in Docker;
 [`troubleshooting.md`](troubleshooting.md) for common `serve` problems.
