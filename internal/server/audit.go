@@ -46,6 +46,18 @@ type AuditRecord struct {
 
 	// TimedOut — true если команда была прервана по таймауту.
 	TimedOut bool
+
+	// --- upload-специфичные поля (SR-79/plan §Contracts) ---
+	// Логируются ТОЛЬКО при Tool=="upload_file"; не-upload и не-exec записи не меняются.
+	// SECURITY (SR-80): только относительный путь; содержимое файла НЕ логируется НИКОГДА.
+
+	// Path — относительный путь назначения внутри upload root (SR-79/SR-80).
+	// НЕ абсолютный путь. Пусто если путь неизвестен (ранний deny до парса пути).
+	Path string
+
+	// Size — число записанных байт (только в success-ветке; SR-78/SR-79).
+	// В deny/fail — нерелевантен (запись не выполнена).
+	Size int64
 }
 
 // AuditFn is the function signature for writing an audit record.
@@ -68,6 +80,9 @@ type AuditFn func(rec AuditRecord)
 // SR-55: Result:"warn" — отдельный уровень для root-WARN (семантически отличен от deny).
 // SR-59/ADR-002: exec-поля (command/args/exit_code/duration/timed_out) логируются
 // ТОЛЬКО при Tool=="execute_command" — не-exec записи не меняются.
+// SR-79: upload-поля (path/size) логируются ТОЛЬКО при Tool=="upload_file" — через
+// ветку isUpload в КАЖДОМ case. Не-upload и не-exec записи не меняются.
+// SECURITY (SR-80): содержимое файла (content/decoded) НЕ логируется НИКОГДА.
 func writeAudit(logger *clog.Logger, rec AuditRecord) {
 	fp := rec.Fingerprint
 	if fp == "" {
@@ -75,6 +90,7 @@ func writeAudit(logger *clog.Logger, rec AuditRecord) {
 	}
 
 	isExec := rec.Tool == "execute_command"
+	isUpload := rec.Tool == "upload_file"
 
 	switch rec.Result {
 	case "success":
@@ -99,6 +115,17 @@ func writeAudit(logger *clog.Logger, rec AuditRecord) {
 					"duration", rec.Duration,
 					"timed_out", rec.TimedOut,
 				)
+			} else if isUpload {
+				// SR-79: upload-поля в success-ветке (tool/result/path/size).
+				// SECURITY (SR-80): содержимое файла НЕ логируется.
+				logger.Info("MCP",
+					"fp", fp,
+					"remote", rec.RemoteAddr,
+					"tool", rec.Tool,
+					"result", "ok",
+					"path", rec.Path,
+					"size", rec.Size,
+				)
 			} else {
 				logger.Info("MCP",
 					"fp", fp,
@@ -115,9 +142,9 @@ func writeAudit(logger *clog.Logger, rec AuditRecord) {
 			)
 		}
 	case "warn":
-		// Result:"warn" — предупреждение (не отказ): команда может продолжить выполнение.
-		// Используется для root-WARN (SR-55): raxd запущен с euid==0.
-		// Семантически отличен от "deny": команда ещё не отклонена/не выполнена на этом уровне.
+		// Result:"warn" — предупреждение (не отказ): команда/запись может продолжить.
+		// Используется для root-WARN (SR-55/SR-77): raxd запущен с euid==0.
+		// Семантически отличен от "deny": действие ещё не отклонено/не выполнено на этом уровне.
 		if isExec {
 			logger.Warn("WARN",
 				"fp", fp,
@@ -127,6 +154,25 @@ func writeAudit(logger *clog.Logger, rec AuditRecord) {
 				"command", rec.Command,
 				"args", formatArgs(rec.Args),
 			)
+		} else if isUpload {
+			// SR-79: upload warn (root-предупреждение); path если известен.
+			// ключа result= нет (mcp-spec §2.3.1).
+			if rec.Path != "" {
+				logger.Warn("WARN",
+					"fp", fp,
+					"remote", rec.RemoteAddr,
+					"tool", rec.Tool,
+					"reason", rec.Reason,
+					"path", rec.Path,
+				)
+			} else {
+				logger.Warn("WARN",
+					"fp", fp,
+					"remote", rec.RemoteAddr,
+					"tool", rec.Tool,
+					"reason", rec.Reason,
+				)
+			}
 		} else {
 			logger.Warn("WARN",
 				"fp", fp,
@@ -145,6 +191,25 @@ func writeAudit(logger *clog.Logger, rec AuditRecord) {
 				"command", rec.Command,
 				"args", formatArgs(rec.Args),
 			)
+		} else if isUpload {
+			// SR-79: upload fail (I/O-ошибка); path если известен.
+			// ключа result= нет.
+			if rec.Path != "" {
+				logger.Warn("FAIL",
+					"fp", fp,
+					"remote", rec.RemoteAddr,
+					"tool", rec.Tool,
+					"reason", rec.Reason,
+					"path", rec.Path,
+				)
+			} else {
+				logger.Warn("FAIL",
+					"fp", fp,
+					"remote", rec.RemoteAddr,
+					"tool", rec.Tool,
+					"reason", rec.Reason,
+				)
+			}
 		} else {
 			logger.Warn("FAIL",
 				"fp", fp,
@@ -163,6 +228,25 @@ func writeAudit(logger *clog.Logger, rec AuditRecord) {
 				"command", rec.Command,
 				"args", formatArgs(rec.Args),
 			)
+		} else if isUpload {
+			// SR-79: upload deny (traversal/exists/isdir/too-large/bad-base64/bad-mode/deny_root).
+			// ключа result= нет.
+			if rec.Path != "" {
+				logger.Warn("DENY",
+					"fp", fp,
+					"remote", rec.RemoteAddr,
+					"tool", rec.Tool,
+					"reason", rec.Reason,
+					"path", rec.Path,
+				)
+			} else {
+				logger.Warn("DENY",
+					"fp", fp,
+					"remote", rec.RemoteAddr,
+					"tool", rec.Tool,
+					"reason", rec.Reason,
+				)
+			}
 		} else {
 			logger.Warn("DENY",
 				"fp", fp,
