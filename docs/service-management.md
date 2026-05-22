@@ -206,7 +206,8 @@ confirming it owns nothing you still need outside `raxd`:
 The data directory is **not** removed by uninstall either. The `data in … is preserved` hint names
 the real, platform-specific state directory: `/var/lib/raxd` on Linux, `/usr/local/var/raxd` on
 macOS. Remove the state directory by hand only when you are sure you no longer need `keys.db`, the TLS
-material, or any audit data it holds.
+material, or any audit data it holds. This UID-reuse residual risk is also listed in
+[`production-readiness.md`](production-readiness.md#6-service-uninstall-keeps-the-raxd-user-and-data-uid-reuse).
 
 ## 4. Audit-log rotation
 
@@ -272,7 +273,8 @@ What **must** be verified on a real macOS host before a macOS release (escalatio
 - the privileged-port mechanics (see [§2](#macos)).
 
 Do not read any macOS behaviour in these docs as "tested in Docker" — the Linux integration is what
-is exercised in the container.
+is exercised in the container. This macOS-outside-Docker limitation is also tracked in
+[`production-readiness.md`](production-readiness.md#4-macos-gatekeeper--launchd-verified-outside-docker-ор-4).
 
 ## 6. Restart on failure vs. graceful stop
 
@@ -345,5 +347,10 @@ error, never a raw `systemctl` trace or any secret).
 - [`execute-command-security.md`](execute-command-security.md) and
   [`file-upload-security.md`](file-upload-security.md) — the per-tool security guides whose root-level
   residual risks the non-root service layout closes.
+- [`production-readiness.md`](production-readiness.md) — known limitations and pending pre-release
+  items (the UID-reuse-on-uninstall and macOS-outside-Docker risks are summarised there).
 - [`development.md`](development.md) — building and testing in Docker.
-</content>
+
+## Author
+
+**Vladimir Kovalev, OEM TECH** — author of raxd.

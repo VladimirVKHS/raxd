@@ -576,7 +576,9 @@ you still need:
 The state directory is **not** removed by `uninstall` either, so `keys.db` and any data survive.
 (The uninstall hint names the real, platform-specific state directory: `/var/lib/raxd` on Linux,
 `/usr/local/var/raxd` on macOS.) See
-[`service-management.md`](service-management.md#3-the-raxd-user-is-kept-after-uninstall).
+[`service-management.md`](service-management.md#3-the-raxd-user-is-kept-after-uninstall). This
+UID-reuse residual risk is also summarised in
+[`production-readiness.md`](production-readiness.md#6-service-uninstall-keeps-the-raxd-user-and-data-uid-reuse).
 
 ### The journal fills up despite the size cap
 
@@ -931,4 +933,9 @@ sure the user running `raxd` has a home directory set.
 - [`file-upload-security.md`](file-upload-security.md) — mandatory security warnings for `upload_file`.
 - [`configuration.md`](configuration.md) — paths, the service layout, `keys.db`, the TLS directory,
   and the `config.yaml` networking, `exec`, and `upload` fields.
+- [`production-readiness.md`](production-readiness.md) — known limitations and pending pre-release items.
 - [`development.md`](development.md) — building and testing in Docker.
+
+## Author
+
+**Vladimir Kovalev, OEM TECH** — author of raxd.

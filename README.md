@@ -1,21 +1,26 @@
 # raxd
 
-**raxd** is a remote access daemon for AI agents — a single cross-platform Go binary that is meant
-to act as a system service, a CLI utility, a network server (TCP + TLS), and an MCP server for AI
-agents, all at once.
+**raxd** is a remote access daemon for AI agents — a single cross-platform Go binary that acts as a
+system service, a CLI utility, a network server (TCP + TLS), and an MCP server for AI agents, all at
+once.
 
-> **Project status: early.** The command tree, configuration/path resolution, build metadata, a
-> product banner, a reproducible Docker dev/test environment, **API key management**
-> (`key create` / `key list` / `key delete`), the **TLS network server** (`raxd serve`), the first
-> **MCP server** (the `ping` and `server_info` tools), **command execution over MCP** (the
-> `execute_command` tool), and **file upload over MCP** (the `upload_file` tool) — all on the `/mcp`
-> route — are in place and working. **Registering `raxd` as a managed system service**
-> (`raxd service install` / `start` / `stop` / `status` / `uninstall`, systemd on Linux, launchd on
-> macOS) is now in place too, running the daemon under an unprivileged `raxd` user. The latest piece,
-> the **`curl | sh` installer** (`install.sh` — platform detection, SHA256 verification, non-root
-> install), is now implemented and verified end-to-end in Docker; what remains is publishing the
-> release artifacts to a public HTTPS host (the default download URL is still a placeholder). See
-> [Installation](#installation) and [`docs/installation.md`](docs/installation.md).
+> **Project status: feature-complete for v1.** Every capability the binary is built around is
+> implemented and verified in Docker: the command tree and configuration/path resolution, build
+> metadata and the product banner, **API key management** (`key create` / `key list` / `key delete`),
+> the **TLS 1.3 network server** (`raxd serve`), the **MCP server** on `/mcp` with the `ping`,
+> `server_info`, **`execute_command`** (runs a command on the host), and **`upload_file`** (writes a
+> file on the host) tools, the **system-service integration** (`raxd service install` / `start` /
+> `stop` / `status` / `uninstall`, systemd on Linux, launchd on macOS, running the daemon as the
+> unprivileged `raxd` user), and the **`curl | sh` installer** (`install.sh`) with a reproducible
+> release matrix (four `tar.gz` archives + `SHA256SUMS`).
+>
+> **What is still pending before a public production release** (honest, not yet done): a public HTTPS
+> host that serves the artifacts (the default download URL is a placeholder), a **GPG/minisign
+> signature** of `SHA256SUMS`, **macOS Apple-Developer-ID notarization**, and a **`LICENSE`** file.
+> These and the other known limitations are listed in one place in
+> [`docs/production-readiness.md`](docs/production-readiness.md) — **read it before deploying to a real
+> host.** The single stub command remaining is `raxd config port` (edit `config.yaml` by hand for
+> now). See [Installation](#installation) and [`docs/installation.md`](docs/installation.md).
 
 Author: **Vladimir Kovalev, OEM TECH**.
 
@@ -33,11 +38,11 @@ server. The end product is a single binary that is simultaneously:
 
 Target platforms: **macOS and Linux**, architectures **amd64 and arm64**. Windows is out of scope.
 
-At this stage the binary provides a stable command tree, the local foundation (API keys stored
-securely on disk), the networked core, and system-service registration. `raxd serve` opens a TLS 1.3
-listener, authenticates every connection against those keys, and serves an MCP endpoint on `/mcp`
-with two read-only tools (`ping`, `server_info`), the security-critical `execute_command` tool (runs
-a command on the host), and the `upload_file` tool (writes a file on the host). For production,
+The binary provides a stable command tree, the local foundation (API keys stored securely on disk),
+the networked core, and system-service registration. `raxd serve` opens a TLS 1.3 listener,
+authenticates every connection against those keys, and serves an MCP endpoint on `/mcp` with two
+read-only tools (`ping`, `server_info`), the security-critical `execute_command` tool (runs a command
+on the host), and the `upload_file` tool (writes a file on the host). For production,
 `raxd service install` registers that `raxd serve` as a managed OS service — with autostart, restart
 on failure, and a graceful stop — running the daemon as the unprivileged `raxd` user (not root).
 
@@ -86,7 +91,8 @@ on failure, and a graceful stop — running the daemon as the unprivileged `raxd
 Behind authentication, the working routes today are the health check (`GET /healthz`) and the MCP
 server (`/mcp`, with `ping`, `server_info`, `execute_command`, and `upload_file`). Every other route
 returns `501 Not Implemented`. Everything in the [Coming next](#coming-next) section is **not
-implemented yet**.
+implemented yet**, and every pending production-release item is collected in
+[`docs/production-readiness.md`](docs/production-readiness.md).
 
 > **`execute_command` and `upload_file` are dangerous.** `execute_command` runs an arbitrary binary
 > on the host on behalf of an authenticated client — remote code execution of the SSH class.
@@ -127,7 +133,8 @@ register the system service afterwards, run `raxd service install`.
 > with `RAXD_BASE_URL`, install manually from a release archive (with SHA256 verification), or build
 > the artifacts from source in Docker (`make release-all`). The trust model (v1 relies on TLS + SHA256
 > with **no** GPG signature yet) and every option are documented in full in
-> [`docs/installation.md`](docs/installation.md).
+> [`docs/installation.md`](docs/installation.md); the full pending-release checklist is in
+> [`docs/production-readiness.md`](docs/production-readiness.md).
 
 To build everything yourself and verify the install-flow locally, see
 [`docs/installation.md`](docs/installation.md#building-release-artifacts-from-source) and
@@ -418,21 +425,24 @@ Prints a single line to **stdout** and exits with code `0`. On a build without l
 raxd dev (commit none, built unknown)
 ```
 
-A release build injects real values via ldflags, for example:
+A release build injects real values via ldflags. The version is whatever was passed in `VERSION`
+(typically a `v`-prefixed git tag), printed exactly as provided — for example:
 
 ```
-raxd 1.0.0 (commit abc1234, built 2025-06-01)
+raxd v0.1.0 (commit abc1234, built 2026-05-22)
 ```
 
 ### Example: `raxd status`
 
 Prints the daemon state and the resolved filesystem paths to **stdout** and exits with code `0`.
 `status` reports on-disk paths only and does not probe a running `serve` process, so `state` is
-shown as `not running` even while a server is listening:
+shown as `not running` even while a server is listening. If `config.yaml` does not exist yet (the
+common case on a fresh install), the `config` line carries an informational `(not found, defaults
+applied)` suffix and the exit code is still `0`:
 
 ```
   state    not running
-  config   /home/user/.config/raxd/config.yaml
+  config   /home/user/.config/raxd/config.yaml  (not found, defaults applied)
   keys     /home/user/.local/state/raxd/keys.db
   tls      /home/user/.local/state/raxd/tls
 ```
@@ -487,7 +497,9 @@ are in [`docs/configuration.md`](docs/configuration.md).
 ## Coming next
 
 The following capabilities are **planned and not implemented yet**. They are listed so you know what
-the binary is being built toward; do not treat them as available today.
+the binary is being built toward; do not treat them as available today. The production-release gating
+items (host, signature, notarization, license) are tracked in
+[`docs/production-readiness.md`](docs/production-readiness.md).
 
 - **Public release host + signed artifacts** — the `install.sh` installer and the reproducible release
   matrix (4 archives + `SHA256SUMS`) exist and are verified in Docker, but the artifacts are not yet
@@ -537,6 +549,10 @@ the binary is being built toward; do not treat them as available today.
   policy, no disk quota, residual risks).
 - [`docs/configuration.md`](docs/configuration.md) — paths, the service layout, `keys.db`, the TLS
   directory, and the `config.yaml` networking, `exec`, and `upload` fields.
+- [`docs/production-readiness.md`](docs/production-readiness.md) — the consolidated **production
+  readiness / known limitations** page: every pending pre-release item (host, signature, notarization,
+  license) and the residual risks (no disk quota, args/path logging, root-WARN default, UID-reuse on
+  uninstall, macOS-outside-Docker), with the escalation that closes each.
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — common problems with installation, `serve`,
   the service, the TLS certificate, keys, the config file, `execute_command`, and `upload_file`.
 - [`docs/development.md`](docs/development.md) — building and testing in Docker, project layout, and
@@ -549,4 +565,5 @@ of this README.
 
 ## License
 
-No license file is present in the repository yet; licensing terms are not defined at this stage.
+No license file is present in the repository yet; licensing terms are not defined at this stage. See
+[`docs/production-readiness.md`](docs/production-readiness.md) for the pending pre-release items.
