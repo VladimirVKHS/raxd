@@ -98,7 +98,7 @@ go vet -mod=vendor ./... && go test -mod=vendor -count=1 ./...
 
 ### Docker-вывод
 
-**До исправлений (коммит до 4876696, верифицирован дирижёром):**
+**Round 1 — до исправлений (верифицирован дирижёром, коммит до 4876696):**
 
 ```
 docker build --target test -t raxd-test-svc .  →  OK
@@ -121,9 +121,34 @@ ok  github.com/vladimirvkhs/raxd/internal/version    0.001s
 # -race: cmdexec 2.191s / fileupload 1.092s / keystore 1.329s / server 4.122s / mcp 6.219s
 ```
 
-479 RUN-тестов, 0 FAIL.
+479 тестов, 0 FAIL.
 
-**После исправлений ISSUE-1..7 (коммит 4876696):** ожидается Docker-верификация от дирижёра. Локально (хост): `go test ./... -count=1` — все 12 пакетов PASS.
+**Round 2 — после исправлений ISSUE-1..7 (коммиты 4876696/5a1f6cf, верифицирован дирижёром):**
+
+```
+docker build --target test -t raxd-test-svc .  →  OK
+
+docker run --rm raxd-test-svc
+# go vet ./... + go test ./... + -race (cmdexec/fileupload/keystore/server/mcp):
+
+ok  github.com/vladimirvkhs/raxd
+ok  github.com/vladimirvkhs/raxd/internal/banner
+ok  github.com/vladimirvkhs/raxd/internal/cli
+ok  github.com/vladimirvkhs/raxd/internal/cmdexec
+ok  github.com/vladimirvkhs/raxd/internal/config
+ok  github.com/vladimirvkhs/raxd/internal/fileupload
+ok  github.com/vladimirvkhs/raxd/internal/keystore
+ok  github.com/vladimirvkhs/raxd/internal/mcp        4.3s
+ok  github.com/vladimirvkhs/raxd/internal/server
+ok  github.com/vladimirvkhs/raxd/internal/service
+ok  github.com/vladimirvkhs/raxd/internal/version
+
+# -race: cmdexec 2.18s / fileupload 1.05s / keystore 1.22s / server 4.14s / mcp 6.12s
+```
+
+11 пакетов PASS, 0 FAIL. Включает:
+- `internal/service` — `TestRunManager_RawStderrNotPropagated` (реальный sentinel-assert, ISSUE-4 fix), `TestResolveManagerWithPort_*` (ISSUE-1 fix)
+- `internal/cli` — `resolveManagerWithPort` читает port из config.Load(); status/install output содержат port/autostart/unit_path (ISSUE-2/3/6)
 
 Подтверждено в Docker:
 - SR-90 анти-инъекция: `TestValidateTemplateData_UserInjection` (newline/equals), `TestRenderUnit_InjectionRejectedBeforeRender`, `TestRenderPlist_InjectionRejectedBeforeRender` — PASS
@@ -185,7 +210,7 @@ ok  github.com/vladimirvkhs/raxd/internal/version    0.001s
 
 ## Известные ограничения
 
-- **Docker-верификация после исправлений (коммит 4876696):** локально все тесты PASS (`go test ./... -count=1` — 12 пакетов, 0 FAIL). Docker-прогон ожидается от дирижёра; предыдущая верификация (479 тестов PASS) была до ISSUE-1..7 fixes.
+- **Docker-верификация:** проведена дважды. Round 1 (до ISSUE-1..7 fixes): 479 тестов PASS. Round 2 (коммиты 4876696/5a1f6cf, ISSUE-1..7 fixes): 11 пакетов PASS, 0 FAIL.
 - **Кросс-сборка `make build-all`:** Makefile и Dockerfile.systemd созданы system-dev; кросс-сборка компилируется без ошибок (go build проверен локально), финальная верификация с `make verify-cross` — в Docker
 - **macOS createUser:** `launchd.go` создаёт директории через `runCommandRaw` + chown (ISSUE-7 fix) — логика присутствует, но не тестируется на Linux. QA проверяет на реальном macOS
 - **Расширение security_static_test.go:** потребовалось добавить `internal/service` в whitelist exec-теста; задокументировано в коммите и выше в отклонениях
