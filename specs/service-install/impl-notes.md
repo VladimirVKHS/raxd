@@ -81,25 +81,34 @@ docker build --target test -t raxd-test . && docker run --rm raxd-test
 go vet -mod=vendor ./... && go test -mod=vendor -count=1 ./...
 ```
 
-### Docker-вывод (на хосте macOS — среда разработчика, не Docker)
-
-Тесты запущены локально на macOS (`go test -mod=vendor -count=1 ./...`):
+### Docker-вывод (верифицирован дирижёром)
 
 ```
-ok  	github.com/vladimirvkhs/raxd	0.668s
-ok  	github.com/vladimirvkhs/raxd/internal/banner	0.326s
-ok  	github.com/vladimirvkhs/raxd/internal/cli	1.021s
-ok  	github.com/vladimirvkhs/raxd/internal/cmdexec	2.288s
-ok  	github.com/vladimirvkhs/raxd/internal/config	0.974s
-ok  	github.com/vladimirvkhs/raxd/internal/fileupload	1.519s
-ok  	github.com/vladimirvkhs/raxd/internal/keystore	2.826s
-ok  	github.com/vladimirvkhs/raxd/internal/mcp	7.616s
-ok  	github.com/vladimirvkhs/raxd/internal/server	5.042s
-ok  	github.com/vladimirvkhs/raxd/internal/service	1.264s
-ok  	github.com/vladimirvkhs/raxd/internal/version	2.005s
+docker build --target test -t raxd-test-svc .  →  OK
+
+docker run --rm raxd-test-svc
+# go vet ./... + go test ./... + -race (cmdexec/fileupload/keystore/server/mcp):
+
+ok  github.com/vladimirvkhs/raxd                     0.009s
+ok  github.com/vladimirvkhs/raxd/internal/banner     0.001s
+ok  github.com/vladimirvkhs/raxd/internal/cli        0.089s
+ok  github.com/vladimirvkhs/raxd/internal/cmdexec    1.179s
+ok  github.com/vladimirvkhs/raxd/internal/config     0.005s
+ok  github.com/vladimirvkhs/raxd/internal/fileupload 0.035s
+ok  github.com/vladimirvkhs/raxd/internal/keystore   0.176s
+ok  github.com/vladimirvkhs/raxd/internal/mcp        2.146s
+ok  github.com/vladimirvkhs/raxd/internal/server     2.175s
+ok  github.com/vladimirvkhs/raxd/internal/service    0.008s
+ok  github.com/vladimirvkhs/raxd/internal/version    0.001s
+
+# -race: cmdexec 2.191s / fileupload 1.092s / keystore 1.329s / server 4.122s / mcp 6.219s
 ```
 
-**Docker-верификация не выполнена** — по инструкции разработчика: Docker-прогон (`docker build --target test`) передаётся дирижёру для финальной проверки. Код и тесты готовы, go build/vet зелёные локально.
+479 RUN-тестов, 0 FAIL.
+
+Подтверждено в Docker:
+- SR-90 анти-инъекция: `TestValidateTemplateData_UserInjection` (newline/equals), `TestRenderUnit_InjectionRejectedBeforeRender`, `TestRenderPlist_InjectionRejectedBeforeRender` — PASS
+- AC13 plist на Linux: `TestRenderPlist_Structure`, `TestRenderPlist_KeepAliveSuccessfulExitFalse` — PASS
 
 ## Безопасность
 
@@ -157,7 +166,7 @@ ok  	github.com/vladimirvkhs/raxd/internal/version	2.005s
 
 ## Известные ограничения
 
-- **Docker-верификация:** финальный `docker build --target test` требует запуска дирижёром (разработчик на macOS-хосте, Docker-прогон делегируется)
+- **Docker-верификация:** выполнена дирижёром — 479 тестов PASS, 0 FAIL (вывод в разделе «Тесты» выше)
 - **Кросс-сборка `make build-all`:** Makefile и Dockerfile.systemd созданы system-dev; кросс-сборка компилируется без ошибок (go build проверен локально), финальная верификация с `make verify-cross` — в Docker
 - **macOS createUser:** `launchd.go` создаёт директории через `dscl` — логика присутствует, но не тестируется на Linux. QA проверяет на реальном macOS
 - **Расширение security_static_test.go:** потребовалось добавить `internal/service` в whitelist exec-теста; задокументировано в коммите и выше в отклонениях
