@@ -21,7 +21,7 @@
 | Назначение | Выбор | Статус / версия | URL |
 |---|---|---|---|
 | CLI + подкоманды | `spf13/cobra` | v1.10.x, активно | https://github.com/spf13/cobra |
-| Кроссплатформенный сервис | `kardianos/service` (+ генерация unit/plist) | maintained | https://github.com/kardianos/service |
+| Кроссплатформенный сервис | НЕ используется (ручная генерация unit/plist через stdlib `text/template`, ADR-001 service-install — без новой зависимости/вендоринга); `kardianos/service` рассмотрен и отклонён | n/a | — |
 | Стилизация вывода | `charmbracelet/lipgloss` (v2) | стабильный v2.0.x — импорт `charm.land/lipgloss/v2`; путь `github.com/charmbracelet/lipgloss/v2` — beta | https://github.com/charmbracelet/lipgloss |
 | Логи (цветные, человекочитаемые) | `charmbracelet/log` | активно | https://github.com/charmbracelet/log |
 | Таблицы (список ключей и т.п.) | `olekukonko/tablewriter` | maintained | https://github.com/olekukonko/tablewriter |
