@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -14,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/vladimirvkhs/raxd/internal/cmdexec"
 	"github.com/vladimirvkhs/raxd/internal/config"
+	"github.com/vladimirvkhs/raxd/internal/fileupload"
 	"github.com/vladimirvkhs/raxd/internal/keystore"
 	internalmcp "github.com/vladimirvkhs/raxd/internal/mcp"
 	"github.com/vladimirvkhs/raxd/internal/server"
@@ -97,11 +100,41 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		DenyRoot:         cfg.Exec.DenyRoot,
 	}
 
+	// Резолв upload root (SR-71/AC5a/plan §serve.go):
+	// пустой upload.root → <StateDir>/uploads (безопасный дефолт, НЕ /, НЕ /root).
+	uploadRoot := cfg.Upload.Root
+	if uploadRoot == "" {
+		uploadRoot = filepath.Join(paths.StateDir, "uploads")
+	}
+	// Создаём upload root с правами 0700 (SR-71/plan §serve.go).
+	// ВАЖНО: это НОВЫЙ код — не существующий EnsureDirs (который создаёт TLSDir/ConfigDir/StateDir).
+	if err := os.MkdirAll(uploadRoot, 0o700); err != nil {
+		fmt.Fprintf(stderr, "error: cannot create upload root directory: %s\n", err)
+		return err
+	}
+
+	// Парс DefaultMode (уже провалидирован в config.buildConfig; здесь только конвертация).
+	defaultModeVal, err := fileupload.ParseMode(cfg.Upload.DefaultMode)
+	if err != nil {
+		// Не должно достигаться (валидация в buildConfig), но на всякий случай.
+		fmt.Fprintf(stderr, "error: invalid upload.default_mode: %s\n", err)
+		return err
+	}
+
+	// Собираем fileupload.Config (plan §serve.go).
+	uplCfg := fileupload.Config{
+		UploadRoot:   uploadRoot,
+		MaxFileBytes: cfg.Upload.MaxFileBytes,
+		DefaultMode:  fs.FileMode(defaultModeVal),
+		DenyRoot:     cfg.Upload.DenyRoot,
+	}
+
 	// Build MCP handler (AC11/SR-29): same port/TLS as serve; no second auth channel (SR-28).
 	// auditFn for MCP uses the same logger channel as transport audit.
 	// ADR-004: execHandler manages its own exec-audit; not wrapped with withAudit.
+	// SR-78: uploadHandler manages its own upload-audit; not wrapped with withAudit.
 	auditFn := server.NewAuditFn(logger)
-	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, execCfg)
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, execCfg, uplCfg)
 	if err != nil {
 		fmt.Fprintf(stderr, "error: failed to build MCP handler: %s\n", err)
 		return err
