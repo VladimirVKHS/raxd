@@ -59,7 +59,7 @@ main() {
                 shift
                 prefix="${1:-}"
                 if [[ -z "$prefix" ]]; then
-                    echo "error: --prefix требует аргумент"
+                    echo "error: --prefix requires an argument"
                     exit 1
                 fi
                 ;;
@@ -67,36 +67,36 @@ main() {
                 shift
                 version="${1:-}"
                 if [[ -z "$version" ]]; then
-                    echo "error: --version требует аргумент"
+                    echo "error: --version requires an argument"
                     exit 1
                 fi
                 ;;
             -h|--help)
                 cat <<EOF
-install.sh — установщик raxd
+install.sh — raxd installer
 
-Использование:
+usage:
   curl -fsSL <url>/install.sh | bash
   bash install.sh [--prefix <dir>] [--version <tag>]
 
-Переменные окружения:
-  RAXD_BASE_URL   база URL артефактов (по умолчанию: боевой HTTPS-плейсхолдер)
-  RAXD_VERSION    тег версии (по умолчанию: latest)
-  RAXD_PREFIX     каталог установки (override авто-детекта)
+environment variables:
+  RAXD_BASE_URL   base URL for release artifacts (default: production HTTPS placeholder)
+  RAXD_VERSION    release tag (default: latest)
+  RAXD_PREFIX     install directory (overrides auto-detection)
 
-Коды выхода:
-  0  успех
-  1  общая ошибка
-  2  неподдерживаемая платформа
-  3  несовпадение SHA256
-  4  нет прав на запись / нет sudo
-  5  сбой скачивания
+exit codes:
+  0  success
+  1  general error
+  2  unsupported platform
+  3  SHA256 mismatch
+  4  no write permission / sudo unavailable
+  5  download failure
 EOF
                 exit 0
                 ;;
             *)
-                echo "error: неизвестный флаг: $1"
-                echo "hint: используйте --help для справки"
+                echo "error: unknown flag: $1"
+                echo "hint: use --help for usage information"
                 exit 1
                 ;;
         esac
@@ -117,8 +117,8 @@ EOF
         Linux)   os="linux" ;;
         Darwin)  os="darwin" ;;
         *)
-            echo "error: платформа не поддерживается: $raw_os"
-            echo "hint: поддерживаются только linux и darwin (macOS)"
+            echo "error: unsupported platform: $raw_os"
+            echo "hint: only linux and darwin (macOS) are supported"
             exit 2
             ;;
     esac
@@ -129,13 +129,13 @@ EOF
         x86_64)          arch="amd64" ;;
         aarch64|arm64)   arch="arm64" ;;
         *)
-            echo "error: архитектура не поддерживается: $raw_arch"
-            echo "hint: поддерживаются amd64 (x86_64) и arm64 (aarch64)"
+            echo "error: unsupported architecture: $raw_arch"
+            echo "hint: only amd64 (x86_64) and arm64 (aarch64) are supported"
             exit 2
             ;;
     esac
 
-    echo "==> определена платформа: ${os}/${arch}"
+    echo "==> detected platform: ${os}/${arch}"
 
     # ── Имя артефакта (AC16, SR-101) — единственный источник имён ─────────────
     # Согласовано с scripts/release.sh: raxd_<version>_<os>_<arch>.tar.gz
@@ -152,37 +152,37 @@ EOF
     elif command -v shasum >/dev/null 2>&1; then
         sha256_cmd="shasum"
     else
-        echo "error: не найдена утилита для проверки SHA256 (sha256sum или shasum)"
-        echo "hint: установите coreutils (linux) или используйте macOS 10.13+"
+        echo "error: no SHA256 utility found (sha256sum or shasum)"
+        echo "hint: install coreutils (linux) or use macOS 10.13+"
         exit 1
     fi
 
     # ── Скачивание архива и SHA256SUMS (SR-99, SR-103) ───────────────────────
 
-    echo "==> скачивание ${archive}..."
+    echo "==> downloading ${archive}..."
     if ! curl -fsSL "${archive_url}" -o "${tmpdir}/${archive}"; then
-        echo "error: сбой скачивания архива: ${archive_url}"
-        echo "hint: проверьте подключение к сети и корректность RAXD_BASE_URL/RAXD_VERSION"
+        echo "error: download failed: ${archive_url}"
+        echo "hint: check your network connection and verify RAXD_BASE_URL/RAXD_VERSION"
         exit 5
     fi
 
-    echo "==> скачивание SHA256SUMS..."
+    echo "==> downloading SHA256SUMS..."
     if ! curl -fsSL "${sums_url}" -o "${tmpdir}/SHA256SUMS"; then
-        echo "error: сбой скачивания SHA256SUMS: ${sums_url}"
-        echo "hint: проверьте доступность ${base_url}/SHA256SUMS"
+        echo "error: download failed: ${sums_url}"
+        echo "hint: check availability of ${base_url}/SHA256SUMS"
         exit 5
     fi
 
     # ── Проверка SHA256 ДО размещения (AC3, SR-100) ──────────────────────────
 
-    echo "==> проверка целостности SHA256..."
+    echo "==> verifying SHA256 integrity..."
 
     # Фильтруем SHA256SUMS: оставляем только строку для нашего архива.
     # Формат SHA256SUMS: '<hash>  <filename>' (два пробела, GNU sha256sum).
     local filtered_sums="${tmpdir}/SHA256SUMS.filtered"
     grep -F "  ${archive}" "${tmpdir}/SHA256SUMS" > "${filtered_sums}" || {
-        echo "error: запись для '${archive}' не найдена в SHA256SUMS"
-        echo "hint: убедитесь, что RAXD_VERSION='${version}' соответствует опубликованному релизу"
+        echo "error: no entry for '${archive}' in SHA256SUMS"
+        echo "hint: make sure RAXD_VERSION='${version}' matches a published release"
         exit 3
     }
 
@@ -199,21 +199,21 @@ EOF
     ) || check_ok=1
 
     if [[ "$check_ok" -ne 0 ]]; then
-        echo "error: несовпадение SHA256 — архив повреждён или подменён"
-        echo "hint: попробуйте установку заново; если ошибка повторяется — сообщите разработчикам"
+        echo "error: SHA256 mismatch — archive is corrupted or tampered"
+        echo "hint: try reinstalling; if the error persists, report it to the maintainers"
         exit 3
     fi
 
-    echo "==> SHA256 совпадает — артефакт целостен"
+    echo "==> SHA256 verified — archive is intact"
 
     # ── Распаковка (SR-103) ───────────────────────────────────────────────────
 
-    echo "==> распаковка..."
+    echo "==> extracting..."
     tar -xzf "${tmpdir}/${archive}" -C "${tmpdir}"
 
     local bin_src="${tmpdir}/raxd"
     if [[ ! -f "$bin_src" ]]; then
-        echo "error: бинарь 'raxd' не найден в архиве"
+        echo "error: binary 'raxd' not found in archive"
         exit 1
     fi
 
@@ -237,37 +237,37 @@ EOF
 
     if [[ -w "${install_dir}" ]]; then
         # Установка без sudo (атомарная замена через install, SR-107)
-        echo "==> установка в ${dst}..."
+        echo "==> installing to ${dst}..."
         install -m 0755 "${bin_src}" "${dst}"
     else
         # Каталог не writable — пробуем sudo
         if ! command -v sudo >/dev/null 2>&1; then
-            echo "error: нет прав на запись в ${install_dir} и sudo недоступен"
-            echo "hint: запустите от root или укажите другой каталог через --prefix ~/.local/bin"
+            echo "error: no write permission to ${install_dir} and sudo is unavailable"
+            echo "hint: run as root or specify a different directory with --prefix ~/.local/bin"
             exit 4
         fi
 
-        echo "==> для установки в ${install_dir} требуются права администратора..."
+        echo "==> administrator privileges required to install to ${install_dir}..."
         echo "hint: sudo install -m 0755 raxd ${dst}"
 
         if ! sudo install -m 0755 "${bin_src}" "${dst}"; then
-            echo "error: не удалось установить бинарь с sudo в ${install_dir}"
-            echo "hint: используйте --prefix для выбора каталога без root-прав"
+            echo "error: failed to install binary with sudo to ${install_dir}"
+            echo "hint: use --prefix to choose a directory that does not require root"
             exit 4
         fi
     fi
 
-    echo "==> бинарь установлен: ${dst}"
+    echo "==> binary installed: ${dst}"
 
     # ── macOS quarantine (AC11, ADR-005, SR-109) ──────────────────────────────
 
     if [[ "$os" == "darwin" ]]; then
         xattr -d com.apple.quarantine "${dst}" 2>/dev/null || true
         echo ""
-        echo "hint: если macOS Gatekeeper блокирует запуск raxd, выполните:"
+        echo "hint: if macOS Gatekeeper blocks raxd, run:"
         echo "  xattr -d com.apple.quarantine ${dst}"
-        echo "  или: System Settings → Privacy & Security → разрешить '${dst}'"
-        echo "hint: для нотаризированной версии с Green Gatekeeper — запрашивайте нотаризацию через Apple Developer Program"
+        echo "  or: System Settings → Privacy & Security → allow '${dst}'"
+        echo "hint: for a notarized build with full Gatekeeper approval, request notarization via Apple Developer Program"
         echo ""
     fi
 
@@ -275,16 +275,16 @@ EOF
 
     if ! command -v raxd >/dev/null 2>&1; then
         local path_hint="export PATH=\"${install_dir}:\$PATH\""
-        echo "hint: raxd установлен, но каталог ${install_dir} не в \$PATH"
-        echo "hint: добавьте в ~/.bashrc или ~/.zshrc:"
+        echo "hint: raxd is installed but ${install_dir} is not in \$PATH"
+        echo "hint: add to ~/.bashrc or ~/.zshrc:"
         echo "  ${path_hint}"
     fi
 
     # ── Опциональный hint про сервис (AC1, spec Out of Scope) ─────────────────
 
     echo ""
-    echo "==> raxd успешно установлен (${version})"
-    echo "hint: для регистрации системного сервиса выполните: raxd service install"
+    echo "==> raxd installed successfully (${version})"
+    echo "hint: to register a system service, run: raxd service install"
     echo ""
 }
 
