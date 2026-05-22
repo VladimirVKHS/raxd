@@ -6,13 +6,15 @@
 # trap cleanup на EXIT/INT/TERM (SR-98).
 #
 # Использование:
-#   curl -fsSL https://<base-url>/install.sh | bash
-#   curl -fsSL https://<base-url>/install.sh | bash -s -- --prefix ~/.local/bin
+#   curl -fsSL https://github.com/vladimirvkhs/raxd/releases/latest/download/install.sh | bash
+#   bash install.sh [--prefix ~/.local/bin] [--version v0.1.0]
 #   RAXD_VERSION=v0.1.0 curl -fsSL … | bash
 #
 # Переменные окружения:
-#   RAXD_BASE_URL  — база URL для скачивания артефактов (по умолчанию: боевой placeholder)
-#   RAXD_VERSION   — тег версии (по умолчанию: latest)
+#   RAXD_REPO      — репозиторий GitHub (по умолчанию: vladimirvkhs/raxd)
+#   RAXD_API_URL   — URL для резолва latest-тега (по умолчанию: GitHub API releases/latest)
+#   RAXD_BASE_URL  — база URL для скачивания артефактов (если задан явно — GitHub API не вызывается)
+#   RAXD_VERSION   — тег версии (по умолчанию: latest; резолвится через RAXD_API_URL)
 #   RAXD_PREFIX    — каталог установки (override авто-детекта)
 #
 # Коды возврата:
@@ -21,7 +23,7 @@
 #   2  — неподдерживаемая платформа (AC4, SR-104)
 #   3  — несовпадение SHA256 (AC3, SR-100)
 #   4  — нет прав на запись / нет sudo (AC9, SR-106)
-#   5  — сбой скачивания (SR-99)
+#   5  — сбой скачивания / сбой API (SR-99)
 
 set -euo pipefail
 
@@ -30,11 +32,23 @@ set -euo pipefail
 main() {
     # ── Параметры по умолчанию ────────────────────────────────────────────────
 
-    # Дефолтный RAXD_BASE_URL: HTTPS-плейсхолдер боевого remote.
-    # ВАЖНО: перед публичным релизом заменить на реальный URL
-    # (например https://github.com/vladimirvkhs/raxd/releases/download/${RAXD_VERSION}).
-    # Для теста install-flow переопределяется через env (ADR-002, SR-113).
-    local base_url="${RAXD_BASE_URL:-https://releases.example.com/raxd}"
+    # Репозиторий GitHub: <owner>/<repo>
+    local repo="${RAXD_REPO:-vladimirvkhs/raxd}"
+
+    # URL для резолва latest-тега через GitHub API.
+    # Переопределяется в тестах для мок-API.
+    local api_url="${RAXD_API_URL:-https://api.github.com/repos/${repo}/releases/latest}"
+
+    # Дефолтный RAXD_BASE_URL — ПУСТОЙ (sentinel): означает «использовать GitHub Releases».
+    # Если пользователь задал RAXD_BASE_URL явно (в env или флаге) — API не вызывается,
+    # используется указанный URL как есть. Это критично для мок-тестов (SR-113, ADR-002).
+    local base_url="${RAXD_BASE_URL:-}"
+    # Флаг: base_url задан явно (true) или будет вычислен (false).
+    local base_url_explicit=0
+    if [[ -n "${RAXD_BASE_URL:-}" ]]; then
+        base_url_explicit=1
+    fi
+
     local version="${RAXD_VERSION:-latest}"
     local prefix="${RAXD_PREFIX:-}"
 
@@ -76,12 +90,16 @@ main() {
 install.sh — raxd installer
 
 usage:
-  curl -fsSL <url>/install.sh | bash
+  curl -fsSL https://github.com/vladimirvkhs/raxd/releases/latest/download/install.sh | bash
   bash install.sh [--prefix <dir>] [--version <tag>]
 
 environment variables:
-  RAXD_BASE_URL   base URL for release artifacts (default: production HTTPS placeholder)
-  RAXD_VERSION    release tag (default: latest)
+  RAXD_REPO       GitHub repository (default: vladimirvkhs/raxd)
+  RAXD_API_URL    GitHub API URL for resolving the latest release tag
+                  (default: https://api.github.com/repos/vladimirvkhs/raxd/releases/latest)
+  RAXD_BASE_URL   base URL for release artifacts; if set explicitly, GitHub API is NOT called
+                  (default: computed from RAXD_REPO and resolved version)
+  RAXD_VERSION    release tag, e.g. v0.1.0 (default: latest — resolved via GitHub API)
   RAXD_PREFIX     install directory (overrides auto-detection)
 
 exit codes:
@@ -90,7 +108,17 @@ exit codes:
   2  unsupported platform
   3  SHA256 mismatch
   4  no write permission / sudo unavailable
-  5  download failure
+  5  download / API failure
+
+examples:
+  # one-liner (always installs the latest release):
+  curl -fsSL https://github.com/vladimirvkhs/raxd/releases/latest/download/install.sh | bash
+
+  # pin a specific version:
+  RAXD_VERSION=v0.1.0 curl -fsSL https://github.com/vladimirvkhs/raxd/releases/latest/download/install.sh | bash
+
+  # install to a custom prefix (no sudo required):
+  bash install.sh --prefix ~/.local/bin
 EOF
                 exit 0
                 ;;
@@ -106,6 +134,62 @@ EOF
     # ── mktemp для временного каталога (SR-98) ───────────────────────────────
 
     tmpdir="$(mktemp -d)"
+
+    # ── Резолв версии и формирование base_url (ОР-3) ─────────────────────────
+    #
+    # Логика выбора источника:
+    #   1. RAXD_BASE_URL задан явно → используем как есть, version как есть.
+    #      API не вызывается. Это путь мок-тестов (SR-113, ADR-002).
+    #   2. RAXD_BASE_URL не задан (дефолт):
+    #      a. version == "latest" → резолвим реальный тег через GitHub API.
+    #      b. version задан явно (не "latest") → используем тег напрямую.
+    #      В обоих случаях: base_url = https://github.com/<repo>/releases/download/<version>
+
+    if [[ "${base_url_explicit}" -eq 1 ]]; then
+        # Путь 1: явный override base_url. API НЕ вызывается.
+        # Используем base_url и version как есть (тест-путь SR-113).
+        echo "==> using explicit base url: ${base_url}"
+    else
+        # Путь 2: дефолтный источник — GitHub Releases.
+        if [[ "$version" == "latest" ]]; then
+            # Резолв latest → реальный тег через GitHub API (ОР-3).
+            echo "==> resolving latest release tag from GitHub API..."
+            local api_response
+            if ! api_response="$(curl -fsSL "${api_url}" 2>/dev/null)"; then
+                echo "error: failed to reach GitHub API: ${api_url}"
+                echo "hint: check your network connection or set RAXD_VERSION=<tag> to skip API"
+                exit 5
+            fi
+
+            # Парсим tag_name без jq: ищем строку "tag_name": "..."
+            # Формат ответа GitHub API: {"tag_name":"v0.1.0",...}
+            local resolved_tag
+            resolved_tag="$(echo "${api_response}" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
+
+            if [[ -z "$resolved_tag" ]]; then
+                echo "error: could not parse tag_name from GitHub API response"
+                echo "hint: check ${api_url} manually; or set RAXD_VERSION=<tag> to skip API"
+                exit 5
+            fi
+
+            # Строгая валидация тега (анти-инъекция): только безопасные символы.
+            # Паттерн: начинается с буквы/цифры/v, содержит только [0-9A-Za-z._+-].
+            if ! echo "${resolved_tag}" | grep -qE '^v?[0-9A-Za-z][0-9A-Za-z._+-]*$'; then
+                echo "error: resolved tag has unexpected format: '${resolved_tag}'"
+                echo "hint: tag must match pattern v?[0-9A-Za-z][0-9A-Za-z._+-]*"
+                exit 5
+            fi
+
+            version="${resolved_tag}"
+            echo "==> resolved latest tag: ${version}"
+        else
+            # Версия задана явно (не latest) — используем напрямую, без API.
+            echo "==> using specified version: ${version}"
+        fi
+
+        # Формируем base_url из GitHub Releases.
+        base_url="https://github.com/${repo}/releases/download/${version}"
+    fi
 
     # ── Детект OS и архитектуры (AC4, SR-104) ────────────────────────────────
 
