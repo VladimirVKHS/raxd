@@ -46,6 +46,9 @@ PASS_COUNT=0
 FAIL_COUNT=0
 FAILS=()
 
+# Флаг: AC6/SR-83 верифицирован LIVE через /proc/$PID/status (euid != 0)
+LIVE_AC6_VERIFIED=false
+
 pass() {
     local msg="$1"
     echo -e "${GREEN}PASS${NC}: $msg"
@@ -282,15 +285,14 @@ if [ -n "$PID" ] && [ "$PID" -gt 0 ] && [ -f "/proc/$PID/status" ]; then
     EUID_DEMON=$(grep "^Uid:" /proc/"$PID"/status 2>/dev/null | awk '{print $3}' || echo "")
     if [ -n "$EUID_DEMON" ] && [ "$EUID_DEMON" != "0" ]; then
         pass "AC6/SR-83: LIVE — euid процесса демона != 0 (euid=$EUID_DEMON)"
+        LIVE_AC6_VERIFIED=true
     elif [ -n "$EUID_DEMON" ] && [ "$EUID_DEMON" = "0" ]; then
         fail "AC6/SR-83: euid процесса демона == 0 (root!)"
     else
-        info "ОГРАНИЧЕНИЕ: не удалось прочитать EUID из /proc/$PID/status (процесс уже завершился)"
-        pass "AC6/SR-83: User=raxd в unit гарантирует euid!=0 (LIVE-чтение /proc невозможно — быстрый сбой serve)"
+        info "STEP 2: не удалось прочитать EUID из /proc/$PID/status (процесс уже завершился) — ждём STEP 4"
     fi
 else
-    info "ОГРАНИЧЕНИЕ: MainPID=0 (демон ещё не запустился или уже завершился в auto-restart)"
-    pass "AC6/SR-83: User=raxd подтверждён через systemctl show + unit-файл"
+    info "STEP 2: MainPID=0 (демон ещё не запустился или уже завершился в auto-restart) — ждём STEP 4"
 fi
 
 echo ""
@@ -346,6 +348,7 @@ if [ -n "$PID_AC4" ] && [ "$PID_AC4" -gt 0 ]; then
             EUID_AFTER=$(grep "^Uid:" /proc/"$PID_AFTER_AC4"/status 2>/dev/null | awk '{print $3}' || echo "")
             if [ -n "$EUID_AFTER" ] && [ "$EUID_AFTER" != "0" ]; then
                 pass "AC6/SR-83: euid после рестарта != 0 (euid=$EUID_AFTER)"
+                LIVE_AC6_VERIFIED=true
             fi
         fi
     elif [ "$nrestarts" -gt 0 ]; then
@@ -354,9 +357,10 @@ if [ -n "$PID_AC4" ] && [ "$PID_AC4" -gt 0 ]; then
         pass "AC4: Restart=on-failure в unit + активный цикл auto-restart (подтверждён шагом 2)"
     fi
 
-    # Показать EUID если удалось захватить
+    # Показать EUID если удалось захватить в цикле ожидания
     if [ -n "$EUID_DEMO_AC4" ] && [ "$EUID_DEMO_AC4" != "0" ]; then
         pass "AC6/SR-83: LIVE-захват EUID при старте демона = $EUID_DEMO_AC4 (не root)"
+        LIVE_AC6_VERIFIED=true
     fi
 else
     # Проверяем NRestarts — если > 0, значит рестарты уже были
@@ -364,8 +368,15 @@ else
     if [ "$nrestarts" -gt 0 ]; then
         pass "AC4: NRestarts=$nrestarts — демон перезапускался при сбое (Restart=on-failure работает)"
     else
-        pass "AC4: Restart=on-failure подтверждён через unit; PID не удалось поймать в auto-restart окне"
+        fail "AC4: НЕ верифицирован — kill не достиг живого PID и NRestarts=0 в этом прогоне"
     fi
+fi
+
+# Финальный вердикт AC6: PASS только если LIVE-чтение /proc состоялось (STEP 2 или STEP 4)
+if [ "$LIVE_AC6_VERIFIED" = "true" ]; then
+    info "AC6/SR-83: LIVE euid верифицирован (флаг установлен выше)"
+else
+    fail "AC6/SR-83: LIVE euid != 0 НЕ верифицирован ни в STEP 2, ни в STEP 4 — /proc/$PID/status недоступен"
 fi
 
 echo ""
@@ -566,30 +577,38 @@ if [ "$restart_jd_exit" -eq 0 ]; then
     done
     info "Наполнение завершено."
 
-    # Проверить ограниченность роста
+    # Проверить ограниченность роста: размер должен быть <= 10M (SystemMaxUse=5M + допуск 2x)
+    # Порог 10M = 10485760 байт
+    MAX_JOURNAL_BYTES=10485760
     disk_usage=$(journalctl --disk-usage 2>&1 || echo "unavailable")
     info "journalctl --disk-usage: $disk_usage"
 
-    if echo "$disk_usage" | grep -qiE "[0-9]"; then
-        pass "AC8: journalctl --disk-usage возвращает значение"
-        echo "  disk-usage: $disk_usage"
-        # Проверить что не ушло за 10M (SystemMaxUse=5M + допуск 2x)
-        if echo "$disk_usage" | grep -qiE "([0-9]+\.[0-9]+|[0-9]+) ?[KM]?B" 2>/dev/null; then
-            pass "AC8: размер журнала в допустимых пределах (ротация работает)"
-        fi
+    # Извлечь значение размера (форматы: "5.0M", "512K", "1.2G", "10B")
+    size_str=$(echo "$disk_usage" | grep -oiE '[0-9]+(\.[0-9]+)?[KMGT]?B?' | head -1 || echo "")
+    info "Извлечённый размер: '$size_str'"
+
+    if [ -z "$size_str" ]; then
+        fail "AC8/SR-94: journalctl --disk-usage не вернул распознаваемый размер (raw: $disk_usage)"
     else
-        info "ОГРАНИЧЕНИЕ: journalctl --disk-usage формат неожиданный: $disk_usage"
-        pass "AC8: drop-in установлен, механизм задокументирован (SR-94)"
+        # Перевести в байты вручную (numfmt --from=iec не всегда доступен в контейнере)
+        size_num=$(echo "$size_str" | grep -oiE '^[0-9]+(\.[0-9]+)?' | head -1 || echo "0")
+        size_unit=$(echo "$size_str" | grep -oiE '[KMGT]' | head -1 || echo "")
+        # Целочисленное приближение через awk (bc может отсутствовать)
+        case "$size_unit" in
+            K|k) size_bytes=$(awk "BEGIN{printf \"%d\", $size_num * 1024}") ;;
+            M|m) size_bytes=$(awk "BEGIN{printf \"%d\", $size_num * 1048576}") ;;
+            G|g) size_bytes=$(awk "BEGIN{printf \"%d\", $size_num * 1073741824}") ;;
+            *)   size_bytes=$(awk "BEGIN{printf \"%d\", $size_num}") ;;
+        esac
+        info "Размер в байтах: $size_bytes (порог: $MAX_JOURNAL_BYTES)"
+        if [ "$size_bytes" -le "$MAX_JOURNAL_BYTES" ]; then
+            pass "AC8/SR-94: размер журнала ${size_str} (${size_bytes}B) <= 10M — ротация ограничила рост"
+        else
+            fail "AC8/SR-94: размер журнала ${size_str} (${size_bytes}B) превышает порог 10M — ротация НЕ сработала"
+        fi
     fi
 else
-    info "ОГРАНИЧЕНИЕ: systemctl restart systemd-journald не удался (exit=$restart_jd_exit)"
-    info "  Это возможно в контейнере из-за особенностей cgroup. Минимальная проверка:"
-    assert_file_exists "AC8: drop-in присутствует после install" "$DROP_IN_PATH"
-    if grep -q "SystemMaxUse=" "$DROP_IN_PATH"; then
-        pass "AC8: drop-in содержит SystemMaxUse= (механизм ротации задан и задокументирован)"
-    else
-        fail "AC8: drop-in не содержит SystemMaxUse="
-    fi
+    fail "AC8/SR-94: systemctl restart systemd-journald не удался (exit=$restart_jd_exit) — end-to-end ротация не верифицирована"
 fi
 
 echo ""
