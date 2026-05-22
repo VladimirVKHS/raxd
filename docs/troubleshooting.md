@@ -39,8 +39,9 @@ You have no active API keys, or you are not sending the key correctly.
   Revocation takes effect immediately — a key you delete with `raxd key delete` stops working on its
   next request. Confirm the key is still active with `raxd key list`.
 
-This applies to the MCP endpoint too: a `401` on `/mcp` means the same thing, and no tool runs. See
-[MCP server (`/mcp`)](#mcp-server-mcp) below.
+This applies to the MCP endpoint too: a `401` on `/mcp` means the same thing, and no tool runs
+(including `execute_command` — no command is executed). See [MCP server (`/mcp`)](#mcp-server-mcp)
+below.
 
 Note: response bodies for rejected requests are intentionally empty; the reason is only in the
 server's audit stream. That is by design (it avoids telling a caller whether a key is unknown or
@@ -189,8 +190,9 @@ by default. There is no built-in trust anchor and no mTLS in this build.
 
 This is expected for an **unimplemented** route. After authentication, the routes that do real work
 are `GET /healthz` (returns `pong`) and `/mcp` (the MCP server). Every other path (for example
-`/exec`) returns `501` with the body `not implemented`, because command execution and file upload are
-not implemented yet. There is nothing to fix — those features arrive in later tasks.
+`/exec`) returns `501` with the body `not implemented`. Note that command execution is **not** a
+separate route: it is the MCP `execute_command` tool on `/mcp`, not a `/exec` endpoint. There is
+nothing to fix about the `501` on other paths — those routes are simply unimplemented.
 
 > **`/mcp` no longer returns `501`.** If you used an older build, the MCP route was a `501` stub. In
 > the current build, `POST /mcp` with a valid key returns a real JSON-RPC response. If you still get
@@ -207,6 +209,12 @@ it from the client side (the `413` response) instead. Reduce the request body or
 `max_body_bytes` in `config.yaml` (see
 [`configuration.md`](configuration.md#networking-and-serve-fields)).
 
+> Note: large `execute_command` arguments are bounded twice — first by `max_body_bytes` (the whole
+> JSON-RPC body), then by `exec.max_args` / `exec.max_arg_len`. A `413` means the **whole request**
+> was too big; an `isError: true` with a "too many arguments" / "argument too long" message means the
+> request was fine but the per-argument limits were exceeded (see
+> [the `execute_command` section](#the-execute_command-tool) below).
+
 ### A request returns `429 Too Many Requests`
 
 You exceeded the rate limit. Limiting is a token bucket applied **per key and per client IP** with a
@@ -220,7 +228,8 @@ time=… level=WARN msg=RATE fp=- remote=… reason="rate limit exceeded (ip)"
 
 Slow down, or raise `rate_limit` / `rate_burst` in `config.yaml` (see
 [`configuration.md`](configuration.md#networking-and-serve-fields)). This rate limit also applies to
-MCP calls on `/mcp`.
+MCP calls on `/mcp`, including `execute_command` — when the limit is hit the call is rejected with
+`429` **before** any command runs.
 
 ### A request returns `403 Forbidden`
 
@@ -264,15 +273,20 @@ curl -k https://127.0.0.1:7822/mcp \
 
 ### A `tools/call` returns a JSON-RPC error instead of running
 
-- **Unknown tool** (for example `execute_command` or `upload_file`) → error code `-32601`
-  (`Method not found`) or `-32602` (`Invalid params`), depending on the SDK version. Those tools are
-  not implemented in this build; only `ping` and `server_info` exist. No command runs. See
-  [`mcp.md`](mcp.md#scope-and-limitations).
+- **Unknown tool name** (for example a typo like `exec` instead of `execute_command`, or
+  `upload_file`, which is not implemented) → error code `-32602` (`Invalid params`). Only `ping`,
+  `server_info`, and `execute_command` are registered. No command runs. See
+  [`mcp.md`](mcp.md#behaviour-and-error-handling).
 - **Unknown method** → `-32601`. **Malformed JSON** → `-32700`. **Not a valid JSON-RPC request** →
   `-32600`.
 
 These are JSON-RPC errors returned with HTTP `200`, not transport `4xx`/`501`. After such an error
 the server stays up, and a valid `ping` still returns `pong`.
+
+> Do not confuse a JSON-RPC `-32602` ("unknown tool name") with an `execute_command` **tool result**
+> that has `isError: true`. The former means the tool name was wrong and nothing was dispatched; the
+> latter means `execute_command` *was* called but the command was rejected or could not start (see
+> below).
 
 ### An MCP client cannot connect even though `curl` works
 
@@ -282,6 +296,101 @@ does not, the issue is likely on the client side. Verify the channel with the `c
 [`mcp.md`](mcp.md#curl-smoke-test) first. Also confirm the client is configured as a
 **streamable-http** (remote) server with the `url` and `Authorization` header, **not** as a stdio
 command, and that it trusts the self-signed certificate (or has verification disabled for dev).
+
+## The `execute_command` tool
+
+`execute_command` runs a command on the host. Unlike `ping`/`server_info`, it can fail in
+command-specific ways. The full contract is in [`mcp.md`](mcp.md#execute_command); the security
+warnings are in [`execute-command-security.md`](execute-command-security.md). This section is for
+diagnosing a call.
+
+### A command returns `isError: true`
+
+`isError: true` means the command was **rejected or could not start** — it does **not** mean a
+command ran and failed. (A command that ran and failed has a non-zero `exit_code` and `isError`
+absent/false — see [the next entry](#a-command-that-exits-non-zero-or-times-out-is-not-an-error).)
+The cases, and the matching audit line:
+
+| Symptom (text content) | Cause | Audit |
+|------------------------|-------|-------|
+| `command not found` | the binary does not exist, is a relative path, or `cwd` is invalid | `msg=FAIL … reason=not-found` / `reason=bad-cwd` |
+| `command not allowed` | the allowlist is on and the command is not in it | `msg=DENY … reason=not-allowed` |
+| `too many arguments: N > M` | more than `exec.max_args` arguments | `msg=DENY … reason=…` |
+| `argument too long: N > M` | a single argument longer than `exec.max_arg_len` | `msg=DENY … reason=…` |
+| `timeout_ms N exceeds max M` | the requested `timeout_ms` is above `exec.max_timeout_ms` | `msg=DENY … reason=…` |
+| `execution as root is forbidden by policy` | `deny_root: true` and the daemon is root | `msg=WARN reason=running-as-root` then `msg=DENY` |
+| `validating "arguments": additional properties not allowed: …` | an unknown input field (for example `env`, `shell`) | none (rejected by the SDK before the handler) |
+
+How to act on each:
+
+- **`command not found`.** This **same** client text covers two distinct causes: (1) the binary does
+  not exist (or is a relative path), and (2) an **invalid `cwd`** — a working directory you passed
+  that does not exist or is not a directory. The response body is identical in both cases, so the
+  client alone cannot tell them apart; **use the audit line's `reason=` to distinguish them**:
+  `reason=not-found` is the binary case, `reason=bad-cwd` is the invalid-`cwd` case. To fix the binary
+  case, check the binary is installed in the container and on the daemon's `PATH`, and use a bare name
+  resolved on `PATH` (for example `ls`) or an **absolute** path (for example `/bin/ls`) — a
+  **relative** path (for example `./tool`) is always rejected. To fix the `cwd` case, pass a `cwd`
+  that exists and is a directory (or omit `cwd` to use `exec.default_cwd`, default `/tmp`).
+- **`command not allowed`.** The allowlist (`exec.allowlist`) is on and your `command` string is not
+  an exact match. Remember `ls` ≠ `/bin/ls`: list the command **exactly** the way you call it. See
+  [the allowlist note](configuration.md#command-execution-exec-fields).
+- **Argument / timeout limits.** Reduce the number/length of `args`, or lower `timeout_ms` below
+  `exec.max_timeout_ms`. These limits are configurable in `config.yaml` (`exec.max_args`,
+  `exec.max_arg_len`, `exec.max_timeout_ms`).
+- **`execution as root is forbidden by policy`.** `deny_root: true` is set and the daemon is running
+  as root. Run `raxd` as a non-root user, or set `deny_root: false` (which downgrades the refusal to a
+  per-call `WARN` — the command then runs as root, which is itself risky).
+- **`additional properties not allowed`.** Remove the unknown field. The only accepted fields are
+  `command`, `args`, `timeout_ms`, `cwd`. There is no `env` field.
+
+### A command that exits non-zero or times out is **not** an error
+
+This trips people up. Two normal outcomes are **not** reported as `isError`:
+
+- **Non-zero exit code.** If the command runs and exits with a non-zero code, the result is a normal
+  success: `isError` is absent/false and `exit_code` carries the value. The audit line is
+  `msg=MCP … result=ok …`. Inspect `exit_code` / `stderr` in `structuredContent` to decide what to do.
+- **Timeout (`timed_out: true`).** If the command runs longer than its timeout, it is killed (the
+  whole process tree), and the result is again **not** an error: `isError` is absent/false,
+  `timed_out: true`, with whatever partial output was captured. `exit_code` is reported as `-1` in
+  this case — treat `timed_out` as the authoritative field. The audit line is
+  `msg=MCP … result=ok … timed_out=true`.
+
+So if you expected an error and got a "successful" result with a non-zero `exit_code` or
+`timed_out: true`, that is by design: the command **did** run.
+
+### Output looks cut off (`stdout_truncated` / `stderr_truncated`)
+
+Each output stream is capped at `exec.max_output_bytes` (default 1 MiB). When a stream reaches the
+cap, the captured output is truncated and the matching flag (`stdout_truncated` or
+`stderr_truncated`) is `true`. This is not an error — it protects the daemon from a runaway,
+high-output command. If you genuinely need more, raise `exec.max_output_bytes` in `config.yaml` (see
+[`configuration.md`](configuration.md#command-execution-exec-fields)), bearing in mind the memory
+cost.
+
+### Reading the `execute_command` audit lines
+
+Every call writes its own audit record to the `stderr` audit stream. To watch only command execution:
+
+```sh
+raxd serve 2>&1 | grep "tool=execute_command"
+```
+
+What to look for:
+
+- `msg=MCP … result=ok` — the command ran. Read `exit_code=`, `duration=`, `timed_out=`.
+- `msg=DENY … reason=…` — the command was rejected (allowlist, limits, `deny_root`); it did not run.
+- `msg=FAIL … reason=…` — the command could not start; it did not run. The `reason=` tells you which
+  case: `reason=not-found` (the binary does not exist or is a relative path) or `reason=bad-cwd` (an
+  invalid working directory) — note that both surface the same `command not found` text to the client.
+- `msg=WARN … reason=running-as-root` — an extra record written on **every** call when the daemon is
+  root. If you see this, the daemon is running as root and every command runs as root. Fix the
+  deployment (run non-root) or set `exec.deny_root: true`.
+
+> **Arguments are logged verbatim.** The `args=[…]` field shows exactly what the client sent, with no
+> masking. If you find a secret in the audit log, the client put it in `args` — do not do that. See
+> [the security guide](execute-command-security.md#1-do-not-pass-secrets-in-command-arguments-argv).
 
 ## Key management
 
@@ -318,8 +427,10 @@ Revoke the lost key (`raxd key delete <id>`) and create a new one.
 ### `config.yaml` changes have no effect
 
 Only `raxd serve` reads `config.yaml` today, and it reads the file **at startup**. Restart `serve`
-after editing the file. The other commands (`version`, `status`, the `key` group) do not act on the
-config values. `raxd config port` is a stub and does not write the file — edit `config.yaml` by hand.
+after editing the file. This includes the `exec.*` keys — changing the allowlist, timeouts, limits,
+or `deny_root` requires a `serve` restart to take effect. The other commands (`version`, `status`,
+the `key` group) do not act on the config values. `raxd config port` is a stub and does not write the
+file — edit `config.yaml` by hand.
 
 > Cross-reference: the dedicated entries for the two config-load failures live under
 > [`raxd serve`](#configuration-load-errors-share-one-generic-hint) above, including the note that an
@@ -342,8 +453,11 @@ sure the user running `raxd` has a home directory set.
 ## Related documents
 
 - [`commands.md`](commands.md) — full command reference, including all `serve` error cases.
-- [`mcp.md`](mcp.md) — MCP integration guide: the `/mcp` endpoint, connection parameters, tools, and
-  audit.
+- [`mcp.md`](mcp.md) — MCP integration guide: the `/mcp` endpoint, connection parameters, the
+  `ping` / `server_info` / `execute_command` tools, and audit.
+- [`execute-command-security.md`](execute-command-security.md) — mandatory security warnings for
+  `execute_command`.
 - [`configuration.md`](configuration.md) — paths, `keys.db`, the TLS directory, and the
-  `config.yaml` networking fields.
+  `config.yaml` networking and `exec` fields.
 - [`development.md`](development.md) — building and testing in Docker.
+</content>
