@@ -9,16 +9,16 @@
 Структура `TemplateData` с типизированным `NeedNetBindCap bool` (не сырая строка, SR-90). Функция `ValidateTemplateData(d)` проверяет ДО рендера: User/Group по regex `^[a-z_][a-z0-9_-]{0,31}$`, Label по `^[a-z][a-z0-9._-]{0,253}$`, ExecPath — абсолютный+нормализованный без управляющих символов, StateDir/ConfigDir/LogPath — абсолютные без управляющих, Port в 1..65535. Функции `RenderUnit(d)` и `RenderPlist(d)` вызывают валидацию перед рендером — ошибка возвращается до записи (SR-90). Шаблон unit генерирует: для Port≥1024 — `NoNewPrivileges=yes`, без AmbientCapabilities; для Port<1024 — `CapabilityBoundingSet=CAP_NET_BIND_SERVICE` + `AmbientCapabilities=CAP_NET_BIND_SERVICE`, без NoNewPrivileges (ADR-003, П-1). Hardening `ProtectSystem=strict/ProtectHome=yes/PrivateTmp=yes` присутствует в обоих вариантах (SR-87). `StateDirectoryMode=0700` явно (SR-89). `StandardError=journal` явно. Plist содержит `KeepAlive.SuccessfulExit=false` (AC4/AC5), `UserName=raxd` (SR-83), `EnvironmentVariables` с XDG_* (ADR-002). `JournaldDropIn()` возвращает содержимое drop-in с `SystemMaxUse=200M`/`SystemMaxFileSize=50M` (SR-94, ADR-004). `TemplateDataFromConfig(cfg)` деривирует `NeedNetBindCap = Port < 1024`.
 
 ### `internal/service/exec.go`
-`RunManager(ctx, name, args...)` — обёртка над `exec.CommandContext` без shell (SR-91). `exec.ErrNotFound` → `ErrManagerUnavailable`. Не-ExitError (path error, context cancel) → нейтральная ошибка. Сырой stderr захватывается и НЕ пробрасывается в user output (SR-95), только нейтральный текст. Вспомогательные: `runCommandRaw(ctx, name, args...)` для `systemd.go`/`launchd.go`, `isExitCode(err, code)` для проверки exit 9 (useradd already-exists). `neutralizeStderr` обрезает >120 байт и удаляет PEM/rax_-маркеры (SR-95).
+`RunManager(ctx, name, args...)` — обёртка над `exec.CommandContext` без shell (SR-91). `exec.ErrNotFound` → `ErrManagerUnavailable`. Не-ExitError (path error, context cancel) → нейтральная ошибка. Сырой stderr захватывается и НЕ пробрасывается в user output (SR-95), только нейтральный текст. Вспомогательные: `runCommandRaw(ctx, name, args...)` для `systemd.go`/`launchd.go`, `isExitCode(err, code)` для проверки exit 9 (useradd already-exists). `neutralizeStderr` всегда возвращает фиксированную строку "manager command failed" — сырой stderr полностью отбрасывается (ISSUE-5 fix, SR-95).
 
 ### `internal/service/systemd.go`
 `systemdManager`: Install — 8 шагов (privilege check → idempotency check → createUser → renderUnit → writeFile unit 0644 → writeFile drop-in 0644 → daemon-reload → enable). Откат при сбое шагов 5-8 — удаление unit/drop-in (AC11, SR-92). Пользователь raxd НЕ откатывается (ADR-002, П-2). `createUser` вызывает `useradd --system --no-create-home --shell /usr/sbin/nologin` через `runCommandRaw` (SR-91); exit 9 = already exists → OK (SR-83). Uninstall: stop+disable+daemon-reload+rm unit+rm drop-in+daemon-reload; пользователь raxd остаётся (П-2, SR-93). Start/Stop: privilege check + unit-file existence check → ErrNotInstalled. Status: `systemctl show -p MainPID,ActiveState,SubState,UnitFileState raxd`; EUID читается из `/proc/<pid>/status` (AC6). `writeFile` создаёт директории + записывает с заданным mode. `parseSystemctlProps` парсит KEY=VALUE вывод. `readProcEUID` читает строку Uid: из /proc.
 
 ### `internal/service/launchd.go`
-`launchdManager` (macOS, AC13 — интеграция только на реальном macOS): Install — plist в `/Library/LaunchDaemons/tech.oem.raxd.plist` 0644 (SR-88); `createDirs` создаёт StateDir/LogPath 0700 + chown (SR-89); launchctl bootstrap + enable (AC3); откат при сбое bootstrap. Uninstall: bootout+disable+rm plist; пользователь kept (П-2). Start: kickstart -k; Stop: kill SIGTERM (AC5). Status: print system/tech.oem.raxd; парсит "state = running" и "pid = N". EUID не читается на macOS (нет /proc).
+`launchdManager` (macOS, AC13 — интеграция только на реальном macOS): Install — plist в `/Library/LaunchDaemons/tech.oem.raxd.plist` 0644 (SR-88); `createDirs` создаёт StateDir/LogPath 0700 + chown через `runCommandRaw(ctx, "/usr/sbin/chown", ...)` (ISSUE-7 fix, SR-89, SR-91); launchctl bootstrap + enable (AC3); откат при сбое bootstrap. Uninstall: bootout+disable+rm plist; пользователь kept (П-2). Start: kickstart -k; Stop: kill SIGTERM (AC5). Status: print system/tech.oem.raxd; парсит "state = running" и "pid = N". EUID не читается на macOS (нет /proc).
 
 ### `internal/cli/service.go`
-cobra-группа `service` + 5 подкоманд через `buildServiceCmd(mgr service.ServiceManager)` с инъекцией менеджера для тестов. install: ErrAlreadyInstalled → nil (exit 0) + info-блок без `error:` (AC9, ux-spec); ErrPermission/ErrManagerUnavailable/ErrUnsupported → error: + hint:; успех → aligned success-block + audit log (ux-spec). uninstall: ErrNotInstalled → nil (exit 0) + info-блок (AC10, ux-spec); успех → removed unit/drop-in/kept user. start: ErrNotInstalled → error + exit 1; stop: аналогично. status: вывод в stdout (`cmd.OutOrStdout()`), ux-spec P-5; флаг `--json` → JSON в stdout с полями installed/active/pid/euid/user/state/manager. `mapManagerError` — нейтральный маппинг ошибок без raw stderr (SR-95). `printSvcError` — строчные error:/hint: (ux-spec).
+cobra-группа `service` + 5 подкоманд через `buildServiceCmd(mgr service.ServiceManager)` с инъекцией менеджера для тестов. `resolveManagerWithPort(injected)` (ISSUE-1 fix): в production читает порт из `config.Load(config.Paths())`, а не из `DefaultConfig()`; возвращает `(manager, port, error)` — порт проводится в success-блоки и status. install: ErrAlreadyInstalled → nil (exit 0) + info-блок без `error:` (AC9); успех → success-block с port и `autostart enabled` (ISSUE-6 fix). status human: строки port и autostart (ISSUE-3 fix). status --json: поля port/autostart/unit_path (ISSUE-2 fix). `mapManagerError` — нейтральный маппинг без raw stderr (SR-95). `printSvcError` — строчные error:/hint:.
 
 ### `internal/cli/root.go`
 `buildServiceCmd(mgr)` добавлен в `root.AddCommand`. Экспортированы `NewRootCmd()` и `NewRootCmdWithServiceManager(mgr service.ServiceManager)` для тестовой инъекции.
@@ -33,6 +33,18 @@ cobra-группа `service` + 5 подкоманд через `buildServiceCmd(
 2. **Комментарий в unitTemplate содержал слово "NoNewPrivileges".** В шаблоне для условного блока (Port<1024) был комментарий с текстом "NoNewPrivileges is NOT set". Тест `TestRenderUnit_PrivilegedPort` проверяет отсутствие строки "NoNewPrivileges" в выводе. Исправлено: комментарий перефразирован без упоминания директивы. Не отклонение от плана — коррекция реализации под тест.
 
 3. **launchd.go — macOS-ограничение (AC13).** Создание пользователя (`dscl`), проверка EUID и интеграция с launchctl не тестируются в Docker (Linux). Это зафиксированное ограничение среды (AC13, ОР-4), не скрытое — полная интеграция на реальном macOS должна выполняться QA вне Docker.
+
+### Исправления по developer-guardian (коммит 4876696)
+
+4. **ISSUE-1 (реальный баг SR-85/ADR-003) — исправлен.** `resolveManager` заменён на `resolveManagerWithPort`, читающий `config.Load(config.Paths()).Port`. Добавлены whitebox-тесты: `TestResolveManagerWithPort_ReadsPortFromConfig` (XDG_CONFIG_HOME → config.yaml port:443 → port==443) и `TestResolveManagerWithPort_DefaultPortWhenNoConfig`.
+
+5. **ISSUE-4 (ложно-зелёный тест) — исправлен.** `TestRunManager_RawStderrNotPropagated` теперь запускает `/bin/ls /nonexistent-raxd-stderr-test-xyzzy`, записывает известный sentinel в stderr, и утверждает, что sentinel отсутствует в `err.Error()`.
+
+6. **ISSUE-2/3/6 (ux-spec) — исправлены.** `jsonStatus` дополнен полями `port/autostart/unit_path`. `printStatusHuman` добавлены строки port и autostart. Install success block добавлены port и autostart enabled.
+
+7. **ISSUE-5 (info) — исправлен.** `neutralizeStderr` упрощена: отбрасывает аргумент, всегда возвращает `"manager command failed"` — dead code удалён.
+
+8. **ISSUE-7 (info) — исправлен.** `launchd.go createDirs`: `exec.Command(...)` заменён на `runCommandRaw(ctx, "/usr/sbin/chown", ...)` + убран импорт `os/exec` из launchd.go.
 
 ## Тесты
 
@@ -59,6 +71,9 @@ cobra-группа `service` + 5 подкоманд через `buildServiceCmd(
 | TestNew_EmptyExecPath | os.Executable() fallback |
 | TestRunManager_NotFound | SR-91, ErrManagerUnavailable |
 | TestRunManager_NoShellInterpolation | SR-91 |
+| TestRunManager_RawStderrNotPropagated | SR-95 (реальная проверка sentinel, ISSUE-4 fix) |
+| TestResolveManagerWithPort_ReadsPortFromConfig | SR-85/ADR-003, ISSUE-1 fix |
+| TestResolveManagerWithPort_DefaultPortWhenNoConfig | DefaultConfig fallback |
 | TestServiceCommandRegistered | AC1 |
 | TestServiceInstall_AlreadyInstalled_Exit0 | AC9 |
 | TestServiceUninstall_NotInstalled_Exit0 | AC10 |
@@ -81,7 +96,9 @@ docker build --target test -t raxd-test . && docker run --rm raxd-test
 go vet -mod=vendor ./... && go test -mod=vendor -count=1 ./...
 ```
 
-### Docker-вывод (верифицирован дирижёром)
+### Docker-вывод
+
+**До исправлений (коммит до 4876696, верифицирован дирижёром):**
 
 ```
 docker build --target test -t raxd-test-svc .  →  OK
@@ -106,6 +123,8 @@ ok  github.com/vladimirvkhs/raxd/internal/version    0.001s
 
 479 RUN-тестов, 0 FAIL.
 
+**После исправлений ISSUE-1..7 (коммит 4876696):** ожидается Docker-верификация от дирижёра. Локально (хост): `go test ./... -count=1` — все 12 пакетов PASS.
+
 Подтверждено в Docker:
 - SR-90 анти-инъекция: `TestValidateTemplateData_UserInjection` (newline/equals), `TestRenderUnit_InjectionRejectedBeforeRender`, `TestRenderPlist_InjectionRejectedBeforeRender` — PASS
 - AC13 plist на Linux: `TestRenderPlist_Structure`, `TestRenderPlist_KeepAliveSuccessfulExitFalse` — PASS
@@ -128,8 +147,8 @@ ok  github.com/vladimirvkhs/raxd/internal/version    0.001s
 
 ### Нейтрализация raw stderr (SR-95)
 - `RunManager` захватывает stderr в буфер
-- `neutralizeStderr` обрезает до 120 байт и удаляет PEM/rax_ маркеры
-- В user-facing error выходит только нейтральное сообщение
+- `neutralizeStderr` всегда возвращает `"manager command failed"`, полностью отбрасывая raw stderr (ISSUE-5 fix: dead code truncation удалён)
+- `TestRunManager_RawStderrNotPropagated`: запускает `/bin/ls /nonexistent-raxd-stderr-test-xyzzy`, проверяет sentinel НЕ в err.Error() (ISSUE-4 fix)
 - CLI `mapManagerError` строит user-facing текст из typed sentinels, не из raw os-ошибки
 
 ### Не-root демон (SR-83, SR-84)
@@ -166,7 +185,7 @@ ok  github.com/vladimirvkhs/raxd/internal/version    0.001s
 
 ## Известные ограничения
 
-- **Docker-верификация:** выполнена дирижёром — 479 тестов PASS, 0 FAIL (вывод в разделе «Тесты» выше)
+- **Docker-верификация после исправлений (коммит 4876696):** локально все тесты PASS (`go test ./... -count=1` — 12 пакетов, 0 FAIL). Docker-прогон ожидается от дирижёра; предыдущая верификация (479 тестов PASS) была до ISSUE-1..7 fixes.
 - **Кросс-сборка `make build-all`:** Makefile и Dockerfile.systemd созданы system-dev; кросс-сборка компилируется без ошибок (go build проверен локально), финальная верификация с `make verify-cross` — в Docker
-- **macOS createUser:** `launchd.go` создаёт директории через `dscl` — логика присутствует, но не тестируется на Linux. QA проверяет на реальном macOS
+- **macOS createUser:** `launchd.go` создаёт директории через `runCommandRaw` + chown (ISSUE-7 fix) — логика присутствует, но не тестируется на Linux. QA проверяет на реальном macOS
 - **Расширение security_static_test.go:** потребовалось добавить `internal/service` в whitelist exec-теста; задокументировано в коммите и выше в отклонениях
