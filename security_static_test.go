@@ -160,27 +160,120 @@ func TestStaticNoHardcodedSecrets(t *testing.T) {
 	}
 }
 
-// TestStaticNoFileCreationWithWideModes verifies that config package does not
-// create files with modes wider than 0600 (the contract for future keys.db/TLS key).
-// Security requirement: "файлы внутри StateDir/TLSDir — 0600; grep/код-ревью: нет создания файлов с режимом > 0600".
-// baseline §1/§2.
-func TestStaticNoFileCreationWithWideModes(t *testing.T) {
-	files := goSourceFiles(t, "internal/config")
-
-	// Forbidden: any WriteFile/Create with a mode > 0600 (e.g. 0644, 0755).
-	// We check for explicit mode literals wider than 0600.
+// isWideModeFsCall reports whether a source line contains both a wide mode literal
+// (0644/0o644/0755/0o755/0666/0o666/0777/0o777) and a file-creation or permission
+// API call (WriteFile, OpenFile, Mkdir, MkdirAll, Chmod, Create).
+//
+// Rationale: mode literals also appear legitimately in validation masks such as
+//   if mode &^ fs.FileMode(0o777) != 0 { … }
+// — this is mode validation, not file creation, and must NOT be flagged.
+// Only lines that pass a wide mode directly to an fs-creation/chmod call are violations.
+//
+// Self-check (see TestStaticNoFileCreationWithWideModes sub-tests):
+//   os.WriteFile(p, d, 0o644)   → violation (WriteFile + wide mode on same line)
+//   if mode &^ fs.FileMode(0o777) != 0 {  → NOT a violation (no perms-sink on line)
+func isWideModeFsCall(line string) bool {
 	wideModes := []string{
 		"0644", "0o644",
 		"0755", "0o755",
 		"0666", "0o666",
 		"0777", "0o777",
 	}
+	permSinks := []string{
+		"WriteFile",
+		"OpenFile",
+		"Mkdir",
+		"MkdirAll",
+		"Chmod",
+		"Create",
+	}
 
-	for _, mode := range wideModes {
-		if matches := grepFiles(t, files, mode); len(matches) > 0 {
-			t.Errorf("SECURITY: file mode %q (wider than 0600) found in config sources:\n  %s",
-				mode, strings.Join(matches, "\n  "))
+	hasWideMode := false
+	for _, m := range wideModes {
+		if strings.Contains(line, m) {
+			hasWideMode = true
+			break
 		}
+	}
+	if !hasWideMode {
+		return false
+	}
+
+	for _, sink := range permSinks {
+		if strings.Contains(line, sink) {
+			return true
+		}
+	}
+	return false
+}
+
+// grepFilesWideMode searches files for lines that contain a wide mode literal
+// AND a file-creation/permission API call on the same line.
+// Returns "file:line" strings for each violation.
+func grepFilesWideMode(t *testing.T, files []string) []string {
+	t.Helper()
+	var matches []string
+	for _, f := range files {
+		fh, err := os.Open(f)
+		if err != nil {
+			t.Fatalf("open %q: %v", f, err)
+		}
+		scanner := bufio.NewScanner(fh)
+		for scanner.Scan() {
+			line := scanner.Text()
+			trimmed := strings.TrimSpace(line)
+			if strings.HasPrefix(trimmed, "//") {
+				continue
+			}
+			if isWideModeFsCall(line) {
+				matches = append(matches, filepath.Base(f)+":"+trimmed)
+			}
+		}
+		fh.Close()
+	}
+	return matches
+}
+
+// TestStaticNoFileCreationWithWideModes verifies that the config package does not
+// create or chmod files with modes wider than 0600 (the security contract for
+// keys.db / TLS key files: baseline §1/§2, SR-73/ADR-003).
+//
+// A violation is a source line that contains BOTH:
+//   (a) a wide mode literal — 0644, 0o644, 0755, 0o755, 0666, 0o666, 0777, 0o777
+//   (b) a file-creation or permission call — WriteFile, OpenFile, Mkdir, MkdirAll,
+//       Chmod, Create
+//
+// Mode validation masks such as `if mode &^ fs.FileMode(0o777) != 0` are intentionally
+// excluded: they validate the caller-supplied mode rather than creating a file, so they
+// do not weaken the security guarantee this test enforces.
+//
+// The test includes a self-check (sub-tests "matcher_*") that verifies the matcher
+// itself is non-trivial: a genuine violation string IS flagged and a validation mask
+// string is NOT flagged.  This prevents a future "fix" from emptying the matcher.
+func TestStaticNoFileCreationWithWideModes(t *testing.T) {
+	// --- Self-check: verify the matcher is non-trivial ---
+	t.Run("matcher_violation_detected", func(t *testing.T) {
+		// A real violation: wide mode passed to WriteFile on the same line.
+		violationLine := `os.WriteFile(p, data, 0o644)`
+		if !isWideModeFsCall(violationLine) {
+			t.Errorf("matcher self-check FAILED: %q should be detected as a violation (WriteFile + 0o644), but was not", violationLine)
+		}
+	})
+
+	t.Run("matcher_validation_mask_excluded", func(t *testing.T) {
+		// A legitimate validation mask (introduced by F-1 fix in parseModeStr / ParseMode).
+		// Must NOT be flagged — it validates a mode, it does not create a file.
+		maskLine := `if mode&^fs.FileMode(0o777) != 0 {`
+		if isWideModeFsCall(maskLine) {
+			t.Errorf("matcher self-check FAILED: %q should NOT be detected as a violation (validation mask, no perms-sink), but was flagged", maskLine)
+		}
+	})
+
+	// --- Real check: scan internal/config non-test sources ---
+	files := goSourceFiles(t, "internal/config")
+	if matches := grepFilesWideMode(t, files); len(matches) > 0 {
+		t.Errorf("SECURITY: wide file mode used in file-creation/chmod call in config sources:\n  %s",
+			strings.Join(matches, "\n  "))
 	}
 }
 
