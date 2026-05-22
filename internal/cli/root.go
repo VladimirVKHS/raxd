@@ -7,12 +7,26 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/vladimirvkhs/raxd/internal/banner"
 	"github.com/vladimirvkhs/raxd/internal/config"
+	"github.com/vladimirvkhs/raxd/internal/service"
 )
 
 // NewRootCmd constructs the root cobra.Command and registers all sub-commands.
 // SilenceUsage and SilenceErrors are true so that the caller (main) fully
 // controls exit-code mapping and error printing.
 func NewRootCmd() *cobra.Command {
+	return buildRootCmd(nil)
+}
+
+// NewRootCmdWithServiceManager constructs the root command with a pre-built
+// ServiceManager injected for unit tests. The manager is used instead of
+// calling service.New() at runtime.
+func NewRootCmdWithServiceManager(mgr service.ServiceManager) *cobra.Command {
+	return buildRootCmd(mgr)
+}
+
+// buildRootCmd constructs the root command, optionally injecting a service manager.
+// mgr==nil means production mode (service.New() is called at command execution time).
+func buildRootCmd(mgr service.ServiceManager) *cobra.Command {
 	root := &cobra.Command{
 		Use:   "raxd [command]",
 		Short: "raxd — remote access daemon for AI agents",
@@ -42,6 +56,7 @@ Use "raxd [command] --help" for more information about a command.`,
 		newServeCmd(),
 		newVersionCmd(),
 		newStatusCmd(),
+		buildServiceCmd(mgr),
 	)
 
 	return root

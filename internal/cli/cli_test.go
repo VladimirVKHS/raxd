@@ -43,6 +43,7 @@ func TestSubcommandsRegistered(t *testing.T) {
 		"serve":   false,
 		"version": false,
 		"status":  false,
+		"service": false,
 	}
 
 	for _, cmd := range root.Commands() {
