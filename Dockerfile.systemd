@@ -1,0 +1,87 @@
+# Dockerfile.systemd — образ для systemd-интеграционных тестов raxd
+#
+# SECURITY-BASELINE §6: запуск сервисных тестов ТОЛЬКО в этом контейнере,
+# не на хост-машине разработчика. Демон raxd исполняет произвольные команды.
+#
+# AC16: все Linux-интеграционные критерии (AC1-AC12) проверяются внутри
+# этого контейнера с systemd как PID 1.
+#
+# Использование:
+#   # Собрать образ:
+#   docker build -f Dockerfile.systemd -t raxd-systemd-test .
+#
+#   # Запустить контейнер (cgroup v2 — современные хосты):
+#   docker run -d \
+#     --name raxd-svc-test \
+#     --privileged \
+#     --cgroupns=host \
+#     -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
+#     raxd-systemd-test
+#
+#   # На хостах с cgroup v1 заменить :rw на :ro.
+#
+#   # Войти в контейнер:
+#   docker exec -it raxd-svc-test bash
+#
+#   # Или через Makefile:
+#   make test-service
+#
+# Сборка raxd выполняется ОТДЕЛЬНО (make build-linux-amd64 / build-all),
+# бинарь копируется в контейнер при прогоне сценария.
+
+FROM ubuntu:22.04
+
+# Prevent interactive prompts during package installation
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install systemd and test utilities.
+# - systemd: service manager (PID 1)
+# - dbus: required by systemd
+# - procps: ps, /proc utilities
+# - iproute2: ss (socket statistics, for port check AC6)
+# - bsdutils: logger (for AC8 journal fill test)
+# - passwd: useradd/usermod (for raxd system user creation SR-83)
+# - file: binary format verification (for cross-build check AC14)
+# - curl: optional, for basic connectivity tests
+# - ca-certificates: TLS root certs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    systemd \
+    systemd-sysv \
+    dbus \
+    procps \
+    iproute2 \
+    bsdutils \
+    passwd \
+    file \
+    curl \
+    ca-certificates \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/*
+
+# Mask systemd units that are not relevant or broken in containers.
+# These prevent systemd from hanging on startup waiting for hardware/network.
+RUN systemctl mask \
+    systemd-resolved.service \
+    systemd-networkd.service \
+    systemd-networkd.socket \
+    getty@.service \
+    serial-getty@.service \
+    sys-fs-fuse-connections.mount \
+    systemd-remount-fs.service \
+    dev-hugepages.mount \
+    tmp.mount \
+    || true
+
+# Create directory for journald drop-in (used by raxd service install and AC8 test).
+RUN mkdir -p /etc/systemd/journald.conf.d
+
+# Create directory for systemd unit drop-ins.
+RUN mkdir -p /etc/systemd/system/raxd.service.d
+
+# Create /src for build artifacts (binar is copied here by the test runner).
+RUN mkdir -p /src/dist
+
+# Entrypoint: systemd as PID 1.
+# systemd will start as init system and manage all services inside the container.
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
