@@ -9,10 +9,10 @@ agents, all at once.
 > (`key create` / `key list` / `key delete`), the **TLS network server** (`raxd serve`), the first
 > **MCP server** (the `ping` and `server_info` tools), **command execution over MCP** (the
 > `execute_command` tool), and **file upload over MCP** (the `upload_file` tool) — all on the `/mcp`
-> route — are in place and working. The server provides a TLS 1.3 transport with per-connection
-> API-key authentication, rate limiting, and an audit log; the MCP endpoint runs behind that same
-> transport. The features that still run *behind* authentication — registering `raxd` as a system
-> service, and `curl | sh` installation — are **not implemented yet**; see [Coming next](#coming-next).
+> route — are in place and working. **Registering `raxd` as a managed system service**
+> (`raxd service install` / `start` / `stop` / `status` / `uninstall`, systemd on Linux, launchd on
+> macOS) is now in place too, running the daemon under an unprivileged `raxd` user. The remaining
+> piece, `curl | sh` installation, is **not implemented yet**; see [Coming next](#coming-next).
 
 Author: **Vladimir Kovalev, OEM TECH**.
 
@@ -31,11 +31,12 @@ server. The end product is a single binary that is simultaneously:
 Target platforms: **macOS and Linux**, architectures **amd64 and arm64**. Windows is out of scope.
 
 At this stage the binary provides a stable command tree, the local foundation (API keys stored
-securely on disk), and the networked core: `raxd serve` opens a TLS 1.3 listener, authenticates every
-connection against those keys, and serves an MCP endpoint on `/mcp` with two read-only tools (`ping`,
-`server_info`), the security-critical `execute_command` tool (runs a command on the host), and the
-`upload_file` tool (writes a file on the host). Both `execute_command` and `upload_file` are
-registered at the same extension point, behind the same authentication, rate limiting, and audit.
+securely on disk), the networked core, and system-service registration. `raxd serve` opens a TLS 1.3
+listener, authenticates every connection against those keys, and serves an MCP endpoint on `/mcp`
+with two read-only tools (`ping`, `server_info`), the security-critical `execute_command` tool (runs
+a command on the host), and the `upload_file` tool (writes a file on the host). For production,
+`raxd service install` registers that `raxd serve` as a managed OS service — with autostart, restart
+on failure, and a graceful stop — running the daemon as the unprivileged `raxd` user (not root).
 
 ## What works today
 
@@ -48,6 +49,10 @@ registered at the same extension point, behind the same authentication, rate lim
 | `raxd key delete` — revoke an API key | **Working** |
 | Secure key storage in `keys.db` (salted SHA-256 hash, `0600` file) | **Working** |
 | `raxd serve` — foreground TLS 1.3 server | **Working** |
+| `raxd service install` / `uninstall` / `start` / `stop` / `status` — manage raxd as a system service | **Working** |
+| Non-root daemon under the `raxd` user (systemd `User=raxd` / launchd `UserName=raxd`) | **Working** |
+| Autostart at boot, restart on failure, graceful stop via the service manager | **Working** |
+| journald drop-in that caps the audit-log size (`SystemMaxUse` / `SystemMaxFileSize`) | **Working** (Linux) |
 | TLS 1.3 transport with a self-signed ECDSA P-256 certificate (auto-generated, reused) | **Working** |
 | Per-connection API-key authentication over the network (`Authorization: Bearer`) | **Working** |
 | Rate limiting (per key and per IP) and DNS-rebinding `Host`/`Origin` checks | **Working** |
@@ -58,10 +63,10 @@ registered at the same extension point, behind the same authentication, rate lim
 | **MCP `upload_file`** — write a file on the host (`os.Root`-confined, size limit, controlled mode, no-overwrite default, atomic, audit) | **Working** |
 | MCP audit (one line per tool call; for `execute_command`: command, args, exit code, duration; for `upload_file`: path, size) | **Working** |
 | `raxd --help` and the full command tree | **Working** |
-| Product banner with author (printed to stderr) | **Working** |
-| XDG-based config/state path resolution (`~/.config/raxd`, `XDG_*` overrides) | **Working** |
+| XDG-based config/state path resolution (`~/.config/raxd`, `XDG_*` overrides; system paths under the service) | **Working** |
 | Directory creation with `0700` permissions | **Working** |
 | `config.yaml` loading via viper (networking, `exec`, and `upload` fields read by `serve`) | **Working** |
+| Cross-compilation to darwin/linux × amd64/arm64 (static `CGO_ENABLED=0` binaries) | **Working** |
 | File **download** / host filesystem read / file deletion over MCP | **Not implemented** |
 | MCP tools beyond `ping` / `server_info` / `execute_command` / `upload_file`; MCP Resources / Prompts | **Not implemented** |
 | Interactive / PTY command sessions and real-time output streaming | **Not implemented** |
@@ -70,7 +75,6 @@ registered at the same extension point, behind the same authentication, rate lim
 | mTLS / client certificates | **Not implemented** (API-key auth only) |
 | `raxd config port` | **Stub** (`not implemented yet`) |
 | `curl \| sh` installer | **Not implemented** |
-| Running as a registered system service (systemd/launchd) | **Not implemented** (`serve` is foreground only) |
 
 Behind authentication, the working routes today are the health check (`GET /healthz`) and the MCP
 server (`/mcp`, with `ping`, `server_info`, `execute_command`, and `upload_file`). Every other route
@@ -84,7 +88,8 @@ implemented yet**.
 > [`upload_file` security guide](docs/file-upload-security.md) before enabling either against a real
 > host. The allowlist is **off by default** (any command is allowed), command arguments and the upload
 > destination path are **logged verbatim** (do not pass secrets in `args` or in `path`), and you
-> should run `raxd` as a **non-root** user inside a container.
+> should run `raxd` as a **non-root** user — which the [`raxd service`](docs/service-management.md)
+> layout does for you by running the daemon as the `raxd` user.
 
 ## Requirements
 
@@ -92,7 +97,9 @@ implemented yet**.
 - [Docker](https://www.docker.com/) — **all builds, tests, and any execution of `raxd` happen
   inside a container, never on the host.** `raxd` is designed to execute commands over the network
   and `raxd serve` opens a TLS listener, so its place is an isolated container (see the security
-  baseline §6 and `docs/development.md`).
+  baseline §6 and `docs/development.md`). The system-service integration is exercised in a privileged
+  systemd-in-Docker container; the macOS launchd path is verified on a real macOS host (see
+  [`docs/service-management.md`](docs/service-management.md#5-the-macos-path-is-not-tested-in-docker)).
 
 ## Quick start (Docker)
 
@@ -120,12 +127,14 @@ See [`docs/development.md`](docs/development.md) for the project layout, how to 
 metadata, and why the workflow is Docker-only.
 
 > There is **no installer yet**. Installation via `curl | sh` is planned (see
-> [Coming next](#coming-next)) but does not exist — build from source in Docker as shown above.
+> [Coming next](#coming-next)) but does not exist — build from source in Docker as shown above. Once
+> a binary is in place, register it as a service with `raxd service install` (see
+> [the service guide](docs/service-management.md)).
 
 ## Commands
 
-`raxd` exposes the following command tree. The service commands, the `key` group, and `serve` are
-working; `config port` is an honest stub.
+`raxd` exposes the following command tree. The service commands, the `key` group, the `service`
+group, and `serve` are working; `config port` is an honest stub.
 
 ```
 raxd
@@ -135,15 +144,24 @@ raxd
 │   ├── create         create a new API key                (working)
 │   ├── list           list all API keys                   (working)
 │   └── delete         revoke an API key                   (working)
+├── service            manage raxd as a system service
+│   ├── install        register the service + autostart    (working)
+│   ├── uninstall      remove the service registration     (working)
+│   ├── start          start the service                   (working)
+│   ├── stop           stop the service                    (working)
+│   └── status         show the system-service status      (working)
 ├── config             manage configuration
 │   └── port           set the listening port              (stub)
 └── serve              start the raxd TLS server           (working)
 ```
 
 A full reference with usage strings, exit codes, and output examples is in
-[`docs/commands.md`](docs/commands.md). The MCP server is not a CLI command — it is hosted by
-`raxd serve` on the `/mcp` route; see [`docs/mcp.md`](docs/mcp.md). Command execution and file upload
-are **not** CLI sub-commands either — they are the MCP `execute_command` and `upload_file` tools.
+[`docs/commands.md`](docs/commands.md). The system-service security and operations model — non-root
+execution, the privileged-port capability, what `uninstall` keeps, and audit-log rotation — is in
+[`docs/service-management.md`](docs/service-management.md). The MCP server is not a CLI command — it
+is hosted by `raxd serve` on the `/mcp` route; see [`docs/mcp.md`](docs/mcp.md). Command execution and
+file upload are **not** CLI sub-commands either — they are the MCP `execute_command` and `upload_file`
+tools.
 
 ### Example: API keys
 
@@ -227,8 +245,57 @@ response codes, and configuration fields, see [`docs/commands.md`](docs/commands
 > **Scope:** `serve` today provides the secure transport, authentication, the health check, and the
 > MCP server (`ping` / `server_info` / `execute_command` / `upload_file`). On startup it also creates
 > the upload root (default `~/.local/state/raxd/uploads`, `0700`) for `upload_file`. Every route
-> other than `/healthz` and `/mcp` returns `501`. `serve` is foreground only and does **not** register
-> itself as a system service.
+> other than `/healthz` and `/mcp` returns `501`. `serve` is foreground only — to run it as a managed
+> service with autostart, use `raxd service install` (see the next example).
+
+### Example: running raxd as a system service
+
+For production, register `raxd` as a managed OS service instead of running `serve` in the foreground.
+`raxd service install` needs root (it writes to system directories, creates the service user, and
+calls the service manager), but the **daemon it registers runs as the unprivileged `raxd` user**, not
+root:
+
+```
+$ sudo raxd service install
+  installed     raxd service
+  unit          /etc/systemd/system/raxd.service
+  drop-in       /etc/systemd/journald.conf.d/raxd.conf
+  user          raxd  [not root]
+  port          7822
+  autostart     enabled
+  hint: start the service now with "raxd service start"
+```
+
+Start it and check the status (status goes to stdout, so it pipes cleanly):
+
+```sh
+sudo raxd service start
+raxd service status
+```
+
+```
+  installed    yes
+  running      yes
+  pid          1234
+  euid         999
+  user         raxd  [not root]
+  port         7822
+  autostart    enabled
+  unit         /etc/systemd/system/raxd.service
+  manager      systemd
+  state        active (running)
+```
+
+The non-zero `euid` (here `999`) confirms the daemon — and therefore every `execute_command` and
+`upload_file` it serves — runs as the unprivileged `raxd` user, not root. `raxd service uninstall`
+removes the registration but **intentionally keeps** the inert `raxd` user and the data directory.
+
+> **Read the [service guide](docs/service-management.md) before installing on a real host.** It covers
+> the non-root model, the privileged-port capability (the default port `7822` needs none; a port
+> `< 1024` grants only `CAP_NET_BIND_SERVICE`), what `uninstall` keeps, audit-log rotation via the
+> journald drop-in, and the fact that the macOS launchd path is verified on a real macOS host rather
+> than in Docker. The on-disk service paths and permissions are in
+> [`docs/configuration.md`](docs/configuration.md#service-layout-system-service).
 
 ### Example: connecting to the MCP server
 
@@ -281,7 +348,8 @@ see [`docs/mcp.md`](docs/mcp.md#execute_command).
 > [`execute_command` security guide](docs/execute-command-security.md). Key points: the allowlist is
 > **off by default** (any command runs); command arguments are **logged verbatim** (do not pass
 > secrets in `args`); the allowlist match is **exact** (`ls` ≠ `/bin/ls`); and you should run `raxd`
-> as a **non-root** user in a container. The `exec.*` settings are documented in
+> as a **non-root** user — the easiest way is to register it as a service (the daemon then runs as the
+> `raxd` user). The `exec.*` settings are documented in
 > [`docs/configuration.md`](docs/configuration.md#command-execution-exec-fields).
 
 ### Example: uploading a file over MCP
@@ -342,7 +410,8 @@ shown as `not running` even while a server is listening:
 ```
 
 For security, `status` never prints key material, TLS contents, or any secrets — only the state
-string and the resolved paths.
+string and the resolved paths. (To inspect the **system service** state instead — installed, running,
+PID, autostart — use `raxd service status`.)
 
 ### The banner
 
@@ -367,8 +436,8 @@ this single fixed (wide) layout — adaptive sizing and color/styling are planne
 `raxd` resolves its directories using the XDG Base Directory convention, with a single canonical
 config path on both Linux and macOS:
 
-| Path | Default | Override |
-|------|---------|----------|
+| Path | Default (interactive) | Override |
+|------|-----------------------|----------|
 | Config directory | `~/.config/raxd` | `$XDG_CONFIG_HOME/raxd` |
 | Config file | `~/.config/raxd/config.yaml` | follows config directory |
 | State directory | `~/.local/state/raxd` | `$XDG_STATE_HOME/raxd` |
@@ -379,9 +448,13 @@ config path on both Linux and macOS:
 Directories are created with `0700` permissions when `raxd` runs. The `keys.db` file is created with
 `0600` permissions the first time you run `key create`. The TLS certificate (`cert.pem`, `0644`) and
 private key (`key.pem`, `0600`) are created in the TLS directory the first time you run `raxd serve`,
-and reused afterward. The upload root is created with `0700` on `raxd serve`. Full details, including
-the networking fields and the `exec` / `upload` fields that `serve` reads from `config.yaml`, are in
-[`docs/configuration.md`](docs/configuration.md).
+and reused afterward. The upload root is created with `0700` on `raxd serve`.
+
+When `raxd` runs as a registered **system service**, the daemon uses **system** paths instead
+(`/etc/raxd`, `/var/lib/raxd` on Linux; `/usr/local/etc/raxd`, `/usr/local/var/raxd` on macOS), set
+through the unit/plist environment so no code change is needed. Full details, including the networking
+fields, the `exec` / `upload` fields that `serve` reads from `config.yaml`, and the service layout,
+are in [`docs/configuration.md`](docs/configuration.md).
 
 ## Coming next
 
@@ -396,14 +469,13 @@ the binary is being built toward; do not treat them as available today.
 - **Chunked / streaming upload** — `upload_file` ships one whole file per request, bounded by
   `max_body_bytes`; uploading larger files would need a chunked/streaming channel.
 - **Command sandboxing** — cgroups/rlimits/seccomp/namespaces for `execute_command`. Today isolation
-  relies on running `raxd` as a non-root user inside a container; the tool already kills the whole
-  process tree on timeout, caps output, and limits argument count/length.
-- **System-service registration** — running `raxd` as a systemd/launchd service (`serve` is
-  foreground only today and does not install or manage a service).
+  relies on running `raxd` as a non-root user inside a container (which the `raxd service` layout
+  arranges); the tool already kills the whole process tree on timeout, caps output, and limits
+  argument count/length.
 - **mTLS / client certificates** — currently out of scope; authentication is by API key only.
 - **Installation via `curl | sh`** — an `install.sh` script, goreleaser release matrix, SHA256
   verification, and macOS notarization (distribution task). *There is no installer yet — install
-  by building from source in Docker as described above.*
+  by building from source in Docker, then `raxd service install` to register the service.*
 - **`config port`** — actually writing the listening port to `config.yaml` (edit the file by hand
   for now).
 - **Visual design** — lipgloss styling, adaptive banner width, and colored output.
@@ -411,7 +483,10 @@ the binary is being built toward; do not treat them as available today.
 ## Documentation
 
 - [`docs/commands.md`](docs/commands.md) — full command reference (`version`, `status`, the `key`
-  group, `serve`, and the `config port` stub).
+  group, the `service` group, `serve`, and the `config port` stub).
+- [`docs/service-management.md`](docs/service-management.md) — the system-service security and
+  operations guide: non-root execution, the privileged-port capability, what `uninstall` keeps,
+  audit-log rotation, the restart policy, and the macOS verification limitation.
 - [`docs/mcp.md`](docs/mcp.md) — MCP integration guide: the `/mcp` endpoint, connection parameters,
   the `ping` / `server_info` / `execute_command` / `upload_file` tools, authentication, the curl
   smoke-test, MCP client config, and audit.
@@ -421,10 +496,10 @@ the binary is being built toward; do not treat them as available today.
 - [`docs/file-upload-security.md`](docs/file-upload-security.md) — mandatory security warnings for
   `upload_file` (mount points in the upload root, secrets in the path, `deny_root`/root, the mode
   policy, no disk quota, residual risks).
-- [`docs/configuration.md`](docs/configuration.md) — paths, `keys.db`, the TLS directory, and the
-  `config.yaml` networking, `exec`, and `upload` fields.
-- [`docs/troubleshooting.md`](docs/troubleshooting.md) — common problems with `serve`, the TLS
-  certificate, keys, the config file, `execute_command`, and `upload_file`.
+- [`docs/configuration.md`](docs/configuration.md) — paths, the service layout, `keys.db`, the TLS
+  directory, and the `config.yaml` networking, `exec`, and `upload` fields.
+- [`docs/troubleshooting.md`](docs/troubleshooting.md) — common problems with `serve`, the service,
+  the TLS certificate, keys, the config file, `execute_command`, and `upload_file`.
 - [`docs/development.md`](docs/development.md) — building and testing in Docker, project layout, and
   build metadata.
 

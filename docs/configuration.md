@@ -1,7 +1,8 @@
 # Configuration and paths
 
 This document describes where `raxd` stores its configuration and state, how to override those
-locations, the `keys.db` key database, the TLS directory, and the `config.yaml` format — **as
+locations, the `keys.db` key database, the TLS directory, the `config.yaml` format, and — when `raxd`
+runs as a registered **system service** — the system paths it uses instead. Everything is **as
 implemented in the code today**.
 
 ## Path resolution
@@ -25,6 +26,11 @@ resolved values at any time with [`raxd status`](commands.md#raxd-status). (`rax
 config, keys, and TLS paths; the upload root is created by `raxd serve` from the state directory and is
 not listed by `status`.)
 
+> The table above is the **interactive** layout — what an ordinary user gets from `$HOME`. When `raxd`
+> runs as a registered **system service**, the daemon resolves these same paths against **system**
+> XDG values set in the unit/plist, so it lands in `/etc/raxd` and `/var/lib/raxd` (Linux) instead.
+> See [Service layout (system service)](#service-layout-system-service) below.
+
 > Path resolution is implemented explicitly in the standard library (reading `XDG_CONFIG_HOME` /
 > `XDG_STATE_HOME` and falling back to `$HOME`). The `adrg/xdg` library is intentionally **not**
 > used, because its macOS default would point at `~/Library/Application Support` and conflict with
@@ -46,6 +52,10 @@ export XDG_STATE_HOME=/custom/state
 When a variable is empty or unset, the corresponding default (`$HOME/.config` or
 `$HOME/.local/state`) is used.
 
+This is exactly the mechanism the system service uses: the generated unit/plist set
+`XDG_CONFIG_HOME` / `XDG_STATE_HOME` / `HOME` so the daemon resolves system paths without any change
+to `raxd`'s code (see [Service layout](#service-layout-system-service)).
+
 ## Directory creation and permissions
 
 When `raxd` runs, it ensures the config directory, the state directory, and the TLS directory exist.
@@ -63,6 +73,82 @@ report an error and exit with a non-zero code:
 error: cannot determine config directory: $HOME is not set
   hint: set the HOME environment variable and try again
 ```
+
+## Service layout (system service)
+
+When you register `raxd` as a service with [`raxd service install`](commands.md#raxd-service), the
+daemon does **not** use the interactive `~/.config` / `~/.local/state` paths. Instead the generated
+unit (Linux) or plist (macOS) sets system XDG values so `raxd`'s ordinary path resolution lands in
+system directories — no change to `raxd`'s code is needed (ADR-002). The service runs under the
+unprivileged user `raxd`, which has no normal `$HOME`, so the system paths are the correct home for
+its state.
+
+The paths come from the service defaults in the code (`DefaultConfigForGOOS`):
+
+| Location | Linux | macOS |
+|----------|-------|-------|
+| Config directory | `/etc/raxd` | `/usr/local/etc/raxd` |
+| State directory | `/var/lib/raxd` | `/usr/local/var/raxd` |
+| Log directory | n/a — audit goes to **journald** | `/usr/local/var/log/raxd` |
+| Unit / plist | `/etc/systemd/system/raxd.service` | `/Library/LaunchDaemons/tech.oem.raxd.plist` |
+| Journal drop-in | `/etc/systemd/journald.conf.d/raxd.conf` | n/a (no journald) |
+
+How the daemon is pointed at these directories:
+
+- **Linux.** The unit sets `Environment=XDG_CONFIG_HOME=/etc`, `Environment=XDG_STATE_HOME=/var/lib`,
+  and `Environment=HOME=/var/lib/raxd`. With `$XDG_CONFIG_HOME=/etc`, `raxd`'s resolver appends
+  `/raxd`, giving `/etc/raxd`; likewise `$XDG_STATE_HOME=/var/lib` gives `/var/lib/raxd`. systemd
+  creates `/var/lib/raxd` (`StateDirectory=raxd`) and `/etc/raxd` (`ConfigurationDirectory=raxd`)
+  owned by `raxd` **before** the daemon starts, both with mode `0700` (explicit
+  `StateDirectoryMode=0700` / `ConfigurationDirectoryMode=0700`, not the systemd default of `0755`).
+- **macOS.** The plist sets `XDG_CONFIG_HOME=/usr/local/etc`, `XDG_STATE_HOME=/usr/local/var`, and
+  `HOME=/usr/local/var/raxd`. launchd has no `StateDirectory` equivalent, so `install` creates
+  `/usr/local/var/raxd`, `/usr/local/etc/raxd`, and `/usr/local/var/log/raxd` itself, each `0700`
+  and owned by `raxd`.
+
+> **Why `/usr/local` on macOS and not `/etc` / `/var/lib`.** On macOS, `/etc` and `/var` are
+> system-managed (under SIP); third-party daemons use the `/usr/local` prefix. The plist's
+> `XDG_CONFIG_HOME` / `XDG_STATE_HOME` are derived from those paths so the directory the daemon
+> resolves is exactly the one `install` created.
+
+Permissions of the service artifacts:
+
+| Artifact | Owner | Mode |
+|----------|-------|------|
+| Unit (`raxd.service`) | `root:root` | `0644` |
+| Journal drop-in (`raxd.conf`) | `root:root` | `0644` |
+| plist (`tech.oem.raxd.plist`) | `root:wheel` | `0644` |
+| State directory (`/var/lib/raxd`, `/usr/local/var/raxd`) | `raxd:raxd` | `0700` |
+| Config directory (`/etc/raxd`, `/usr/local/etc/raxd`) | `raxd:raxd` | `0700` |
+| Log directory (macOS, `/usr/local/var/log/raxd`) | `raxd:raxd` | `0700` |
+| `keys.db`, TLS private key (inside the state dir) | `raxd:raxd` | `0600` |
+
+The registration files are owned by root and not group/world-writable, so the unprivileged `raxd`
+user **cannot** rewrite the definition of its own service. The state directory is `0700` (not the
+wider systemd default), and `keys.db` and the TLS private key keep their `0600` — exactly as for the
+interactive layout above.
+
+### The listening port and privileged ports
+
+The service listens on the port from `config.yaml` (`port:`, default `7822`), the same value
+[`raxd serve`](commands.md#raxd-serve) would bind. `raxd service install` reads it at install time.
+
+- **Default `7822` (≥ 1024).** Not a privileged port, so the daemon needs no special privilege to
+  bind it. This is why the service runs fully as the unprivileged `raxd` user with no extra
+  capability.
+- **A privileged port (< 1024).** On Linux the generated unit gains exactly one capability —
+  `CAP_NET_BIND_SERVICE` — and nothing more (no full root, no setuid-root). For that case
+  `NoNewPrivileges` is omitted while the other hardening is kept; this is a deliberate, narrow
+  trade-off documented in
+  [`service-management.md`](service-management.md#2-privileged-ports--1024-and-the-network-capability).
+
+Because the daemon runs as `raxd` (not root), `config.yaml`'s `exec.deny_root` / `upload.deny_root`
+levers are a secondary defence — the non-root service layout is the primary one. See
+[`service-management.md`](service-management.md#1-non-root-execution).
+
+For the full service security and operations model — non-root execution, the privileged-port
+capability, what `uninstall` keeps, audit-log rotation, and the macOS verification limitation — see
+[`service-management.md`](service-management.md).
 
 ## The `keys.db` key database
 
@@ -107,6 +193,11 @@ keystore's constant-time `Verify`). Two consequences worth noting:
 - A **corrupt** `keys.db` is a startup error: `serve` reports `key store is corrupted or unreadable`
   and exits with code `1`, without modifying the file. (If the store becomes unreadable while the
   server is running, individual requests are answered with `403` and a `DENY` audit line.)
+
+> **Under the service, `keys.db` lives in the system state directory.** A daemon registered with
+> `raxd service` reads `keys.db` from `/var/lib/raxd/keys.db` (Linux) or `/usr/local/var/raxd/keys.db`
+> (macOS), owned by `raxd`, `0600`. Create keys as the operator with `raxd key create` against that
+> same state directory before starting the service.
 
 ### Behaviour and edge cases
 
@@ -154,7 +245,9 @@ Behaviour:
 
 Configuration is read from the config file shown above (`~/.config/raxd/config.yaml` by default)
 using [viper](https://github.com/spf13/viper). The file is YAML. It is read by `raxd serve` at
-startup; the other commands do not consume it yet.
+startup; the other commands do not consume it yet — with one exception:
+[`raxd service install`](commands.md#raxd-service-install) reads the `port:` value (only) to decide
+whether the service needs the privileged-port capability.
 
 ### Networking and `serve` fields
 
@@ -190,7 +283,7 @@ max_body_bytes:   1048576   # 1 MiB
 
 | Key | Type | Default | Meaning |
 |-----|------|---------|---------|
-| `port` | integer | `7822` | TCP port the listener binds to |
+| `port` | integer | `7822` | TCP port the listener binds to. Also read by `raxd service install` to decide on the privileged-port capability (a value `< 1024` triggers `CAP_NET_BIND_SERVICE`) |
 | `bind_addr` | string | `127.0.0.1` | Local address to bind to. Must be a valid IP. Default is loopback only |
 | `rate_limit` | number | `10` | Sustained request rate (events/second) per key and per IP |
 | `rate_burst` | integer | `20` | Maximum burst size for the token bucket |
@@ -223,6 +316,9 @@ Notes on the values:
   **no** audit line. For an oversized `upload_file` body this surfaces (in this build) as an HTTP
   `400` from the MCP SDK ("failed to read body"), **not** a `413` — see
   [`mcp.md`](mcp.md#upload_file) for that caveat and [`troubleshooting.md`](troubleshooting.md#a-request-returns-413-and-nothing-shows-up-in-the-audit-stream).
+- **Changing `port` for the service.** If you set a port `< 1024`, run `raxd service install` (or
+  re-install) so the generated unit picks up the capability for the new port. See
+  [`service-management.md`](service-management.md#2-privileged-ports--1024-and-the-network-capability).
 
 ### Command execution (`exec`) fields
 
@@ -295,15 +391,19 @@ Notes on the values, with the security implications spelled out:
   `config.yaml` key to accept one. The child environment is built only from `exec.env_whitelist`. This
   blocks loader-injection attacks (`LD_PRELOAD` and friends).
 - **`deny_root` is a hard lever, not the primary defence.** The primary defence against running as
-  root is to **run `raxd` as a non-root user**. `deny_root: true` is the operator's lever to refuse
-  execution if the daemon ever finds itself running as root. See
-  [the security guide](execute-command-security.md#3-the-deny_root-policy-and-running-as-root).
+  root is to **run `raxd` as a non-root user** — which the [`raxd service`](commands.md#raxd-service)
+  layout does for you by running the daemon as the `raxd` user. `deny_root: true` is the operator's
+  lever to refuse execution if the daemon ever finds itself running as root. See
+  [the security guide](execute-command-security.md#3-the-deny_root-policy-and-running-as-root) and
+  [`service-management.md`](service-management.md#1-non-root-execution).
 - **Arguments are logged verbatim.** The `args` a client sends are written to the audit log without
   masking. **Do not pass secrets in arguments.** See
   [the security guide](execute-command-security.md#1-do-not-pass-secrets-in-command-arguments-argv).
-- **Audit-log rotation is not built in.** The audit stream (including `execute_command` records) goes
-  to `stderr`. Rotation is delegated to the system (`journald` / `logrotate`); configure it for a
-  file-output deployment.
+- **Audit-log rotation is delegated to the system.** The audit stream (including `execute_command`
+  records) goes to `stderr`. Under the [`raxd service`](commands.md#raxd-service) layout on Linux,
+  that stderr goes to journald and is size-capped by the drop-in `install` writes; see
+  [`service-management.md`](service-management.md#4-audit-log-rotation). For a bare file-output
+  deployment, configure `logrotate` yourself.
 
 For the tool's input/output contract, error mapping, and curl examples, see
 [`mcp.md`](mcp.md#execute_command).
@@ -388,7 +488,9 @@ Notes on the values, with the security implications spelled out:
   **not** block **mount points**: do **not** place a bind-mount inside the upload root. See
   [the security guide](file-upload-security.md#1-do-not-place-a-bind-mount-or-external-filesystem-inside-the-upload-root).
 - **The default root is safe.** When `upload.root` is empty, `serve` uses `<state directory>/uploads`
-  (created `0700`) — never `/`, `/root`, or a root home directory.
+  (created `0700`) — never `/`, `/root`, or a root home directory. Under the service the state
+  directory is the system one (`/var/lib/raxd` on Linux), so the default upload root is
+  `/var/lib/raxd/uploads`, owned by `raxd`.
 - **The mode policy blocks privilege/integrity bits.** setuid/setgid/sticky and world-writable are
   rejected for both `default_mode` and a client-supplied `mode`. The created file inherits the daemon's
   UID/GID; the tool never `chown`s or elevates. See
@@ -416,18 +518,22 @@ For the tool's input/output contract, error mapping, and curl examples, see
   `upload.default_mode` makes `serve` exit `1` with the messages shown above.
 - **`config port` does not write the file yet.** `raxd config port <PORT>` is still a stub. To
   change the port (or any other field, including `exec.*` / `upload.*`) today, edit `config.yaml`
-  directly; `raxd serve` reads it on the next start.
+  directly; `raxd serve` reads it on the next start. If you change `port` for a registered service,
+  re-run `raxd service install` so the unit picks up the right privileged-port capability.
 
 ## Related documents
 
-- [`commands.md`](commands.md) — full command reference, including `raxd status`, `raxd key`, and
-  `raxd serve`.
+- [`commands.md`](commands.md) — full command reference, including `raxd status`, `raxd key`,
+  `raxd service`, and `raxd serve`.
+- [`service-management.md`](service-management.md) — the system-service security and operations guide
+  (non-root execution, privileged-port capability, what `uninstall` keeps, audit-log rotation, the
+  macOS verification limitation).
 - [`mcp.md`](mcp.md) — the MCP integration guide, including the `execute_command` and `upload_file`
   tool references.
 - [`execute-command-security.md`](execute-command-security.md) — mandatory security warnings for
   `execute_command`.
 - [`file-upload-security.md`](file-upload-security.md) — mandatory security warnings for `upload_file`.
-- [`troubleshooting.md`](troubleshooting.md) — common problems with `serve`, the TLS certificate,
-  the config file, `execute_command`, and `upload_file`.
+- [`troubleshooting.md`](troubleshooting.md) — common problems with `serve`, the service, the TLS
+  certificate, the config file, `execute_command`, and `upload_file`.
 - [`development.md`](development.md) — building and testing in Docker.
 </content>

@@ -61,6 +61,10 @@ error: cannot bind to 127.0.0.1:7822: address already in use
   `port:` key (see [`configuration.md`](configuration.md#networking-and-serve-fields)) and start
   `serve` again. The MCP endpoint follows the same port.
 
+> If `raxd` is running as a registered service, a stale instance is most often the cause — stop it
+> with `raxd service stop` (or check `raxd service status`) rather than killing it by hand. See
+> [the service section](#raxd-service) below.
+
 > **What you will (and will not) see.** When the port is in use, the bind fails before the server
 > ever starts, so `serve` prints **only** the `error:` / `hint:` lines above and exits `1`. The
 > startup block (`cert` / `key` / `tls` / `listening …` / `press Ctrl+C`) and the shutdown block do
@@ -282,6 +286,170 @@ That is the normal, healthy state. `raxd serve` is a long-running process: after
 blocks and prints **only** an audit line per connection. Silence means no connections are arriving;
 there are no heartbeat messages. Press Ctrl+C to stop it (graceful shutdown, exit `0`).
 
+## `raxd service`
+
+Problems registering or running `raxd` as a system service. The full command reference is in
+[`commands.md`](commands.md#raxd-service); the security and operations model is in
+[`service-management.md`](service-management.md). Remember the systemd integration is exercised in a
+privileged systemd-in-Docker container, while the macOS launchd path is verified on a real macOS host
+(see [`service-management.md`](service-management.md#5-the-macos-path-is-not-tested-in-docker)).
+
+### `error: insufficient privileges to install the service`
+
+`install`, `uninstall`, `start`, and `stop` write to system directories and call the service manager,
+so they require root.
+
+```
+error: insufficient privileges to install the service
+  hint: run as root or with sudo: sudo raxd service install
+  hint: installation requires root to write system service files
+```
+
+Run the command with `sudo`. `raxd` does **not** silently fall back to anything when it lacks
+privileges — there is no risk of a partially-installed or root-running daemon from a non-root attempt.
+
+> Installing needs root, but the **daemon** does not run as root: the generated unit/plist set
+> `User=raxd` / `UserName=raxd`, so the running service is the unprivileged `raxd` user. The
+> `insufficient privileges` error is only about the installer's write access, not the daemon. See
+> [`service-management.md`](service-management.md#1-non-root-execution).
+
+`raxd service status` does **not** require root — you can always inspect the state without `sudo`.
+
+### `error: service manager is not available`
+
+`raxd` could not reach the OS service manager (`systemctl` on Linux, `launchctl` on macOS) — it is
+not present, or the init system is not the expected one.
+
+```
+error: service manager is not available
+  hint: ensure systemd (Linux) or launchd (macOS) is running
+```
+
+- On Linux, this means `systemd` is not the init system (or `systemctl` is missing). A plain
+  container without systemd as PID 1 cannot host the service — the systemd integration is tested in a
+  dedicated privileged systemd container (see
+  [`service-management.md`](service-management.md#where-this-runs)). On a normal Linux host with
+  systemd, confirm `systemctl` is on `PATH`.
+- On a non-Linux, non-macOS platform `raxd` cannot manage a service at all and reports
+  `error: this platform is not supported` with the hint that service management is available on Linux
+  and macOS only.
+
+### The service installed but will not start (crash-loop)
+
+If `raxd service start` succeeds but `raxd service status` keeps showing the daemon stopped or with a
+changing PID, the daemon is failing to start under the service. Inspect the logs:
+
+- **Linux:** `journalctl -u raxd -e` (the audit stream and any startup error go to journald). Look
+  for the same `serve` startup errors documented under [`raxd serve`](#raxd-serve) above (port in
+  use, TLS directory permission, corrupt `keys.db`, bad `config.yaml`, upload-root permission).
+- **macOS:** check the log file `/usr/local/var/log/raxd/raxd.log` (the plist's `StandardErrorPath`).
+
+Common service-specific causes:
+
+- **Directory ownership/permissions.** The service runs as `raxd`, so its state directory
+  (`/var/lib/raxd` on Linux, `/usr/local/var/raxd` on macOS) and config directory (`/etc/raxd` /
+  `/usr/local/etc/raxd`) must exist and be owned by `raxd` with mode `0700`. On Linux systemd creates
+  `/var/lib/raxd` and `/etc/raxd` for you (via `StateDirectory` / `ConfigurationDirectory`) before
+  the daemon starts; on macOS `install` creates them. If you changed ownership by hand, restore
+  `raxd:raxd` ownership and `0700`.
+- **A privileged port without the capability.** If you set `port:` to a value `< 1024` after the
+  service was installed for the default port, the running unit may not have `CAP_NET_BIND_SERVICE` and
+  the bind will fail with a permission error. Re-run `sudo raxd service install` (after `uninstall`)
+  so the regenerated unit gains the capability — see the next entry.
+
+### A privileged port (< 1024) fails to bind
+
+By default `raxd` listens on `7822`, which is unprivileged and binds fine as the `raxd` user. If you
+set `port:` in `config.yaml` to a value below `1024` (for example `443`), the daemon needs the
+`CAP_NET_BIND_SERVICE` capability to bind it without being root.
+
+`raxd service install` reads the port from `config.yaml` at install time and adds the capability to
+the generated unit **only** when the port is `< 1024`. So:
+
+1. Set the privileged `port:` in `config.yaml` first.
+2. Then run `sudo raxd service install` (uninstall first if it is already installed) so the
+   regenerated unit includes `CAP_NET_BIND_SERVICE`.
+
+If you changed the port without re-installing, the old unit lacks the capability and the bind fails.
+The capability granted is only `CAP_NET_BIND_SERVICE` — never full root or setuid-root. See
+[`service-management.md`](service-management.md#2-privileged-ports--1024-and-the-network-capability).
+On macOS the privileged-port mechanics are an open question verified on a real macOS host; keeping the
+default `7822` avoids the issue entirely.
+
+### `error: raxd service is not installed`
+
+You ran `raxd service start` or `raxd service stop` before installing the service.
+
+```
+error: raxd service is not installed
+  hint: install it first with "raxd service install"
+```
+
+Install it first with `sudo raxd service install`. Note the asymmetry: `start` and `stop` on an
+absent service are **errors** (exit `1`), but `uninstall` on an absent service is a **no-op success**
+(exit `0`, with a `not installed` message). A `raxd service status` on an absent service is also a
+clean exit `0` showing `installed no`.
+
+### `install` says "already installed"
+
+Re-running `install` on an installed service is safe — it does **not** create a duplicate and is
+**not** an error:
+
+```
+  already installed   raxd service
+  hint: use "raxd service status" to check the current state
+```
+
+The command exits `0`. To change the configuration of an installed service (for example after editing
+`port:`), `uninstall` first, then `install` again.
+
+### After `uninstall`, the `raxd` user is still there
+
+That is deliberate. `uninstall` removes the unit/plist, disables autostart, and removes the journald
+drop-in, but it **intentionally keeps** the system user `raxd` (no login shell, no home, no longer
+running) — removing a system user is riskier than keeping an inert one (UID-reuse). The success block
+says so:
+
+```
+  kept          system user "raxd" (no shell, no home, not running)
+  hint: to also remove the user: sudo userdel raxd
+```
+
+If you need a zero-footprint removal, delete the user yourself **after** confirming it owns nothing
+you still need:
+
+- **Linux:** `sudo userdel raxd`
+- **macOS:** `sudo dscl . -delete /Users/raxd`
+
+The state directory is **not** removed by `uninstall` either, so `keys.db` and any data survive.
+(The uninstall hint names the real, platform-specific state directory: `/var/lib/raxd` on Linux,
+`/usr/local/var/raxd` on macOS.) See
+[`service-management.md`](service-management.md#3-the-raxd-user-is-kept-after-uninstall).
+
+### The journal fills up despite the size cap
+
+`install` writes a journald drop-in (`/etc/systemd/journald.conf.d/raxd.conf`) with
+`SystemMaxUse=200M` and `SystemMaxFileSize=50M`. These limits are **per-host** (they apply to the
+whole journal, not just the `raxd` unit). On a host shared with other heavily-logging services the cap
+is shared among all of them.
+
+- Confirm the drop-in is present and applied: `systemctl restart systemd-journald` after install, then
+  `journalctl --disk-usage`.
+- For a limit isolated to `raxd`, switch the daemon to file output and add a `logrotate` config — the
+  documented fallback (see
+  [`service-management.md`](service-management.md#4-audit-log-rotation)).
+
+On macOS there is no journald; rotation of `/usr/local/var/log/raxd/raxd.log` is done with `newsyslog`
+and is verified on a real macOS host.
+
+### The service stopped and did not come back
+
+That is correct for a **graceful stop**. `raxd service stop` sends `SIGTERM`, the daemon exits cleanly
+(code `0`), and the restart policy (`Restart=on-failure` on Linux, `KeepAlive.SuccessfulExit=false` on
+macOS) does **not** restart a clean exit. The service stays stopped until you `raxd service start` it.
+The manager only restarts the service after a **crash** (a non-zero exit or `kill -9`). See
+[`service-management.md`](service-management.md#6-restart-on-failure-vs-graceful-stop).
+
 ## MCP server (`/mcp`)
 
 The MCP server runs inside `raxd serve` on the `/mcp` route. Most MCP problems are the transport
@@ -371,7 +539,9 @@ How to act on each:
   `exec.max_arg_len`, `exec.max_timeout_ms`).
 - **`execution as root is forbidden by policy`.** `deny_root: true` is set and the daemon is running
   as root. Run `raxd` as a non-root user, or set `deny_root: false` (which downgrades the refusal to a
-  per-call `WARN` — the command then runs as root, which is itself risky).
+  per-call `WARN` — the command then runs as root, which is itself risky). The simplest way to run
+  non-root is to register `raxd` as a service, which runs the daemon as the `raxd` user — see
+  [`service-management.md`](service-management.md#1-non-root-execution).
 - **`additional properties not allowed`.** Remove the unknown field. The only accepted fields are
   `command`, `args`, `timeout_ms`, `cwd`. There is no `env` field.
 
@@ -408,6 +578,9 @@ Every call writes its own audit record to the `stderr` audit stream. To watch on
 raxd serve 2>&1 | grep "tool=execute_command"
 ```
 
+When `raxd` runs as a service on Linux, the audit stream is in journald — use
+`journalctl -u raxd -f | grep "tool=execute_command"` instead.
+
 What to look for:
 
 - `msg=MCP … result=ok` — the command ran. Read `exit_code=`, `duration=`, `timed_out=`.
@@ -417,7 +590,8 @@ What to look for:
   invalid working directory) — note that both surface the same `command not found` text to the client.
 - `msg=WARN … reason=running-as-root` — an extra record written on **every** call when the daemon is
   root. If you see this, the daemon is running as root and every command runs as root. Fix the
-  deployment (run non-root) or set `exec.deny_root: true`.
+  deployment (run non-root — for example via [`raxd service`](service-management.md#1-non-root-execution))
+  or set `exec.deny_root: true`.
 
 > **Arguments are logged verbatim.** The `args=[…]` field shows exactly what the client sent, with no
 > masking. If you find a secret in the audit log, the client put it in `args` — do not do that. See
@@ -472,7 +646,9 @@ How to act on each:
   [the mode policy](file-upload-security.md#4-file-mode-policy--only-0777-permission-bits-default-0600).
 - **`upload as root is forbidden by policy`.** `upload.deny_root: true` is set and the daemon is root.
   Run `raxd` as a non-root user, or set `upload.deny_root: false` (which downgrades the refusal to a
-  per-call `WARN` — the file is then written as root, which is itself risky).
+  per-call `WARN` — the file is then written as root, which is itself risky). Registering `raxd` as a
+  service runs the daemon non-root for you — see
+  [`service-management.md`](service-management.md#1-non-root-execution).
 - **`write failed`.** A genuine I/O error (often a full disk, or a permission problem on the upload
   root). Check free space and that the upload root is writable (`0700`, owned by the daemon user). No
   partial or temp file is left behind. See the next entry.
@@ -500,6 +676,8 @@ Every call writes its own audit record to the `stderr` audit stream. To watch on
 ```sh
 raxd serve 2>&1 | grep "tool=upload_file"
 ```
+
+When `raxd` runs as a service on Linux, use `journalctl -u raxd -f | grep "tool=upload_file"`.
 
 What to look for:
 
@@ -555,9 +733,10 @@ Revoke the lost key (`raxd key delete <id>`) and create a new one.
 Only `raxd serve` reads `config.yaml` today, and it reads the file **at startup**. Restart `serve`
 after editing the file. This includes the `exec.*` and `upload.*` keys — changing the allowlist,
 timeouts, limits, the upload root, the size limit, the default mode, or either `deny_root` requires a
-`serve` restart to take effect. The other commands (`version`, `status`, the `key` group) do not act
-on the config values. `raxd config port` is a stub and does not write the file — edit `config.yaml`
-by hand.
+`serve` restart to take effect. When `raxd` runs as a service, restart it with `raxd service stop`
+then `raxd service start`. The other commands (`version`, `status`, the `key` group) do not act on the
+config values, except that `raxd service install` reads `port:` to decide on the privileged-port
+capability. `raxd config port` is a stub and does not write the file — edit `config.yaml` by hand.
 
 > Cross-reference: the dedicated entries for the two config-load failures live under
 > [`raxd serve`](#configuration-load-errors-share-one-generic-hint) above, including the note that an
@@ -579,15 +758,24 @@ error: cannot determine config directory: $HOME is not set
 Set `HOME` (or the relevant `XDG_CONFIG_HOME` / `XDG_STATE_HOME`) and retry. In a container, make
 sure the user running `raxd` has a home directory set.
 
+> The system service avoids this by setting `HOME` (and `XDG_CONFIG_HOME` / `XDG_STATE_HOME`)
+> explicitly in the unit/plist, so the unprivileged `raxd` user — which has no normal home — still
+> resolves system paths. See
+> [`configuration.md`](configuration.md#service-layout-system-service).
+
 ## Related documents
 
-- [`commands.md`](commands.md) — full command reference, including all `serve` error cases.
+- [`commands.md`](commands.md) — full command reference, including all `serve` and `service` error
+  cases.
+- [`service-management.md`](service-management.md) — the system-service security and operations guide
+  (non-root execution, privileged-port capability, what `uninstall` keeps, audit-log rotation, the
+  macOS verification limitation).
 - [`mcp.md`](mcp.md) — MCP integration guide: the `/mcp` endpoint, connection parameters, the
   `ping` / `server_info` / `execute_command` / `upload_file` tools, and audit.
 - [`execute-command-security.md`](execute-command-security.md) — mandatory security warnings for
   `execute_command`.
 - [`file-upload-security.md`](file-upload-security.md) — mandatory security warnings for `upload_file`.
-- [`configuration.md`](configuration.md) — paths, `keys.db`, the TLS directory, and the
-  `config.yaml` networking, `exec`, and `upload` fields.
+- [`configuration.md`](configuration.md) — paths, the service layout, `keys.db`, the TLS directory,
+  and the `config.yaml` networking, `exec`, and `upload` fields.
 - [`development.md`](development.md) — building and testing in Docker.
 </content>
