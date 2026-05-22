@@ -47,6 +47,10 @@ import (
 	"github.com/vladimirvkhs/raxd/internal/version"
 )
 
+// defaultExecCfgSec — дублируем в security test файле (разные test-файлы в пакете mcp_test).
+// Используем те же безопасные дефолты что и в mcp_test.go.
+// Примечание: defaultExecCfg() определена в mcp_test.go (тот же пакет mcp_test) — используем её.
+
 // ============================================================================
 // MEDIUM-1 (SR-34, AC10): no-secrets test reads ACTUAL private TLS key content
 // ============================================================================
@@ -380,8 +384,9 @@ func TestToolsListSchemas(t *testing.T) {
 			t.Errorf("AC4/SR-31: tool %q inputSchema.type = %v, want object", name, schema["type"])
 		}
 	}
-	if _, bad := toolMap["execute_command"]; bad {
-		t.Errorf("AC13/SR-37: execute_command must NOT be in tools/list")
+	// execute_command IS now registered (command-exec task; AC1/SR-40).
+	if _, present := toolMap["execute_command"]; !present {
+		t.Errorf("AC1/command-exec: execute_command must be in tools/list after command-exec task")
 	}
 	if _, bad := toolMap["upload_file"]; bad {
 		t.Errorf("AC13/SR-37: upload_file must NOT be in tools/list")
@@ -511,7 +516,7 @@ func TestUnknownToolNotExecuted(t *testing.T) {
 	readBody(t, initResp)
 
 	resp := postMCP(t, client, baseURL, keyStr, jsonrpcBody(5, "tools/call", map[string]interface{}{
-		"name": "execute_command", "arguments": map[string]interface{}{},
+		"name": "upload_file", "arguments": map[string]interface{}{},
 	}), map[string]string{"MCP-Protocol-Version": "2025-11-25"})
 	body := readBody(t, resp)
 
@@ -641,7 +646,7 @@ func TestMCPKeystoreCorruptReturns403(t *testing.T) {
 	auditBuf := &bytes.Buffer{}
 	logger := newTestLogger(auditBuf)
 	auditFn := server.NewAuditFnForTest(logger)
-	mcpH, err := internalmcp.NewHandler(version.Version, auditFn)
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg())
 	if err != nil {
 		t.Fatalf("SR-27/ErrCorrupt: mcp.NewHandler: %v", err)
 	}
@@ -854,7 +859,7 @@ func startMCPServerWithTLSKey(t *testing.T) (baseURL, keyStr string, client *htt
 	auditBuf = &bytes.Buffer{}
 	logger := newTestLogger(auditBuf)
 	auditFn := server.NewAuditFnForTest(logger)
-	mcpH, err := internalmcp.NewHandler(version.Version, auditFn)
+	mcpH, err := internalmcp.NewHandler(version.Version, auditFn, defaultExecCfg())
 	if err != nil {
 		t.Fatalf("mcp.NewHandler: %v", err)
 	}
