@@ -136,7 +136,7 @@ func uploadHandler(cfg fileupload.Config, audit server.AuditFn) sdkmcp.ToolHandl
 		// --- Входные проверки ДО записи (SR-75/SR-73/SR-76) ---
 
 		// (1) Ранний фильтр размера по DecodedLen ДО декодирования (защита памяти; SR-75/R-U5).
-		if base64.StdEncoding.DecodedLen(len(input.Content)) > int(cfg.MaxFileBytes) {
+		if int64(base64.StdEncoding.DecodedLen(len(input.Content))) > cfg.MaxFileBytes {
 			reason := "file too large: exceeds max_file_bytes"
 			audit(server.AuditRecord{
 				TS:          time.Now().UTC(),
