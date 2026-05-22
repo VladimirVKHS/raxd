@@ -68,7 +68,15 @@
 docker build --target test -t raxd-test . && docker run --rm raxd-test
 ```
 
-**Результат:** все пакеты PASS, включая race-прогон; нет `skip`/`t.Skip`/закомментированных тестов.
+**Результат:** все пакеты PASS, включая race-прогон.
+
+**Примечание о `t.Skip`:** в `upload_tool_test.go` присутствуют три euid-условных `t.Skip`
+(строки 924/951/983 — подтесты `TestUploadRootWarnAuditRecord`). Они взаимоисключающие по
+euid: `no_warn_when_not_root` пропускается при euid==0; `warn_when_root` и `deny_root_upload`
+пропускаются при euid!=0. Это не скрытие провалов — unit-подтест (`unit_warn_writeAudit`)
+выполняется всегда без Skip и является основным регрессионным тестом. При запуске в Docker
+от root (euid==0) выполняются euid==0-подтесты; `no_warn_when_not_root` закономерно
+пропускается. Не-euid-условных `t.Skip` нет ни в одном тестовом файле этой задачи.
 
 ```
 ok  github.com/vladimirvkhs/raxd                       0.023s
