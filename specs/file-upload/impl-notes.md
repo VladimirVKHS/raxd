@@ -6,7 +6,7 @@
 
 - **`internal/fileupload/mode.go`** — `ParseMode(s string) (fs.FileMode, error)`: разбирает восьмеричную строку, маскирует `0777`, запрещает special bits (`0o7000`) и world-writable (`0o002`); возвращает `ErrBadMode`. Реализует контракт ADR-003.
 
-- **`internal/fileupload/upload.go`** — `Write(ctx, cfg, in) (Result, error)`: traversal-safe запись через `os.Root` (ADR-001); атомарная схема temp(crypto/rand+O_EXCL) → chmod-by-fd → Write → Sync → Root.Rename → fsync-dir (ADR-002); ранняя size-проверка до декодирования; `filepath.IsLocal` до открытия Root; defer-cleanup temp на любой ошибке. Ошибки: `ErrTraversal`, `ErrExists`, `ErrIsDir`, `ErrTooLarge`.
+- **`internal/fileupload/upload.go`** — `Write(cfg Config, in Input) (Result, error)`: traversal-safe запись через `os.Root` (ADR-001); атомарная схема temp(crypto/rand+O_EXCL) → chmod-by-fd → Write → Sync → Root.Rename → fsync-dir (ADR-002); ранняя size-проверка до декодирования; `filepath.IsLocal` до открытия Root; defer-cleanup temp на любой ошибке. Ошибки: `ErrTraversal`, `ErrExists`, `ErrIsDir`, `ErrTooLarge`.
 
 - **`internal/config/config.go`** — добавлена `UploadConfig{Root, MaxFileBytes, DefaultMode, OverwriteDefault, DenyRoot}` с viper-defaults (`upload.max_file_bytes=716800`, `upload.default_mode="0600"`, `upload.deny_root=false`); валидация: `max_file_bytes` > 0 и ≤ `floor((maxBodyBytes-1024)*3/4)`; проверка `DefaultMode` через `parseModeStr` (inline, без import fileupload — исключает циклическую зависимость).
 
