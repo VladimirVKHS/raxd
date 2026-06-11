@@ -82,3 +82,12 @@ Race-детектор: `CGO_ENABLED=1 go test -race -count=1 ./internal/cmdexec/
 - `reapGroupOrphans`: `waitpid(-pgid, WNOHANG)` — только reap потомков нашей группы, не влияет
   на чужие процессы. Таймаут предотвращает бесконечный loop (SR-64: no panic).
 - Новые зависимости не введены: только стандартный `syscall`.
+
+## Примечание дирижёра: статус hotfix (git-flow)
+
+Эта правка — регрессия релизной линии: тег `v0.1.0` (на истории `main`) не собрался из-за
+падения security-теста SR-47 на Linux CI; релиз заблокирован. По `guides/GIT-FLOW-GUIDE.ru.md`
+§2.2 правка релизной линии — это `hotfix/*`, ответвляемый от `main`/`master` и мержимый в `main`.
+Поэтому ветка переименована `fix/* → hotfix/cmdexec-killgroup-linux`. На remote опубликован только
+`main` (trunk дистрибуции); ответвление от `develop` для разблокировки релиза неприменимо.
+Замечание developer-guardian (verdict needs-changes по origin ветки) этим закрыто.
