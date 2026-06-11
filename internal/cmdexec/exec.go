@@ -147,6 +147,17 @@ func Run(ctx context.Context, cfg Config, in Input) (Result, error) {
 	waitErr := cmd.Wait()
 	duration := time.Since(start)
 
+	// --- 11а. Reap orphan-потомков группы (SR-47/AC6: нет осиротевших) ---
+	// После cmd.Wait() головной процесс уже reap-нут. Потомки группы (например,
+	// sleep запущенный через sh -c "...&..."), получив SIGKILL от killGroup,
+	// могут стать orphan-зомби под init. На Linux с pidfd (Go 1.23+) зомби-процессы
+	// возвращают SUCCESS из pidfd_open, что ложно сигнализирует о живом процессе.
+	// reapGroupOrphans reap-ает этих orphan-ов: мы sub-reaper (setSelfSubreaper в
+	// applyProcessGroup), поэтому они усыновлены нами и доступны для waitpid.
+	if cmd.Process != nil {
+		reapGroupOrphans(cmd.Process.Pid)
+	}
+
 	// --- 11. Анализ результата ---
 	timedOut := false
 	exitCode := 0
