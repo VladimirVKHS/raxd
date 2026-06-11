@@ -18,12 +18,18 @@ import (
 
 // applyProcessGroup настраивает cmd для работы в новой группе процессов (Setpgid:true).
 // Должна вызываться ДО cmd.Start().
+// На Linux также устанавливает текущий процесс как sub-reaper (см. sysproc_linux.go),
+// чтобы orphan-потомки группы усыновлялись нами — это гарантирует reap зомби SR-47.
 // Credential НЕ устанавливается (AC9/SR-54: наследование uid/gid).
 func applyProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 		// Credential намеренно не задаётся — наследование uid/gid демона (SR-54).
 	}
+	// setSelfSubreaper — платформо-специфичная функция:
+	//   Linux (sysproc_linux.go): prctl(PR_SET_CHILD_SUBREAPER, 1)
+	//   Другие Unix (sysproc_unix_other.go): no-op
+	setSelfSubreaper()
 }
 
 // killGroup отправляет SIGKILL всей группе процессов (kill -pgid).
