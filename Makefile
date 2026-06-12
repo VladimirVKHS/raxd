@@ -14,8 +14,10 @@
 # ── Variables ────────────────────────────────────────────────────────────────
 
 # Go flags: offline vendor, CGO disabled for cross-compilation.
+# -buildvcs=false: версия/коммит вшиваются явно через VERSION_LDFLAGS (buildCommit=none),
+#   авто-VCS-штамп Go не нужен и ломает сборку в Docker-CI ("dubious ownership", exit 128).
 GO        := go
-GOFLAGS   := -mod=vendor
+GOFLAGS   := -mod=vendor -buildvcs=false
 CGO_OFF   := CGO_ENABLED=0
 LDFLAGS   := -ldflags="-s -w"
 
