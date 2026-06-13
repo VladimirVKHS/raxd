@@ -162,7 +162,7 @@ After install, start the service with "raxd service start".`,
 // ─── uninstall ────────────────────────────────────────────────────────────────
 
 func newServiceUninstallCmd(mgr service.ServiceManager) *cobra.Command {
-	return &cobra.Command{
+	cmd := &cobra.Command{
 		Use:   "uninstall",
 		Short: "Remove the system service registration and disable autostart",
 		Long: `Unregister raxd from the OS service manager.
@@ -171,9 +171,20 @@ Stops the service if running, removes the unit/plist file, and disables autostar
 The system user "raxd" is intentionally kept (see SR-93, ADR-002).
 Data in the state directory is preserved.
 
+Use --purge --yes to also remove the system user and all data (irreversible).
+
 Requires root or sudo.`,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			stderr := cmd.ErrOrStderr()
+
+			doPurge, _ := cmd.Flags().GetBool("purge")
+			doYes, _ := cmd.Flags().GetBool("yes")
+
+			// AC9, SR-114: --purge without --yes → barrier (nothing executed).
+			if doPurge && !doYes {
+				printPurgeBarrier(stderr)
+				return fmt.Errorf("purge requires --yes flag")
+			}
 
 			m, _, err := resolveManagerWithPort(mgr)
 			if err != nil {
@@ -184,6 +195,12 @@ Requires root or sudo.`,
 			ctx, cancel := serviceContext()
 			defer cancel()
 
+			// SR-125: --purge path is isolated in Purge(); Uninstall is byte-for-byte unchanged.
+			if doPurge && doYes {
+				return runPurgeCmd(ctx, m, stderr)
+			}
+
+			// Original uninstall (AC2: byte-for-byte, SR-125).
 			if err := m.Uninstall(ctx); err != nil {
 				// AC10: ErrNotInstalled@uninstall → exit 0, informational block.
 				if errors.Is(err, service.ErrNotInstalled) {
@@ -218,6 +235,163 @@ Requires root or sudo.`,
 
 			return nil
 		},
+	}
+
+	// AC9: --purge and --yes flags for the irreversible path.
+	cmd.Flags().Bool("purge", false, "also remove the system user \"raxd\" and all data (irreversible, requires --yes)")
+	cmd.Flags().Bool("yes", false, "confirm the irreversible purge operation (required with --purge)")
+
+	return cmd
+}
+
+// runPurgeCmd executes the full purge sequence and formats the output per ux-spec.
+// Called by newServiceUninstallCmd when --purge --yes are both set.
+// SR-116: audit record is emitted here BEFORE (implicit: Purge() emits before RemoveAll internally;
+// the CLI-layer audit log below summarises the completed report for structured logging).
+func runPurgeCmd(ctx context.Context, m service.ServiceManager, stderr io.Writer) error {
+	report, err := m.Purge(ctx, service.PurgeOptions{Confirmed: true})
+	if err != nil {
+		printSvcError(stderr, mapPurgeError(err))
+		return err
+	}
+
+	printPurgeReport(stderr, report)
+	return nil
+}
+
+// printPurgeBarrier prints the irreversibility warning when --purge is used without --yes.
+// SR-115: must mention keys.db and the --yes flag. AC9.
+func printPurgeBarrier(w io.Writer) {
+	cfg := service.DefaultConfigForGOOS(runtime.GOOS)
+
+	fmt.Fprintf(w, "warning: this operation is irreversible\n")
+	fmt.Fprintf(w, "\n")
+	fmt.Fprintf(w, "  The following will be permanently destroyed:\n")
+	fmt.Fprintf(w, "\n")
+	fmt.Fprintf(w, "    %-8s raxd  (system account, no login shell)\n", "user")
+	fmt.Fprintf(w, "    %-8s %s\n", "state", cfg.StateDir)
+	fmt.Fprintf(w, "    %-8s %s\n", "config", cfg.ConfigDir)
+	fmt.Fprintf(w, "    %-8s all API keys and audit log — cannot be recovered\n", "keys.db")
+	fmt.Fprintf(w, "\n")
+	fmt.Fprintf(w, "  hint: to confirm, re-run with --yes:\n")
+	fmt.Fprintf(w, "          sudo raxd service uninstall --purge --yes\n")
+}
+
+// printPurgeReport formats the PurgeReport per ux-spec §2 and §3 (removed/absent lines).
+// Emits the charmbracelet/log audit record before the human-readable block (SR-116).
+func printPurgeReport(w io.Writer, r service.PurgeReport) {
+	// Audit log (SR-116, AC8): structured INFO record before human output.
+	// This is the CLI-layer audit; the manager already emitted a preliminary record internally.
+	logger := log.New(w)
+	logger.Info("service purged",
+		"action", "purge",
+		"platform", r.Platform,
+		"user_removed", r.UserRemoved,
+		"user_absent", r.UserAbsent,
+		"dirs_removed", r.DirsRemoved,
+		"dirs_absent", r.DirsAbsent,
+		"stopped", r.Stopped,
+	)
+
+	// Human-readable report (ux-spec §2: %-14s column).
+	if r.Stopped {
+		fmt.Fprintf(w, "  %-14s raxd service\n", "stopped")
+	} else {
+		fmt.Fprintf(w, "  %-14s raxd service\n", "not running")
+	}
+	fmt.Fprintf(w, "\n")
+
+	if r.Uninstalled {
+		fmt.Fprintf(w, "  %-14s raxd service\n", "uninstalled")
+		if runtime.GOOS == "linux" {
+			fmt.Fprintf(w, "  %-14s unit file and autostart registration\n", "removed")
+			fmt.Fprintf(w, "  %-14s journal size limit drop-in\n", "removed")
+		} else {
+			fmt.Fprintf(w, "  %-14s plist file and autostart registration\n", "removed")
+		}
+	} else {
+		fmt.Fprintf(w, "  %-14s raxd service  [already unregistered]\n", "not installed")
+	}
+	fmt.Fprintf(w, "\n")
+
+	// User line.
+	if r.UserRemoved {
+		fmt.Fprintf(w, "  %-14s user raxd\n", "removed")
+	} else if r.UserAbsent {
+		fmt.Fprintf(w, "  %-14s user raxd  [already removed]\n", "absent")
+	}
+
+	// Directory lines.
+	// Print directories in stable order: removed first, then absent.
+	for _, d := range r.DirsRemoved {
+		fmt.Fprintf(w, "  %-14s %s\n", "removed", d)
+	}
+	for _, d := range r.DirsAbsent {
+		fmt.Fprintf(w, "  %-14s %s\n", "absent", d)
+	}
+
+	// Final line.
+	fmt.Fprintf(w, "\n")
+	anythingDone := r.UserRemoved || len(r.DirsRemoved) > 0
+	if anythingDone {
+		fmt.Fprintf(w, "  purge complete   raxd has been fully removed from this host\n")
+	} else {
+		fmt.Fprintf(w, "  purge complete   nothing to remove — host is already clean\n")
+	}
+}
+
+// mapPurgeError maps Purge errors to user-facing messages per ux-spec §маппинг sentinel.
+// SR-95, SR-124: neutral text, no raw OS errors, no internal details.
+func mapPurgeError(err error) serviceErrorMsg {
+	switch {
+	case errors.Is(err, service.ErrPermission):
+		return serviceErrorMsg{
+			err: "insufficient privileges to run purge",
+			hints: []string{
+				"run as root or with sudo:",
+				"        sudo raxd service uninstall --purge --yes",
+			},
+		}
+	case errors.Is(err, service.ErrUserMismatch):
+		return serviceErrorMsg{
+			err: "system user \"raxd\" does not match the expected raxd service account",
+			hints: []string{
+				"the account may have been modified; inspect it before removing:",
+				"        id raxd",
+				"        getent passwd raxd",
+			},
+		}
+	case errors.Is(err, service.ErrSuspiciousPath):
+		return serviceErrorMsg{
+			err: "resolved path for state/config directory is outside the expected layout",
+			hints: []string{
+				"inspect the raxd configuration for unexpected symlinks or path overrides:",
+				"        raxd service status",
+			},
+		}
+	case errors.Is(err, service.ErrUnsupported):
+		return serviceErrorMsg{
+			err: "this platform is not supported",
+			hints: []string{
+				"raxd service management is available on Linux and macOS only",
+			},
+		}
+	case errors.Is(err, service.ErrManagerUnavailable):
+		return serviceErrorMsg{
+			err: "raxd service did not stop within the timeout",
+			hints: []string{
+				"check service status and stop it manually before purging:",
+				"        sudo raxd service stop",
+				"        sudo raxd service uninstall --purge --yes",
+			},
+		}
+	default:
+		return serviceErrorMsg{
+			err: "purge operation failed",
+			hints: []string{
+				"run \"raxd service status\" to check current state",
+			},
+		}
 	}
 }
 
