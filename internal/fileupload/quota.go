@@ -31,6 +31,13 @@ var ErrQuotaExceeded = errors.New("upload denied: total upload quota exceeded")
 // единственный экземпляр *sync.Mutex на путь (без race при инициализации).
 var rootLocks sync.Map // map[string]*sync.Mutex
 
+// currentBytesHook — hook только для тестов (export_test.go); nil в production.
+// Если не nil, currentBytes вызывает его вместо реального WalkDir.
+// Позволяет тестам детерминированно инжектировать ошибку обхода (SR-96/Q4)
+// без зависимости от uid (работает в Docker от root).
+// ВАЖНО: задаётся только через export_test.go; не трогать в production-коде.
+var currentBytesHook func(*os.Root) (int64, error)
+
 // rootMutex возвращает единственный *sync.Mutex для данного абсолютного пути root.
 // Используется только Write; вызывается при MaxTotalBytes > 0 (SR-99).
 // SECURITY: LoadOrStore — атомарная операция; гонки инициализации нет (SR-92).
@@ -50,6 +57,12 @@ func rootMutex(absRoot string) *sync.Mutex {
 //     вызывающий Write НЕ выполняет запись при ошибке обхода.
 //   - os.Root-инвариант SR-69 сохранён: обход через root.FS() не выходит за корень.
 func currentBytes(root *os.Root) (int64, error) {
+	// Тестовый хук: если задан — использовать вместо реального обхода.
+	// В production currentBytesHook всегда nil (только export_test.go может его задать).
+	if currentBytesHook != nil {
+		return currentBytesHook(root)
+	}
+
 	var total int64
 	err := fs.WalkDir(root.FS(), ".", func(_ string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {

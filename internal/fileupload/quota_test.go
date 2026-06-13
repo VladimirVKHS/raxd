@@ -293,7 +293,7 @@ func TestQuota_SymlinkNotFollowed(t *testing.T) {
 	root := t.TempDir()
 	symlinkPath := filepath.Join(root, "link")
 	if err := os.Symlink(outerFile, symlinkPath); err != nil {
-		t.Skipf("symlink creation failed (may need elevated perms): %v", err)
+		t.Fatalf("symlink creation failed (infrastructure error, not a product bug): %v", err)
 	}
 
 	cfg := fileupload.Config{
@@ -624,6 +624,94 @@ func TestQuota_TotalSmallerThanPerFile(t *testing.T) {
 	}
 	if !errors.Is(err, fileupload.ErrQuotaExceeded) {
 		t.Errorf("want ErrQuotaExceeded, got %v", err)
+	}
+}
+
+// ─── SR-96: fail-closed при ошибке обхода ────────────────────────────────────
+
+// TestQuota_FailClosedOnWalkError: если при обходе root возникает ошибка → запись НЕ
+// выполняется, возвращается ошибка (SR-96/Q4/AC10). Fail-closed: молчаливого обхода нет.
+//
+// Реализация: детерминированная инъекция ошибки через SetCurrentBytesHook (export_test.go).
+// Хук подменяет реальный WalkDir заглушкой, возвращающей ошибку — без зависимости от uid
+// процесса. Работает при запуске от root в Docker (канонический прогон).
+func TestQuota_FailClosedOnWalkError(t *testing.T) {
+	root := t.TempDir()
+
+	cfg := fileupload.Config{
+		UploadRoot:    root,
+		MaxFileBytes:  716800,
+		DefaultMode:   0o600,
+		DenyRoot:      false,
+		MaxTotalBytes: 1000, // лимит включён → currentBytes вызывается
+	}
+
+	// Инжектируем детерминированную ошибку обхода через тестовый хук.
+	// Хук сбрасывается в defer — другие тесты не затронуты.
+	injectedErr := errors.New("injected walk error: permission denied")
+	fileupload.SetCurrentBytesHook(func(*os.Root) (int64, error) {
+		return 0, injectedErr
+	})
+	defer fileupload.SetCurrentBytesHook(nil)
+
+	// Write должен вернуть ошибку (fail-closed): обход упал → запись не выполнена.
+	_, err := fileupload.Write(cfg, fileupload.Input{
+		RelPath:   "test.bin",
+		Data:      make([]byte, 10),
+		Overwrite: false,
+		Mode:      0o600,
+	})
+	if err == nil {
+		t.Fatal("SR-96 fail-closed: ожидалась ошибка при ошибке обхода, Write вернул nil — молчаливый обход недопустим")
+	}
+	// Ошибка НЕ должна быть ErrQuotaExceeded (это fail-closed, а не quota-deny).
+	if errors.Is(err, fileupload.ErrQuotaExceeded) {
+		t.Errorf("SR-96: ошибка обхода должна давать fail (не ErrQuotaExceeded), got ErrQuotaExceeded")
+	}
+	// Ошибка должна содержать причину (обёртка над injectedErr).
+	if !errors.Is(err, injectedErr) {
+		t.Errorf("SR-96: ожидалась обёртка над injectedErr; got %v (%T)", err, err)
+	}
+
+	// Файл test.bin должен отсутствовать (fail-closed: запись не выполнена).
+	if _, statErr := os.Stat(filepath.Join(root, "test.bin")); !os.IsNotExist(statErr) {
+		t.Errorf("SR-96: файл не должен быть создан при ошибке обхода; statErr=%v", statErr)
+	}
+}
+
+// ─── I-3 (SR-90): без следов при deny — MkdirAll ПОСЛЕ квота-проверки ───────
+
+// TestQuota_DenyBeforeMkdirAll: при deny по квоте промежуточный подкаталог НЕ создаётся.
+// SR-90: deny ДО фиксации БЕЗ следов на диске; MkdirAll — часть «фиксации» (I-3/plan.md).
+func TestQuota_DenyBeforeMkdirAll(t *testing.T) {
+	root := t.TempDir()
+	cfg := fileupload.Config{
+		UploadRoot:    root,
+		MaxFileBytes:  716800,
+		DefaultMode:   0o600,
+		DenyRoot:      false,
+		MaxTotalBytes: 50, // лимит 50 байт
+	}
+
+	// Попытка записи в новый подкаталог с файлом, превышающим лимит.
+	// Подкаталог "subdir" ещё не существует в root.
+	_, err := fileupload.Write(cfg, fileupload.Input{
+		RelPath:   "subdir/file.bin",
+		Data:      make([]byte, 100), // 100 > 50 → deny по квоте
+		Overwrite: false,
+		Mode:      0o600,
+	})
+	if err == nil {
+		t.Fatal("ожидалась ошибка quota exceeded, получен nil")
+	}
+	if !errors.Is(err, fileupload.ErrQuotaExceeded) {
+		t.Errorf("want ErrQuotaExceeded, got %v", err)
+	}
+
+	// Подкаталог "subdir" НЕ должен существовать: MkdirAll не должен выполняться до deny.
+	subdirPath := filepath.Join(root, "subdir")
+	if _, statErr := os.Stat(subdirPath); !os.IsNotExist(statErr) {
+		t.Errorf("SR-90/I-3: подкаталог subdir не должен быть создан при deny по квоте; statErr=%v", statErr)
 	}
 }
 
