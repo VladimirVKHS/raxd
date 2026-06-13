@@ -13,13 +13,18 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/charmbracelet/log"
 )
 
 const (
@@ -40,7 +45,21 @@ const (
 
 	// Useradd exit code 9 means the user already exists → treat as success.
 	useraddExitAlreadyExists = 9
+
+	// userdelBin is the fixed path to userdel for purge (SR-120: absolute path, no shell).
+	userdelBin = "/usr/sbin/userdel"
+
+	// getentBin is the fixed path to getent for user verification (SR-120).
+	getentBin = "/usr/bin/getent"
 )
+
+// noLoginShells is the set of acceptable shells for a system (no-login) raxd account.
+// Used by verifyTargetUser on both platforms (service-design.md §9.2).
+var noLoginShells = map[string]bool{
+	"/usr/sbin/nologin": true,
+	"/sbin/nologin":     true,
+	"/usr/bin/false":    true,
+}
 
 // systemdManager implements ServiceManager for Linux + systemd.
 type systemdManager struct {
@@ -287,6 +306,264 @@ func (m *systemdManager) Status(ctx context.Context) (Status, error) {
 		EUID:      euid,
 		State:     stateStr,
 	}, nil
+}
+
+// ─── Purge (service-design.md §2.1, §4) ──────────────────────────────────────
+
+// Purge implements ServiceManager.Purge for Linux.
+// Orchestration order (service-design.md §4, SR-122):
+//  1. Privilege check (SR-121)
+//  2. Confirmed check (SR-114)
+//  3. Status — check if running
+//  4. Stop (if running or unknown), STОP on failure (AC4)
+//  5. Uninstall (ignore ErrNotInstalled, AC3)
+//  6–7. validatePurgePath for StateDir and ConfigDir (SR-118, SR-119)
+//  8. verifyTargetUserLinux (SR-117)
+//  10. Audit record BEFORE physical deletion (SR-116, AC8)
+//  11. Delete user via userdel (SR-120, SR-123)
+//  12–13. os.RemoveAll for StateDir and ConfigDir (AC3)
+//  15. Return PurgeReport, nil
+func (m *systemdManager) Purge(ctx context.Context, opts PurgeOptions) (PurgeReport, error) {
+	report := PurgeReport{Platform: "linux"}
+
+	// Step 1: privilege check — userdel and directory removal require root.
+	if os.Geteuid() != 0 {
+		return PurgeReport{}, wrapErr(ErrPermission, "must be run as root or with sudo")
+	}
+
+	// Step 2: duplicate confirmed guard (primary barrier is CLI --yes, AC9, SR-114).
+	if !opts.Confirmed {
+		return PurgeReport{}, ErrPurgeNotConfirmed
+	}
+
+	// Step 3: check if the service is active.
+	st, _ := m.Status(ctx)
+
+	// Step 4: stop if running or status unknown.
+	if st.Active || (!st.Installed && !st.Active) {
+		// Stop only if the service appears to be running.
+		// If not installed at all (not even installed), skip Stop.
+		if st.Active {
+			if err := m.Stop(ctx); err != nil {
+				// AC4, SR-122: Stop failed → do not proceed to user/dir deletion.
+				return PurgeReport{}, wrapErr(ErrManagerUnavailable, "service did not stop")
+			}
+			report.Stopped = true
+		}
+	}
+
+	// Step 5: Uninstall (idempotent — ignore ErrNotInstalled, AC3).
+	if err := m.Uninstall(ctx); err != nil {
+		if !errors.Is(err, ErrNotInstalled) {
+			// SR-122: uninstall failure stops the sequence.
+			return PurgeReport{}, err
+		}
+	} else {
+		report.Uninstalled = true
+	}
+
+	// Steps 6–7: validate paths before any destructive action (SR-118, SR-119).
+	allowedRoots := []string{m.cfg.StateDir, m.cfg.ConfigDir}
+	if err := validatePurgePath(m.cfg.StateDir, allowedRoots); err != nil {
+		return PurgeReport{}, err
+	}
+	if err := validatePurgePath(m.cfg.ConfigDir, allowedRoots); err != nil {
+		return PurgeReport{}, err
+	}
+
+	// Step 9: verify the target user (SR-117, AC6).
+	userPresent, err := verifyTargetUserLinux(ctx, m.cfg.User)
+	if err != nil {
+		return PurgeReport{}, err
+	}
+	if !userPresent {
+		report.UserAbsent = true
+	}
+
+	// Determine which directories exist for the pre-deletion audit record.
+	var dirsPresent []string
+	for _, d := range []string{m.cfg.StateDir, m.cfg.ConfigDir} {
+		if _, statErr := os.Stat(d); statErr == nil {
+			dirsPresent = append(dirsPresent, d)
+		}
+	}
+
+	// Step 10: emit PRELIMINARY audit record BEFORE physical deletion (SR-116, AC8).
+	// The record captures intent: what IS present and WILL be removed.
+	// The final PurgeReport (UserRemoved/DirsRemoved) is built AFTER destructive steps.
+	// (advisory от system-dev-guardian: разграничить предварительную запись и итоговый отчёт)
+	emitPurgeAuditRecord(opts.AuditOut, report.Platform, userPresent, dirsPresent)
+
+	// Step 11: delete OS user (SR-120: runCommandRaw, no shell).
+	if userPresent {
+		if err := deleteUserLinux(ctx, m.cfg.User); err != nil {
+			return PurgeReport{}, err
+		}
+		report.UserRemoved = true
+	}
+
+	// Steps 12–13: remove directories (AC3: not-exist → DirsAbsent, not error).
+	for _, d := range []string{m.cfg.StateDir, m.cfg.ConfigDir} {
+		if err := os.RemoveAll(d); err != nil {
+			// RemoveAll returns nil for non-existent paths, so a real error means FS issue.
+			return report, wrapErr(ErrManagerUnavailable, fmt.Sprintf("cannot remove %s", d))
+		}
+		// Determine if the dir was present before (we tracked it in dirsPresent).
+		wasPresent := false
+		for _, p := range dirsPresent {
+			if p == d {
+				wasPresent = true
+				break
+			}
+		}
+		if wasPresent {
+			report.DirsRemoved = append(report.DirsRemoved, d)
+		} else {
+			report.DirsAbsent = append(report.DirsAbsent, d)
+		}
+	}
+
+	// Step 15: return completed report.
+	return report, nil
+}
+
+// verifyTargetUserLinux checks the OS user via getent passwd.
+// Returns (present=false, nil) if the user does not exist (idempotent, AC3).
+// Returns ErrUserMismatch if the user exists but has a login shell (SR-117, AC6).
+// SR-120: runCommandRaw — no shell interpolation.
+func verifyTargetUserLinux(ctx context.Context, name string) (present bool, err error) {
+	cmd := runCommandRaw(ctx, getentBin, "passwd", name)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	runErr := cmd.Run()
+	if runErr != nil {
+		// getent exit 2 = "key not found in database" → user absent → idempotent (SR-123).
+		if isExitCode(runErr, 2) {
+			return false, nil
+		}
+		// getent not found (binary missing, etc.)
+		var exitErr *exec.ExitError
+		if !errors.As(runErr, &exitErr) {
+			// binary not found or other non-exit error
+			return false, nil
+		}
+		// Other non-zero exit → unknown error.
+		return false, wrapErr(ErrManagerUnavailable, "getent passwd failed")
+	}
+
+	line := strings.TrimSpace(stdout.String())
+	if line == "" {
+		// Empty output with exit 0 → user absent (AC3).
+		return false, nil
+	}
+
+	return parsePasswdLine(line, name)
+}
+
+// parsePasswdLine parses a single getent passwd line and validates the user.
+// Format: name:password:uid:gid:gecos:home:shell (7 colon-separated fields).
+//
+// Checks (service-design.md §2.1, SR-117, defense-in-depth):
+//  1. Field 0 (name) must equal expectedName.
+//  2. Field 2 (uid) must be < 1000 (systemd-default range for system accounts, [1,999]).
+//  3. Field 6 (shell) must be in noLoginShells — primary protection against login shells.
+//
+// All three checks must pass; any failure returns ErrUserMismatch.
+func parsePasswdLine(line, expectedName string) (present bool, err error) {
+	fields := strings.Split(line, ":")
+	if len(fields) < 7 {
+		return false, wrapErr(ErrManagerUnavailable, "getent passwd: unexpected output format")
+	}
+
+	// Check 1: username must match (field 0).
+	if fields[0] != expectedName {
+		return false, wrapErr(ErrUserMismatch, "username does not match expected raxd account")
+	}
+
+	// Check 2: uid must be < 1000 (system account range, defense-in-depth, service-design.md §2.1).
+	uid, uidErr := strconv.Atoi(fields[2])
+	if uidErr != nil || uid <= 0 || uid >= 1000 {
+		return false, wrapErr(ErrUserMismatch, "uid is not in system account range [1,999]")
+	}
+
+	// Check 3: shell must be a no-login shell — primary protection (SR-117).
+	shell := fields[6]
+	if !noLoginShells[shell] {
+		return false, wrapErr(ErrUserMismatch, "user has a login shell — not a raxd system account")
+	}
+
+	return true, nil
+}
+
+// deleteUserLinux deletes the OS user via userdel (SR-120: fixed binary, separate args).
+// Maps exit codes per service-design.md §2.1.
+func deleteUserLinux(ctx context.Context, name string) error {
+	cmd := runCommandRaw(ctx, userdelBin, name)
+	err := cmd.Run()
+	if err == nil {
+		return nil
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return mapUserdelExitCode(exitErr.ExitCode())
+	}
+	return wrapErr(ErrManagerUnavailable, "userdel: unexpected error")
+}
+
+// mapUserdelExitCode maps userdel exit codes to typed errors (service-design.md §2.1, SR-123).
+//
+//	0  → nil (user deleted)
+//	6  → nil (user not found — idempotent, AC3, SR-123)
+//	8  → error (user logged in)
+//	10 → ErrPermission (cannot update group file, SR-121)
+//	1  → ErrPermission (no permission / generic error, SR-121)
+//	other → wrapped error
+func mapUserdelExitCode(code int) error {
+	switch code {
+	case 0:
+		return nil
+	case 6:
+		// "specified user doesn't exist" — idempotent success (AC3, SR-123).
+		return nil
+	case 1:
+		return wrapErr(ErrPermission, "userdel: insufficient privileges")
+	case 10:
+		return wrapErr(ErrPermission, "userdel: cannot update group file")
+	case 8:
+		return wrapErr(ErrManagerUnavailable, "userdel: user is currently logged in")
+	default:
+		return wrapErr(ErrManagerUnavailable, fmt.Sprintf("userdel: unexpected exit code %d", code))
+	}
+}
+
+// emitPurgeAuditRecord writes the PRELIMINARY audit record BEFORE physical deletion.
+//
+// SR-116: this function is called on step 10, before userdel/RemoveAll (steps 11–14).
+// SR-124: only metadata is logged — no file contents, no keys, no secrets.
+//
+// Parameters:
+//   - w: target writer (opts.AuditOut from PurgeOptions); nil → no-op (safe for tests).
+//   - platform: "linux" or "darwin".
+//   - userPresent: whether the raxd OS user exists at the time of the audit record.
+//   - dirsPresent: list of state/config directories that exist at audit time.
+//
+// The record is "preliminary": it captures intent (what IS present and WILL be removed).
+// The final PurgeReport with actual removal results is returned by Purge() after step 15.
+func emitPurgeAuditRecord(w io.Writer, platform string, userPresent bool, dirsPresent []string) {
+	if w == nil {
+		// No audit sink provided — safe zero-value behaviour (existing tests/fakeManager).
+		return
+	}
+	logger := log.New(w)
+	logger.Info("purge intent",
+		"action", "purge",
+		"phase", "pre-deletion",
+		"platform", platform,
+		"user_present", userPresent,
+		"dirs_present", dirsPresent,
+	)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
