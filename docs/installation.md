@@ -2,16 +2,16 @@
 
 How to install the `raxd` binary on a fresh host. Everything here is taken from the current
 `install.sh`, `scripts/release.sh`, and the `Makefile`; nothing is hypothetical. Where a capability is
-a placeholder or is deliberately left out of v1, that is called out honestly rather than glossed over.
+deliberately left out of v1, that is called out honestly rather than glossed over.
 
-> **Status: the installer exists and is verified, the public download host does not yet.** The
-> `curl | sh` installer (`install.sh`) is implemented and has been verified end-to-end in Docker
-> against a local artifact source (the `TEST1`–`TEST9` install-flow checks are green). What is **not**
-> in place yet is a public release host that serves the release archives over HTTPS: the default
-> download URL in `install.sh` is a **placeholder** (`https://releases.example.com/raxd`). Until a real
-> host is configured, point the installer at your own source with `RAXD_BASE_URL` (see
-> [Quick install](#quick-install-curl--sh)), install [manually from a release archive](#manual-installation),
-> or [build the artifacts from source](#building-release-artifacts-from-source).
+> **Status: the installer is live on GitHub Releases.** The `curl | sh` installer (`install.sh`) is
+> implemented, verified end-to-end in Docker (the `TEST1`–`TEST9` install-flow checks are green), and
+> the release archives are **published on GitHub Releases** for `vladimirvkhs/raxd`. The canonical
+> one-liner works as-is (see [Quick install](#quick-install-curl--sh)). You can still install
+> [manually from a release archive](#manual-installation) or
+> [build the artifacts from source](#building-release-artifacts-from-source) if you prefer. What v1 does
+> **not** include is a GPG/minisign signature of `SHA256SUMS` or macOS Apple-Developer-ID notarization —
+> see the [trust model](#trust-model-v1) and [`production-readiness.md`](production-readiness.md).
 
 `install.sh` installs **only the `raxd` binary**. It does **not** register a system service — that is a
 separate, already-shipped command, `raxd service install`, documented in
@@ -38,30 +38,42 @@ before selecting the artifact.
 
 ## Quick install (`curl | sh`)
 
-The canonical, intended form once a public host is configured is a single command:
+The canonical form is a single command — the artifacts are published on GitHub Releases:
 
 ```sh
-curl -fsSL https://<base-url>/install.sh | bash
+curl -fsSL https://github.com/vladimirvkhs/raxd/releases/latest/download/install.sh | bash
 ```
 
-> **Honesty note: there is no public `<base-url>` yet.** The default `RAXD_BASE_URL` baked into
-> `install.sh` is the placeholder `https://releases.example.com/raxd`, which does not serve real
-> artifacts. Running the command above as-is will fail at the download step (exit `5`) until a real
-> release host is set up. To install today, supply your own source with `RAXD_BASE_URL` (below), use
-> [Manual installation](#manual-installation), or [build from source](#building-release-artifacts-from-source).
+With no `RAXD_BASE_URL` set, `install.sh` resolves the release from GitHub Releases for
+`vladimirvkhs/raxd`: by default it resolves the **latest** published tag through the GitHub API and
+downloads the matching archive and `SHA256SUMS` from
+`https://github.com/vladimirvkhs/raxd/releases/download/<tag>/…`.
+
+> **Version policy: `latest` vs pinned.** The command above always installs the newest published
+> release. For a reproducible install (production / CI), pin a tag with `RAXD_VERSION`:
+>
+> ```sh
+> RAXD_VERSION=v0.1.0 \
+>   curl -fsSL https://github.com/vladimirvkhs/raxd/releases/latest/download/install.sh | bash
+> ```
+>
+> See the same policy in
+> [`production-readiness.md`](production-readiness.md#1-public-release-host--closed-github-releases-ор-3--ор-5).
 
 ### Pointing the installer at an artifact source
 
-`install.sh` reads the artifact location and version from the environment, so you can run it against any
-HTTPS source that hosts the release archives and `SHA256SUMS`:
+`install.sh` reads the artifact location and version from the environment. By default it uses GitHub
+Releases for `RAXD_REPO` (default `vladimirvkhs/raxd`); you can override it to run against any HTTPS
+source that hosts the release archives and `SHA256SUMS`:
 
 | Variable | Purpose | Default |
 |----------|---------|---------|
-| `RAXD_BASE_URL` | Base URL for the artifacts (the archive and `SHA256SUMS` are fetched from `<base-url>/<archive>` and `<base-url>/SHA256SUMS`) | `https://releases.example.com/raxd` (placeholder) |
-| `RAXD_VERSION` | Release tag — selects which archive name is requested | `latest` |
+| `RAXD_REPO` | GitHub repository (`<owner>/<repo>`) used to resolve the release on GitHub Releases | `vladimirvkhs/raxd` |
+| `RAXD_BASE_URL` | Base URL for the artifacts (the archive and `SHA256SUMS` are fetched from `<base-url>/<archive>` and `<base-url>/SHA256SUMS`). When **unset/empty**, the installer uses GitHub Releases for `RAXD_REPO`; set it explicitly to point at your own source (the GitHub API is then not called) | _(empty → GitHub Releases for `RAXD_REPO`)_ |
+| `RAXD_VERSION` | Release tag — selects which release/archive is requested | `latest` |
 | `RAXD_PREFIX` | Install directory, overriding auto-detection (see [Install path and privileges](#install-path-and-privileges)) | _(unset → auto-detect)_ |
 
-For example, to install version `v0.1.0` from your own HTTPS host:
+For example, to install version `v0.1.0` from your own HTTPS host instead of GitHub Releases:
 
 ```sh
 RAXD_BASE_URL=https://artifacts.example.org/raxd RAXD_VERSION=v0.1.0 \
@@ -89,7 +101,8 @@ When you run `install.sh` directly (or pass arguments through `curl | sh` with `
 Passing flags through a pipe uses `bash -s --`:
 
 ```sh
-curl -fsSL https://<base-url>/install.sh | bash -s -- --prefix ~/.local/bin --version v0.1.0
+curl -fsSL https://github.com/vladimirvkhs/raxd/releases/latest/download/install.sh \
+  | bash -s -- --prefix ~/.local/bin --version v0.1.0
 ```
 
 An unknown flag, or `--prefix` / `--version` with no argument, fails with exit `1` and a hint
@@ -199,9 +212,10 @@ Read this before relying on `curl | sh` for a production host.
 
 In v1, the integrity of what you install rests on **two** mechanisms:
 
-1. **TLS (HTTPS) channel** to both the install script and the artifacts. The default `RAXD_BASE_URL` is
-   `https://…`, and downloads use `curl -fsSL`, so a transport error or HTTP error is not masked as an
-   empty file.
+1. **TLS (HTTPS) channel** to both the install script and the artifacts. Downloads use `curl -fsSL`
+   over HTTPS — by default from GitHub Releases (`https://github.com/vladimirvkhs/raxd/…`), or from a
+   `RAXD_BASE_URL` you set explicitly — so a transport error or HTTP error is not masked as an empty
+   file.
 2. **SHA256 verification** of the archive against `SHA256SUMS` **before** the binary is placed
    ([above](#integrity-verification-sha256)).
 
@@ -209,22 +223,23 @@ What v1 deliberately does **not** have:
 
 - **No GPG / minisign signature** of `SHA256SUMS`. There is no signing key or public-key trust
   infrastructure in v1, so `install.sh` does **not** claim to verify a signature (no false
-  `gpg --verify`). This is accepted deviation **П-1** / residual risk **ОР-1**. A signature
-  (a dedicated signing key, the public key distributed out-of-band, and a verify step in `install.sh`
-  *before* the hash check) is to be added before any public release.
+  `gpg --verify`). This is accepted deviation **П-1** / residual risk **ОР-1**, **deferred by an
+  owner-level decision** — v1 trust rests on TLS + SHA256, and a signature (a dedicated signing key, the
+  public key distributed out-of-band, and a verify step in `install.sh` *before* the hash check) may be
+  added later. See [`production-readiness.md`](production-readiness.md#2-no-gpgminisign-signature-of-sha256sums--deferred-by-decision-ор-1).
 
 **The boundary of this model:** because `SHA256SUMS` is fetched from the **same** source as the archive,
 the hash check protects you against an archive that is corrupted or substituted **in transit** or against
 a single tampered file — but **not** against a compromised source that serves a coordinated, matching
 archive **and** `SHA256SUMS`. That gap is exactly what a signature would close, which is why it is tracked
-as **ОР-1** for the public release.
+as **ОР-1**.
 
 Practical implication: only set `RAXD_BASE_URL` (and `--prefix`) to sources and directories you trust
 (see the [note above](#pointing-the-installer-at-an-artifact-source)).
 
 ## Manual installation
 
-If you have a release archive and `SHA256SUMS` (downloaded from a host, or
+If you have a release archive and `SHA256SUMS` (downloaded from GitHub Releases, or
 [built from source](#building-release-artifacts-from-source)), you can install without the script:
 
 1. Download the archive for your platform and the `SHA256SUMS` file into the same directory. Pick the
@@ -242,8 +257,8 @@ If you have a release archive and `SHA256SUMS` (downloaded from a host, or
 
    If the line for your archive does not say `OK`, stop.
 
-3. Unpack — the archive contains the binary named `raxd` (plus `README.md`; a `LICENSE` file is included
-   only if one exists in the source tree — see [Note on licensing](#note-on-licensing)):
+3. Unpack — the archive contains the binary named `raxd`, plus `README.md` and the `LICENSE` file
+   (see [Note on licensing](#note-on-licensing)):
 
    ```sh
    tar -xzf raxd_v0.1.0_linux_amd64.tar.gz
@@ -312,10 +327,10 @@ Or allow it via **System Settings → Privacy & Security** (approve the blocked 
 
 ## Building release artifacts from source
 
-Until a public host serves the artifacts, you can build all four archives + `SHA256SUMS` yourself from
-the source tree. **All builds run inside Docker** (security baseline §6 — `go build` on the host is
-blocked by a guard). The build is offline from the committed `vendor/` directory
-(`-mod=vendor`, `CGO_ENABLED=0`).
+You can build all four archives + `SHA256SUMS` yourself from the source tree — useful for an air-gapped
+install or to reproduce a published release. **All builds run inside Docker** (security baseline §6 —
+`go build` on the host is blocked by a guard). The build is offline from the committed `vendor/`
+directory (`-mod=vendor`, `CGO_ENABLED=0`).
 
 Build everything (cross-compile the four targets, archive them, generate `SHA256SUMS`) in one Docker run:
 
@@ -404,23 +419,26 @@ remove a manually-installed binary, delete it from wherever it was installed:
 rm -f /usr/local/bin/raxd        # or ~/.local/bin/raxd, or your --prefix path
 ```
 
-If you registered the system service, remove that first with the dedicated command (it also removes the
-unit/plist, autostart, and journald drop-in, but intentionally keeps the inert `raxd` user and the data
-directory):
+If you registered the system service, remove that first with the dedicated command (a plain
+`uninstall` removes the unit/plist, autostart, and journald drop-in, but intentionally keeps the inert
+`raxd` user and the data directory; `uninstall --purge --yes` also removes the user and the
+state/config directories, irreversibly):
 
 ```sh
 sudo raxd service uninstall
 ```
 
 See [`service-management.md`](service-management.md) for exactly what `uninstall` keeps and how to remove
-the `raxd` user and state directory yourself if you want a zero-footprint removal.
+the `raxd` user and state directory yourself (by hand, or with `--purge --yes`) if you want a
+zero-footprint removal.
 
 ## Note on licensing
 
-No `LICENSE` file is present in the repository yet, and licensing terms are not defined at this stage.
-The release archives include a `LICENSE` file **only if** one exists in the source tree at build time —
-so today the archives ship the binary and `README.md` but no license. A license is expected to be added
-before any public release.
+`raxd` is licensed under the **MIT License**. A root `LICENSE` file (Copyright (c) 2026
+**Vladimir Kovalev, OEM TECH**) is present in the repository, and the release archives include it:
+`scripts/release.sh` copies the source-tree `LICENSE` into each archive at build time, so a published
+`tar.gz` ships the binary, `README.md`, **and** `LICENSE`. See
+[`production-readiness.md`](production-readiness.md#5-license--closed-mit).
 
 ## Related documents
 

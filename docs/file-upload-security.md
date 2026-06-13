@@ -14,7 +14,9 @@ The tool's safety controls are enforced **on the server**, not in the schema:
 
 - writes are confined to a configured **upload root** via Go's `os.Root` (no `..`-escape, no absolute
   path, no out-of-root symlink);
-- the decoded size is capped by `upload.max_file_bytes`;
+- the decoded size of a single file is capped by `upload.max_file_bytes`;
+- the **total** size of the whole upload root can be capped by `upload.max_total_bytes` (disabled by
+  default; see [§7](#7-residual-risks-out-of-scope-for-this-version));
 - the file mode is restricted (mask `0777`, no setuid/setgid/sticky, no world-writable; default `0600`);
 - existing files are **not** overwritten unless `overwrite: true`;
 - writes are **atomic** (temp file → `rename`), so no partial or stray temp file is left behind;
@@ -143,7 +145,7 @@ success, the size.
 | `msg` | level | When | Key fields |
 |-------|-------|------|------------|
 | `MCP` | `INFO` | the file was written or replaced | `tool=upload_file result=ok path=<rel> size=<N>` |
-| `DENY` | `WARN` | traversal, existing file (no overwrite), target is a directory, too-large, invalid base64, invalid mode, or `deny_root` — **nothing written** | `tool=upload_file reason=<text>` (and `path=<rel>` when the path was known) |
+| `DENY` | `WARN` | traversal, existing file (no overwrite), target is a directory, too-large, **total quota exceeded**, invalid base64, invalid mode, or `deny_root` — **nothing written** | `tool=upload_file reason=<text>` (and `path=<rel>` when the path was known) |
 | `FAIL` | `WARN` | an I/O error during the write (for example a full disk) — the write started but failed; the temp file is cleaned up | `tool=upload_file reason=<text>` (and `path=<rel>` when known) |
 | `WARN` | `WARN` | extra record on **every** call when the daemon is root (`deny_root=false` **or** `true`) | `tool=upload_file reason=running-as-root…` (`[path=<rel>]` only if the path is already known — see the note below) |
 
@@ -152,6 +154,9 @@ success, the size.
   in practice the root `WARN` line has **no** `path=` field. (`path=` is logged only when it is already
   known.) When `deny_root: true`, the `WARN` record is followed by a **separate** `DENY` record, and
   that `DENY` record **does** carry `path=<rel>`.
+- **A total-quota denial is a single `DENY` record** with `reason=total upload quota exceeded`. The
+  reason is **neutral**: it does not include an absolute path, the current/limit byte numbers, or any
+  secret. Nothing is written for it.
 - `path=` is the **relative** path inside the upload root — **never** an absolute host path.
 - `size=` is an integer (decoded byte count) and appears **only** on the success (`MCP`) record. On
   `DENY`/`FAIL` nothing was written, so `size=` is absent.
@@ -167,20 +172,49 @@ format in full.
 
 ## 7. Residual risks (out of scope for this version)
 
-These limits are deliberate for the current version; mitigate them by deployment:
+The upload root's disk use is now bounded at the application level by an optional total-size cap, while
+a few limits remain deliberate for the current version. Mitigate the remaining ones by deployment.
 
-- **No total-size / disk quota.** There is a **per-file** size cap (`upload.max_file_bytes`, default
-  700 KiB), but **no** limit on the **total** number of files or the **total** bytes written to the
-  upload root. Many uploads can gradually fill the disk (recorded as residual risk ОР-U3). Mitigate with
-  a container disk quota / filesystem quota on the upload root, and monitor its size.
+### Total-size cap on the upload root (`upload.max_total_bytes`)
+
+There is a **per-file** size cap (`upload.max_file_bytes`, default 700 KiB) **and**, since this
+version, an optional **total-size** cap on the whole upload root: `upload.max_total_bytes` (in bytes).
+
+- **Default `0` = disabled** — behaviour is unchanged unless you opt in (an upgrade does not suddenly
+  start rejecting uploads).
+- **When set `> 0`**, an upload that would push the **total** bytes of all regular files under the
+  upload root over the limit is **denied before anything is written**: `isError: true`, a `DENY` audit
+  record (`reason=total upload quota exceeded`), no partial/temp file, existing files untouched, and the
+  server stays up. The accounting sums **all** previously written regular files (including files written
+  before the cap was enabled and files in sub-directories); symlinks are not followed, and an error while
+  walking the root fails **closed** (the write is refused rather than silently allowed).
+- The denial message is **neutral** — it states the quota was exhausted without leaking the absolute
+  path, the exact byte numbers, or any secret.
+
+This closes the application-level disk-fill risk (previously ОР-U3 — "many uploads can gradually fill
+the disk"). Configure it in [`configuration.md`](configuration.md#file-upload-upload-fields):
+
+```yaml
+upload:
+  max_total_bytes: 1073741824   # 1 GiB cap on the whole upload root; 0 = disabled (default)
+```
+
+A filesystem or container disk quota on the upload root remains a valid **complementary** measure
+(defence in depth, and it bounds non-`raxd` writes too).
+
+### Still out of scope
+
+- **No per-key / per-fingerprint quota.** `max_total_bytes` is a single **total** cap on the upload
+  root; it does **not** limit individual keys independently. One key cannot be given a smaller budget
+  than another.
+- **No content inspection.** There is no antivirus, content-type check, or file-content filtering. The
+  tool writes the decoded bytes as-is (recorded as residual risk ОР-U5).
 - **Mount points inside the upload root** are not blocked by `os.Root` (see
   [§1](#1-do-not-place-a-bind-mount-or-external-filesystem-inside-the-upload-root); ОР-U2). Keep the
   upload root free of bind-mounts.
 - **Running as root** writes root-owned files unless `upload.deny_root: true` (see
   [§3](#3-running-as-root--warn-by-default-deny_root-to-refuse); ОР-U1). The primary fix is to run
   non-root.
-- **No content inspection.** There is no antivirus, content-type check, or file-content filtering. The
-  tool writes the decoded bytes as-is (recorded as residual risk ОР-U5).
 - **No download / read / delete.** This is upload only — there is no `download_file`, no host
   filesystem read, and no file deletion through the tool. Those are out of scope for this version.
 - **Audit-log rotation.** Rotation is **not** implemented in the binary; the audit stream goes to
@@ -192,11 +226,13 @@ These limits are deliberate for the current version; mitigate them by deployment
 - [`mcp.md`](mcp.md#upload_file) — the `upload_file` tool contract, error mapping, audit, and curl
   examples.
 - [`configuration.md`](configuration.md#file-upload-upload-fields) — the `upload.*` configuration keys
-  and defaults.
+  and defaults (including `max_total_bytes` and its startup validation).
 - [`troubleshooting.md`](troubleshooting.md#the-upload_file-tool) — diagnosing `isError` results and
   reading the upload audit.
 - [`execute-command-security.md`](execute-command-security.md) — the companion security guide for the
   `execute_command` tool (secrets in argv, allowlist, `deny_root`, isolation).
+- [`production-readiness.md`](production-readiness.md#7-upload-disk-usage--total-size-cap-available-uploadmax_total_bytes) —
+  where the upload disk-quota item is tracked.
 - [`commands.md`](commands.md#raxd-serve) — the `serve` command that hosts the MCP endpoint.
 
 ## Author
