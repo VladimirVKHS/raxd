@@ -136,13 +136,7 @@ func writeWithQuota(cfg Config, in Input) (Result, error) {
 	}
 	defer root.Close()
 
-	// --- Создать промежуточные подкаталоги внутри корня (AC5b/SR-71) ---
 	dir := filepath.Dir(in.RelPath)
-	if dir != "." && dir != "" {
-		if err := root.MkdirAll(dir, 0o700); err != nil {
-			return Result{}, fmt.Errorf("create directories: %w", err)
-		}
-	}
 
 	// --- Проверка существующей цели (порядок: ErrIsDir → ErrExists → квота; SR-95/plan.md) ---
 	// Root.Stat гарантирует, что проверяем путь внутри корня.
@@ -168,7 +162,7 @@ func writeWithQuota(cfg Config, in Input) (Result, error) {
 	}
 
 	// --- Квота-арифметика (SR-90/plan.md §Contracts) ---
-	// Выполняется ПОСЛЕ ErrIsDir/ErrExists, НО ДО создания temp-файла.
+	// Выполняется ПОСЛЕ ErrIsDir/ErrExists, НО ДО MkdirAll и создания temp-файла (SR-90/I-3).
 	// currentBytes вызывается под удержанным мьютексом (не лочит сам; SR-92).
 	current, err := currentBytes(root)
 	if err != nil {
@@ -179,8 +173,16 @@ func writeWithQuota(cfg Config, in Input) (Result, error) {
 	// Граница строгая > (Q3/plan.md §Закрытие Open Questions):
 	// разрешено пока итог <= max_total_bytes; denied при итог > max_total_bytes.
 	if current-replaced+int64(len(in.Data)) > cfg.MaxTotalBytes {
-		// deny ДО создания temp (SR-90/AC3): temp на диске не создаётся.
+		// deny ДО MkdirAll и создания temp (SR-90/I-3/AC3): диск не изменён.
 		return Result{}, ErrQuotaExceeded
+	}
+
+	// --- Создать промежуточные подкаталоги ПОСЛЕ квота-проверки (SR-90/I-3/AC5b) ---
+	// MkdirAll выполняется только при approved upload; при deny — никаких следов на диске.
+	if dir != "." && dir != "" {
+		if err := root.MkdirAll(dir, 0o700); err != nil {
+			return Result{}, fmt.Errorf("create directories: %w", err)
+		}
 	}
 
 	// --- Вся существующая атомарная запись под тем же удержанным мьютексом (SR-92) ---
