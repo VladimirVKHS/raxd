@@ -37,6 +37,19 @@ var ErrPermission = errors.New("insufficient privileges")
 // ErrUnsupported is returned by New() on platforms other than linux and darwin.
 var ErrUnsupported = errors.New("platform not supported for service management")
 
+// ErrUserMismatch is returned by Purge when the target OS user does not match the expected
+// raxd system account (name matches but shell is a login-shell). AC6, SR-117.
+var ErrUserMismatch = errors.New("user account does not match expected raxd system account")
+
+// ErrSuspiciousPath is returned by Purge when the state/config directory path fails
+// the validatePurgePath safety check (empty, /, $HOME, system root, symlink outside layout).
+// AC7, SR-118, SR-119.
+var ErrSuspiciousPath = errors.New("suspicious path rejected by purge safety check")
+
+// ErrPurgeNotConfirmed is returned by Purge when opts.Confirmed is false.
+// Duplicate guard inside the manager; primary barrier is the CLI --yes flag. AC9, SR-114.
+var ErrPurgeNotConfirmed = errors.New("purge requires explicit confirmation (--yes flag)")
+
 // ServiceError is a wrapped error that carries a sentinel and a human-readable detail.
 // Use errors.Is(err, ErrXxx) to check the sentinel type.
 type ServiceError struct {
@@ -151,6 +164,42 @@ func DefaultConfigForGOOS(goos string) Config {
 	return base
 }
 
+// ─── Purge types (plan.md §Contracts, service-design.md §5, §7) ──────────────
+
+// PurgeOptions carries parameters for the Purge operation.
+type PurgeOptions struct {
+	// Confirmed must be true (--yes passed by CLI); false → ErrPurgeNotConfirmed.
+	// Duplicate guard inside the manager; primary barrier is the CLI --yes flag (SR-114, AC9).
+	Confirmed bool
+}
+
+// PurgeReport describes what Purge did (or found already done).
+// Fields are populated during the purge sequence and emitted in the audit record
+// BEFORE physical directory removal (AC8, SR-116).
+type PurgeReport struct {
+	// Platform is "linux" or "darwin".
+	Platform string
+
+	// Stopped is true if the service was running and was stopped at step 4.
+	Stopped bool
+
+	// Uninstalled is true if the unit/plist was removed at step 5.
+	// расширение для полноты аудит-отчёта (advisory от system-dev-guardian).
+	Uninstalled bool
+
+	// UserRemoved is true if the OS user was deleted at step 11.
+	UserRemoved bool
+
+	// UserAbsent is true if the OS user did not exist (idempotent, AC3).
+	UserAbsent bool
+
+	// DirsRemoved lists directories removed at steps 12–14.
+	DirsRemoved []string
+
+	// DirsAbsent lists directories that were already absent (idempotent, AC3).
+	DirsAbsent []string
+}
+
 // ─── ServiceManager interface (plan.md §Contracts) ────────────────────────────
 
 // ServiceManager manages the OS-level lifecycle of the raxd service.
@@ -177,6 +226,14 @@ type ServiceManager interface {
 	// Status returns the current state of the service.
 	// Not installed → Status{Installed: false} without error (AC10).
 	Status(ctx context.Context) (Status, error)
+
+	// Purge irreversibly removes the raxd OS user and state/config directories.
+	// Requires opts.Confirmed=true (duplicate guard; primary barrier is CLI --yes, AC9).
+	// Order: privilege-check → stop → uninstall → validatePurgePath → verifyTargetUser →
+	//        audit record → delete user → os.RemoveAll dirs.
+	// Idempotency: absent user/dirs are not errors (AC3).
+	// Errors: ErrPermission, ErrUserMismatch, ErrSuspiciousPath, ErrPurgeNotConfirmed.
+	Purge(ctx context.Context, opts PurgeOptions) (PurgeReport, error)
 }
 
 // ─── New() — platform dispatch (plan.md §Contracts) ──────────────────────────
