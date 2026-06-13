@@ -113,6 +113,11 @@ type UploadConfig struct {
 	// Дефолт 716800 (700 KiB; SR-76/AC7/AC16).
 	MaxFileBytes int64
 
+	// MaxTotalBytes — суммарный лимит объёма upload root в байтах.
+	// 0 = лимит ОТКЛЮЧЁН (дефолт; AC1/AC2/SR-99).
+	// < 0 = невалидное значение, отвергается на старте (AC1/SR-98).
+	MaxTotalBytes int64
+
 	// DefaultMode — режим файла по умолчанию в восьмеричной строке.
 	// Дефолт "0600" (AC9/SR-73/ADR-003).
 	DefaultMode string
@@ -170,6 +175,7 @@ func Load(p PathSet) (*Config, error) {
 	// Без env-оверрайдов — конфиг только через config.yaml.
 	v.SetDefault("upload.root", "")                          // пусто → serve.go резолвит к <StateDir>/uploads (AC5a)
 	v.SetDefault("upload.max_file_bytes", int64(716800))     // 700 KiB (SR-76/AC7/AC16)
+	v.SetDefault("upload.max_total_bytes", int64(0))         // 0 = лимит отключён (AC1/AC2/SR-99)
 	v.SetDefault("upload.default_mode", "0600")              // (AC9/SR-73/ADR-003)
 	v.SetDefault("upload.overwrite_default", false)          // deny overwrite по умолчанию (AC8/AC15)
 	v.SetDefault("upload.deny_root", false)                  // WARN-дефолт (SR-77/AC11)
@@ -226,6 +232,15 @@ func buildConfig(v *viper.Viper) (*Config, error) {
 			maxFileBytes, ceiling, maxBodyBytes)
 	}
 
+	// SR-98/AC1: max_total_bytes должен быть ≥ 0; отрицательное отвергается на старте.
+	// 0 = лимит отключён (AC2/SR-99); > 0 = включён.
+	// НЕ связываем с max_file_bytes: 0 < max_total < max_file_bytes допускается (Q2/AC9/AC10).
+	maxTotalBytes := v.GetInt64("upload.max_total_bytes")
+	if maxTotalBytes < 0 {
+		return nil, fmt.Errorf("upload.max_total_bytes=%d is invalid: must be ≥ 0 (0 = disabled; SR-98/AC1)",
+			maxTotalBytes)
+	}
+
 	// SR-81/ADR-003: default_mode парсится и проходит mode-политику.
 	uploadDefaultModeStr := v.GetString("upload.default_mode")
 	if _, err := parseModeStr(uploadDefaultModeStr); err != nil {
@@ -259,6 +274,7 @@ func buildConfig(v *viper.Viper) (*Config, error) {
 		Upload: UploadConfig{
 			Root:             v.GetString("upload.root"),
 			MaxFileBytes:     maxFileBytes,
+			MaxTotalBytes:    maxTotalBytes,
 			DefaultMode:      uploadDefaultModeStr,
 			OverwriteDefault: v.GetBool("upload.overwrite_default"),
 			DenyRoot:         v.GetBool("upload.deny_root"),

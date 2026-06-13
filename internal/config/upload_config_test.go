@@ -236,6 +236,83 @@ func TestUploadDefaultModeBitsOutside0777IsError(t *testing.T) {
 	}
 }
 
+// ─── upload-quota: AC1/SR-98/SR-99 ───────────────────────────────────────────
+
+// TestUploadMaxTotalBytesDefault: дефолт max_total_bytes=0 применяется без config.yaml (AC1/AC2/SR-99).
+func TestUploadMaxTotalBytesDefault(t *testing.T) {
+	base := t.TempDir()
+	p := config.PathSet{
+		ConfigDir:  filepath.Join(base, "raxd"),
+		ConfigFile: filepath.Join(base, "raxd", "config.yaml"), // не существует
+	}
+
+	cfg, err := config.Load(p)
+	if err != nil {
+		t.Fatalf("Load() без config.yaml: неожиданная ошибка: %v", err)
+	}
+
+	// Дефолт max_total_bytes = 0 (лимит ОТКЛЮЧЁН; AC2/SR-99).
+	if cfg.Upload.MaxTotalBytes != 0 {
+		t.Errorf("upload.max_total_bytes default = %d, want 0 (disabled; AC2/SR-99)", cfg.Upload.MaxTotalBytes)
+	}
+}
+
+// TestUploadMaxTotalBytesNegativeIsError: max_total_bytes=-1 → ошибка на старте (AC1/SR-98).
+func TestUploadMaxTotalBytesNegativeIsError(t *testing.T) {
+	base := t.TempDir()
+	cfgFile := filepath.Join(base, "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("upload:\n  max_total_bytes: -1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := config.PathSet{ConfigDir: base, ConfigFile: cfgFile}
+	_, err := config.Load(p)
+	if err == nil {
+		t.Fatal("Load() с max_total_bytes=-1 должна возвращать ошибку на старте (AC1/SR-98)")
+	}
+	if !strings.Contains(err.Error(), "max_total_bytes") {
+		t.Errorf("сообщение об ошибке должно упоминать max_total_bytes; got: %v", err)
+	}
+	t.Logf("SR-98/AC1: OK — max_total_bytes=-1 → ошибка: %v", err)
+}
+
+// TestUploadMaxTotalBytesPositiveIsOK: max_total_bytes=1000000 → принимается (AC1/SR-98).
+func TestUploadMaxTotalBytesPositiveIsOK(t *testing.T) {
+	base := t.TempDir()
+	cfgFile := filepath.Join(base, "config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("upload:\n  max_total_bytes: 1000000\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := config.PathSet{ConfigDir: base, ConfigFile: cfgFile}
+	cfg, err := config.Load(p)
+	if err != nil {
+		t.Fatalf("Load() с max_total_bytes=1000000 не должна возвращать ошибку; got: %v", err)
+	}
+	if cfg.Upload.MaxTotalBytes != 1000000 {
+		t.Errorf("MaxTotalBytes = %d, want 1000000", cfg.Upload.MaxTotalBytes)
+	}
+}
+
+// TestUploadMaxTotalBytesSmallerThanMaxFile: 0 < max_total_bytes < max_file_bytes допускается (Q2/AC9/AC10).
+func TestUploadMaxTotalBytesSmallerThanMaxFile(t *testing.T) {
+	base := t.TempDir()
+	cfgFile := filepath.Join(base, "config.yaml")
+	// max_file_bytes по умолчанию 716800; max_total_bytes=100 < 716800 → допустимо (Q2).
+	if err := os.WriteFile(cfgFile, []byte("upload:\n  max_total_bytes: 100\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p := config.PathSet{ConfigDir: base, ConfigFile: cfgFile}
+	cfg, err := config.Load(p)
+	if err != nil {
+		t.Fatalf("Load() с max_total_bytes < max_file_bytes не должна возвращать ошибку (Q2/AC10); got: %v", err)
+	}
+	if cfg.Upload.MaxTotalBytes != 100 {
+		t.Errorf("MaxTotalBytes = %d, want 100", cfg.Upload.MaxTotalBytes)
+	}
+}
+
 // TestUploadDefaultModeValidIsOK: допустимые дефолтные моды без ошибок (ADR-003).
 func TestUploadDefaultModeValidIsOK(t *testing.T) {
 	cases := []string{"0600", "0700", "0644", "0400", "0640"}
