@@ -8,6 +8,7 @@ package fileupload
 //   - SR-74 (ADR-002): атомарность temp(crypto/rand)→Sync→Rename→fsync-dir; defer cleanup.
 //   - SR-72: overwrite политика; цель-каталог → ErrIsDir.
 //   - SR-75: лимит MaxFileBytes (страховка в Write; основная проверка — в uploadHandler).
+//   - SR-90…SR-99 (upload-quota): общий лимит MaxTotalBytes, мьютекс, fail-closed.
 //
 // Без MCP/SDK/логирования. Юнит-тестируем офлайн.
 
@@ -71,11 +72,15 @@ type Result struct {
 //
 //	Write(cfg Config, in Input) (Result, error)
 //
+// Сигнатура НЕ меняется (AC11). Config — value-тип (AC11/SR-92).
+//
 // Возвращаемые ошибки:
 //   - ErrTraversal — абс. путь / ..escape / симлинк наружу (SR-69/ADR-001).
 //   - ErrExists — файл существует и Overwrite=false (SR-72).
 //   - ErrIsDir — цель — каталог (SR-72/AC14).
 //   - ErrTooLarge — len(Data) > MaxFileBytes (SR-75/страховка).
+//   - ErrQuotaExceeded — суммарный объём превысит MaxTotalBytes (SR-90/AC3).
+//   - обёрнутая ошибка обхода — fail-closed при ошибке currentBytes (SR-96).
 //   - прочие I/O (диск полон и т.п.) — fail.
 //
 // SECURITY:
@@ -83,8 +88,11 @@ type Result struct {
 //   - Права — chmod по fd (ADR-002/SR-73), не Root.Chmod-по-имени.
 //   - Атомарность: temp → Sync → Root.Rename → fsync-dir; defer cleanup (ADR-002/SR-74).
 //   - НЕ делает chown/setuid/sudo (SR-73/AC9).
+//   - При MaxTotalBytes>0: mu.Lock ДО os.OpenRoot; root переиспользуется для обхода и записи;
+//     вся критическая секция под одним мьютексом (SR-92/plan.md §Contracts).
 func Write(cfg Config, in Input) (Result, error) {
 	// --- Страховочная проверка размера (основная в handler) (SR-75/AC7) ---
+	// Выполняется ДО мьютекса — дешёвая операция, нет смысла блокировать для неё.
 	if int64(len(in.Data)) > cfg.MaxFileBytes {
 		return Result{}, ErrTooLarge
 	}
@@ -97,8 +105,31 @@ func Write(cfg Config, in Input) (Result, error) {
 		return Result{}, fmt.Errorf("%w: %q", ErrTraversal, in.RelPath)
 	}
 
-	// --- Открыть upload root через os.Root (ADR-001/SR-69) ---
-	// Все последующие операции — только через методы Root по относительным путям.
+	// --- Ветка без лимита (MaxTotalBytes==0): обход и мьютекс не задействуются (AC2/SR-99) ---
+	if cfg.MaxTotalBytes == 0 {
+		return writeUnderRoot(cfg, in)
+	}
+
+	// --- Ветка с лимитом: мьютекс ПЕРЕД os.OpenRoot (SR-92/plan.md §Contracts) ---
+	// Один мьютекс на абсолютный UploadRoot из package-level реестра.
+	// Lock берётся ДО OpenRoot; Unlock через defer срабатывает после фиксации ИЛИ любой ошибки.
+	mu := rootMutex(cfg.UploadRoot)
+	mu.Lock()
+	defer mu.Unlock()
+
+	return writeWithQuota(cfg, in)
+}
+
+// writeWithQuota выполняет полную квота-проверку + запись под удержанным мьютексом.
+// Вызывается ТОЛЬКО когда cfg.MaxTotalBytes > 0 и мьютекс уже удержан.
+//
+// SECURITY:
+//   - SR-90: deny ДО создания temp-файла.
+//   - SR-92: весь порядок «открытие root → обход → проверка → запись» под одним мьютексом.
+//   - SR-95: порядок проверок: ErrIsDir → ErrExists → квота-арифметика → temp.
+//   - SR-96: fail-closed при ошибке currentBytes.
+func writeWithQuota(cfg Config, in Input) (Result, error) {
+	// Открываем root ОДИН раз; он переиспользуется для обхода и всей записи (plan.md §Contracts).
 	root, err := os.OpenRoot(cfg.UploadRoot)
 	if err != nil {
 		return Result{}, fmt.Errorf("open upload root: %w", err)
@@ -113,11 +144,67 @@ func Write(cfg Config, in Input) (Result, error) {
 		}
 	}
 
-	// --- Проверка существующей цели (AC8/AC14/SR-72) ---
+	// --- Проверка существующей цели (порядок: ErrIsDir → ErrExists → квота; SR-95/plan.md) ---
 	// Root.Stat гарантирует, что проверяем путь внутри корня.
 	overwritten := false
+	var replaced int64 // размер файла, который будет заменён при overwrite (AC8/SR-95)
+
 	if fi, statErr := root.Stat(in.RelPath); statErr == nil {
 		// Цель существует.
+		if fi.IsDir() {
+			// ErrIsDir — ДО квота-арифметики (SR-95/plan.md §Contracts).
+			return Result{}, ErrIsDir
+		}
+		if !in.Overwrite {
+			// ErrExists — ДО квота-арифметики (SR-95/plan.md §Contracts).
+			return Result{}, ErrExists
+		}
+		// Overwrite==true И цель — regular-файл: учитываем дельту (AC8/SR-95).
+		// replaced = fi.Size() ТОЛЬКО для regular-файла при Overwrite==true.
+		if fi.Mode().IsRegular() {
+			replaced = fi.Size()
+		}
+		overwritten = true
+	}
+
+	// --- Квота-арифметика (SR-90/plan.md §Contracts) ---
+	// Выполняется ПОСЛЕ ErrIsDir/ErrExists, НО ДО создания temp-файла.
+	// currentBytes вызывается под удержанным мьютексом (не лочит сам; SR-92).
+	current, err := currentBytes(root)
+	if err != nil {
+		// fail-closed: ошибка обхода → запись не выполняется (SR-96/Q4).
+		return Result{}, fmt.Errorf("quota: walk upload root: %w", err)
+	}
+
+	// Граница строгая > (Q3/plan.md §Закрытие Open Questions):
+	// разрешено пока итог <= max_total_bytes; denied при итог > max_total_bytes.
+	if current-replaced+int64(len(in.Data)) > cfg.MaxTotalBytes {
+		// deny ДО создания temp (SR-90/AC3): temp на диске не создаётся.
+		return Result{}, ErrQuotaExceeded
+	}
+
+	// --- Вся существующая атомарная запись под тем же удержанным мьютексом (SR-92) ---
+	return doWrite(root, dir, in, overwritten)
+}
+
+// writeUnderRoot выполняет запись без квоты (MaxTotalBytes==0).
+// Открывает root самостоятельно (нет мьютекса — он не нужен при 0; SR-99).
+func writeUnderRoot(cfg Config, in Input) (Result, error) {
+	root, err := os.OpenRoot(cfg.UploadRoot)
+	if err != nil {
+		return Result{}, fmt.Errorf("open upload root: %w", err)
+	}
+	defer root.Close()
+
+	dir := filepath.Dir(in.RelPath)
+	if dir != "." && dir != "" {
+		if err := root.MkdirAll(dir, 0o700); err != nil {
+			return Result{}, fmt.Errorf("create directories: %w", err)
+		}
+	}
+
+	overwritten := false
+	if fi, statErr := root.Stat(in.RelPath); statErr == nil {
 		if fi.IsDir() {
 			return Result{}, ErrIsDir
 		}
@@ -127,9 +214,17 @@ func Write(cfg Config, in Input) (Result, error) {
 		overwritten = true
 	}
 
-	// --- Создать temp-файл в том же каталоге что и цель (ADR-002/SR-74) ---
-	// Root.CreateTemp ОТСУТСТВУЕТ в os.Root (ADR-001/ADR-002 верифицировано).
-	// Генерируем уникальное имя через crypto/rand + O_EXCL.
+	return doWrite(root, dir, in, overwritten)
+}
+
+// doWrite выполняет атомарную запись temp→Chmod→Write→Sync→Rename→fsync-dir.
+// Вызывается уже под мьютексом (при квоте) или без него (при MaxTotalBytes==0).
+// root уже открыт вызывающим; dir — результат filepath.Dir(in.RelPath).
+//
+// SECURITY:
+//   - SR-74 (ADR-002): атомарность temp→Sync→Rename; defer cleanup на ошибке.
+//   - SR-73 (ADR-002): Chmod по fd до записи содержимого.
+func doWrite(root *os.Root, dir string, in Input, overwritten bool) (Result, error) {
 	tmpName, err := randomTmpName()
 	if err != nil {
 		return Result{}, fmt.Errorf("generate temp name: %w", err)
