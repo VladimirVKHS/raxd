@@ -254,7 +254,7 @@ func (m *launchdManager) Purge(ctx context.Context, opts PurgeOptions) (PurgeRep
 	}
 
 	// Step 10: emit PRELIMINARY audit record BEFORE physical deletion (SR-116, AC8).
-	emitPurgeAuditRecord(report, userPresent, dirsPresent)
+	emitPurgeAuditRecord(opts.AuditOut, report.Platform, userPresent, dirsPresent)
 
 	// Step 11: delete OS user via dscl (SR-120).
 	if userPresent {

@@ -12,6 +12,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"runtime"
 )
@@ -171,6 +172,12 @@ type PurgeOptions struct {
 	// Confirmed must be true (--yes passed by CLI); false → ErrPurgeNotConfirmed.
 	// Duplicate guard inside the manager; primary barrier is the CLI --yes flag (SR-114, AC9).
 	Confirmed bool
+
+	// AuditOut is the writer for the preliminary audit record emitted INSIDE Purge
+	// BEFORE physical deletion (SR-116, AC8). If nil, no audit record is written.
+	// CLI passes cmd.ErrOrStderr() here so the record goes to stderr before os.RemoveAll.
+	// Zero value (nil) is safe: existing tests and fakeManager work without changes.
+	AuditOut io.Writer
 }
 
 // PurgeReport describes what Purge did (or found already done).

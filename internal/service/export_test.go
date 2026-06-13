@@ -7,6 +7,8 @@
 // SR-126: testability without real system commands on the host.
 package service
 
+import "io"
+
 // ValidatePurgePath exposes validatePurgePath for purge_test.go.
 func ValidatePurgePath(path string, allowedRoots []string) error {
 	return validatePurgePath(path, allowedRoots)
@@ -32,4 +34,16 @@ func MapDsclDeleteErrorForTest(stderr string) error {
 // MapUserdelExitCodeForTest exposes mapUserdelExitCode for purge_test.go.
 func MapUserdelExitCodeForTest(exitCode int) error {
 	return mapUserdelExitCode(exitCode)
+}
+
+// IsEqualOrAncestorForTest exposes isEqualOrAncestor for purge_test.go.
+// Allows deterministic testing of the HOME-ancestor guard without os.UserHomeDir().
+func IsEqualOrAncestorForTest(candidate, base string) bool {
+	return isEqualOrAncestor(candidate, base)
+}
+
+// EmitPurgeAuditRecordForTest exposes emitPurgeAuditRecord for purge_test.go.
+// Allows testing the audit record is written BEFORE RemoveAll (SR-116, AC8).
+func EmitPurgeAuditRecordForTest(w io.Writer, platform string, userPresent bool, dirsPresent []string) {
+	emitPurgeAuditRecord(w, platform, userPresent, dirsPresent)
 }

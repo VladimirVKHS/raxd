@@ -17,11 +17,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"github.com/charmbracelet/log"
 )
 
 const (
@@ -389,7 +392,7 @@ func (m *systemdManager) Purge(ctx context.Context, opts PurgeOptions) (PurgeRep
 	// The record captures intent: what IS present and WILL be removed.
 	// The final PurgeReport (UserRemoved/DirsRemoved) is built AFTER destructive steps.
 	// (advisory от system-dev-guardian: разграничить предварительную запись и итоговый отчёт)
-	emitPurgeAuditRecord(report, userPresent, dirsPresent)
+	emitPurgeAuditRecord(opts.AuditOut, report.Platform, userPresent, dirsPresent)
 
 	// Step 11: delete OS user (SR-120: runCommandRaw, no shell).
 	if userPresent {
@@ -461,19 +464,31 @@ func verifyTargetUserLinux(ctx context.Context, name string) (present bool, err 
 
 // parsePasswdLine parses a single getent passwd line and validates the user.
 // Format: name:password:uid:gid:gecos:home:shell (7 colon-separated fields).
-// Returns ErrUserMismatch if shell is a login shell (SR-117).
+//
+// Checks (service-design.md §2.1, SR-117, defense-in-depth):
+//  1. Field 0 (name) must equal expectedName.
+//  2. Field 2 (uid) must be < 1000 (systemd-default range for system accounts, [1,999]).
+//  3. Field 6 (shell) must be in noLoginShells — primary protection against login shells.
+//
+// All three checks must pass; any failure returns ErrUserMismatch.
 func parsePasswdLine(line, expectedName string) (present bool, err error) {
 	fields := strings.Split(line, ":")
 	if len(fields) < 7 {
 		return false, wrapErr(ErrManagerUnavailable, "getent passwd: unexpected output format")
 	}
 
-	// Field 0: username must match.
+	// Check 1: username must match (field 0).
 	if fields[0] != expectedName {
 		return false, wrapErr(ErrUserMismatch, "username does not match expected raxd account")
 	}
 
-	// Field 6: shell must be a no-login shell (SR-117).
+	// Check 2: uid must be < 1000 (system account range, defense-in-depth, service-design.md §2.1).
+	uid, uidErr := strconv.Atoi(fields[2])
+	if uidErr != nil || uid <= 0 || uid >= 1000 {
+		return false, wrapErr(ErrUserMismatch, "uid is not in system account range [1,999]")
+	}
+
+	// Check 3: shell must be a no-login shell — primary protection (SR-117).
 	shell := fields[6]
 	if !noLoginShells[shell] {
 		return false, wrapErr(ErrUserMismatch, "user has a login shell — not a raxd system account")
@@ -523,20 +538,32 @@ func mapUserdelExitCode(code int) error {
 	}
 }
 
-// emitPurgeAuditRecord writes the PRELIMINARY audit log entry before physical deletion.
-// SR-116: audit must precede os.RemoveAll so the record is not lost with the state dir.
-// SR-124: only metadata (action, platform, names, boolean flags) — no file contents.
-func emitPurgeAuditRecord(report PurgeReport, userPresent bool, dirsPresent []string) {
-	// Audit output goes to stderr via the structured logger.
-	// This is a best-effort record; failure must not block the purge sequence.
-	// The full audit-log formatting is handled by the CLI layer (ux-spec §aудит).
-	// Here we emit a minimal internal marker for the manager layer.
-	_ = report       // report fields used by CLI
-	_ = userPresent
-	_ = dirsPresent
-	// The actual charmbracelet/log INFO line is emitted by the CLI (service.go)
-	// after Purge returns, because the CLI owns the output streams (ux-spec §2).
-	// The manager-level "audit" is the structured PurgeReport itself.
+// emitPurgeAuditRecord writes the PRELIMINARY audit record BEFORE physical deletion.
+//
+// SR-116: this function is called on step 10, before userdel/RemoveAll (steps 11–14).
+// SR-124: only metadata is logged — no file contents, no keys, no secrets.
+//
+// Parameters:
+//   - w: target writer (opts.AuditOut from PurgeOptions); nil → no-op (safe for tests).
+//   - platform: "linux" or "darwin".
+//   - userPresent: whether the raxd OS user exists at the time of the audit record.
+//   - dirsPresent: list of state/config directories that exist at audit time.
+//
+// The record is "preliminary": it captures intent (what IS present and WILL be removed).
+// The final PurgeReport with actual removal results is returned by Purge() after step 15.
+func emitPurgeAuditRecord(w io.Writer, platform string, userPresent bool, dirsPresent []string) {
+	if w == nil {
+		// No audit sink provided — safe zero-value behaviour (existing tests/fakeManager).
+		return
+	}
+	logger := log.New(w)
+	logger.Info("purge intent",
+		"action", "purge",
+		"phase", "pre-deletion",
+		"platform", platform,
+		"user_present", userPresent,
+		"dirs_present", dirsPresent,
+	)
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
