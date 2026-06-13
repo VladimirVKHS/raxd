@@ -121,12 +121,13 @@ func runServe(cmd *cobra.Command, _ []string) error {
 		return err
 	}
 
-	// Собираем fileupload.Config (plan §serve.go).
+	// Собираем fileupload.Config (plan §serve.go / upload-quota plan §Modules).
 	uplCfg := fileupload.Config{
-		UploadRoot:   uploadRoot,
-		MaxFileBytes: cfg.Upload.MaxFileBytes,
-		DefaultMode:  fs.FileMode(defaultModeVal),
-		DenyRoot:     cfg.Upload.DenyRoot,
+		UploadRoot:    uploadRoot,
+		MaxFileBytes:  cfg.Upload.MaxFileBytes,
+		MaxTotalBytes: cfg.Upload.MaxTotalBytes, // AC1/SR-98: проброс общего лимита (0 = отключён)
+		DefaultMode:   fs.FileMode(defaultModeVal),
+		DenyRoot:      cfg.Upload.DenyRoot,
 	}
 
 	// Build MCP handler (AC11/SR-29): same port/TLS as serve; no second auth channel (SR-28).
