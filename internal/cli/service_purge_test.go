@@ -8,6 +8,7 @@ package cli_test
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -22,6 +23,11 @@ import (
 func (f *fakeManager) Purge(_ context.Context, opts service.PurgeOptions) (service.PurgeReport, error) {
 	if !opts.Confirmed {
 		return service.PurgeReport{}, service.ErrPurgeNotConfirmed
+	}
+	// Simulate the preliminary audit record that the real manager emits before RemoveAll.
+	// This allows TestPurge_AuditSinkReceivedBeforeRemoveAll to verify the CLI passes AuditOut.
+	if opts.AuditOut != nil {
+		fmt.Fprintf(opts.AuditOut, "INFO purge intent action=purge phase=pre-deletion platform=linux\n")
 	}
 	switch f.kind {
 	case "purge-permission":
@@ -286,5 +292,36 @@ func TestPurge_AuditLogPresent(t *testing.T) {
 	// Audit log (charmbracelet/log) writes "INFO" lines with action=purge.
 	if !strings.Contains(stderr, "action=purge") && !strings.Contains(stderr, "purge") {
 		t.Errorf("audit log must be present with action=purge info, stderr:\n%s", stderr)
+	}
+}
+
+// TestPurge_AuditSinkReceivedBeforeRemoveAll verifies that:
+//   - CLI injects stderr as AuditOut into PurgeOptions (SR-116)
+//   - The fakeManager receives a non-nil writer and writes the preliminary record
+//     (platform, pre-deletion phase) before any removal step (Issue 1)
+//   - The audit record contains no secrets (SR-124: no API keys, no key material)
+func TestPurge_AuditSinkReceivedBeforeRemoveAll(t *testing.T) {
+	t.Setenv("NO_COLOR", "1")
+
+	_, stderr, err := executeServicePurgeCmd("", "service", "uninstall", "--purge", "--yes")
+	if err != nil {
+		t.Fatalf("purge must exit 0, got: %v", err)
+	}
+
+	// fakeManager writes "purge intent" with "pre-deletion" phase to opts.AuditOut.
+	// These strings originate from the preliminary record emitted BEFORE RemoveAll.
+	if !strings.Contains(stderr, "purge intent") {
+		t.Errorf("audit sink must receive 'purge intent' preliminary record, stderr:\n%s", stderr)
+	}
+	if !strings.Contains(stderr, "pre-deletion") {
+		t.Errorf("audit sink must contain 'pre-deletion' phase marker, stderr:\n%s", stderr)
+	}
+
+	// SR-124: audit record must not contain secrets or key material.
+	if strings.Contains(stderr, "rax_live_") {
+		t.Errorf("audit record must not contain API key material (rax_live_), stderr:\n%s", stderr)
+	}
+	if strings.Contains(stderr, "-----BEGIN") {
+		t.Errorf("audit record must not contain PEM/certificate material, stderr:\n%s", stderr)
 	}
 }

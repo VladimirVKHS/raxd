@@ -246,10 +246,15 @@ Requires root or sudo.`,
 
 // runPurgeCmd executes the full purge sequence and formats the output per ux-spec.
 // Called by newServiceUninstallCmd when --purge --yes are both set.
-// SR-116: audit record is emitted here BEFORE (implicit: Purge() emits before RemoveAll internally;
-// the CLI-layer audit log below summarises the completed report for structured logging).
+//
+// SR-116: the preliminary audit record (intent: user_present/dirs_present) is emitted
+// INSIDE Purge() at step 10 — BEFORE userdel/RemoveAll — via opts.AuditOut=stderr.
+// The post-completion human report (printPurgeReport) is rendered AFTER Purge returns.
 func runPurgeCmd(ctx context.Context, m service.ServiceManager, stderr io.Writer) error {
-	report, err := m.Purge(ctx, service.PurgeOptions{Confirmed: true})
+	report, err := m.Purge(ctx, service.PurgeOptions{
+		Confirmed: true,
+		AuditOut:  stderr, // SR-116: audit sink — written inside Purge before RemoveAll
+	})
 	if err != nil {
 		printSvcError(stderr, mapPurgeError(err))
 		return err
@@ -278,12 +283,14 @@ func printPurgeBarrier(w io.Writer) {
 }
 
 // printPurgeReport formats the PurgeReport per ux-spec §2 and §3 (removed/absent lines).
-// Emits the charmbracelet/log audit record before the human-readable block (SR-116).
+// The preliminary audit record (intent) was already emitted INSIDE Purge() at step 10 (SR-116).
+// Here we emit a completion record (outcome: what was actually removed) and the human block.
 func printPurgeReport(w io.Writer, r service.PurgeReport) {
-	// Audit log (SR-116, AC8): structured INFO record before human output.
-	// This is the CLI-layer audit; the manager already emitted a preliminary record internally.
+	// Completion audit log: outcome record after destructive steps (distinct from
+	// the pre-deletion intent record emitted by emitPurgeAuditRecord inside Purge).
+	// SR-124: only metadata — no file contents, no key material.
 	logger := log.New(w)
-	logger.Info("service purged",
+	logger.Info("purge complete",
 		"action", "purge",
 		"platform", r.Platform,
 		"user_removed", r.UserRemoved,
