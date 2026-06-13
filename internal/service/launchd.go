@@ -15,11 +15,18 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
+)
+
+const (
+	// dsclBin is the fixed path to dscl for macOS user management (SR-120: absolute, no shell).
+	dsclBin = "/usr/bin/dscl"
 )
 
 const (
@@ -169,6 +176,192 @@ func (m *launchdManager) Stop(ctx context.Context) error {
 		return wrapErr(ErrManagerUnavailable, "launchctl kill SIGTERM failed")
 	}
 	return nil
+}
+
+// ─── Purge (service-design.md §2.2, §4) ──────────────────────────────────────
+
+// Purge implements ServiceManager.Purge for macOS.
+// Orchestration order (service-design.md §4, SR-122):
+//  1. Privilege check (SR-121)
+//  2. Confirmed check (SR-114)
+//  3. Status
+//  4. Stop (if running), STOP on failure (AC4)
+//  5. Uninstall (ignore ErrNotInstalled, AC3)
+//  6–8. validatePurgePath for StateDir, ConfigDir, LogPath (SR-118, SR-119)
+//  9. verifyTargetUserDarwin (SR-117)
+//  10. Audit record BEFORE physical deletion (SR-116, AC8)
+//  11. dscl . -delete (SR-120, SR-123)
+//  12–14. os.RemoveAll for StateDir, ConfigDir, LogPath (AC3)
+//  15. Return PurgeReport, nil
+func (m *launchdManager) Purge(ctx context.Context, opts PurgeOptions) (PurgeReport, error) {
+	report := PurgeReport{Platform: "darwin"}
+
+	// Step 1: privilege check.
+	if os.Geteuid() != 0 {
+		return PurgeReport{}, wrapErr(ErrPermission, "must be run as root or with sudo")
+	}
+
+	// Step 2: duplicate confirmed guard (primary barrier is CLI --yes, AC9, SR-114).
+	if !opts.Confirmed {
+		return PurgeReport{}, ErrPurgeNotConfirmed
+	}
+
+	// Step 3: check status.
+	st, _ := m.Status(ctx)
+
+	// Step 4: stop if running.
+	if st.Active {
+		if err := m.Stop(ctx); err != nil {
+			// AC4, SR-122: Stop failure → do not proceed.
+			return PurgeReport{}, wrapErr(ErrManagerUnavailable, "service did not stop")
+		}
+		report.Stopped = true
+	}
+
+	// Step 5: Uninstall (idempotent, AC3).
+	if err := m.Uninstall(ctx); err != nil {
+		if !errors.Is(err, ErrNotInstalled) {
+			return PurgeReport{}, err
+		}
+	} else {
+		report.Uninstalled = true
+	}
+
+	// Steps 6–8: validate paths (SR-118, SR-119).
+	dirs := []string{m.cfg.StateDir, m.cfg.ConfigDir, m.cfg.LogPath}
+	allowedRoots := dirs
+	for _, d := range dirs {
+		if err := validatePurgePath(d, allowedRoots); err != nil {
+			return PurgeReport{}, err
+		}
+	}
+
+	// Step 9: verify target user (SR-117, AC6).
+	userPresent, err := verifyTargetUserDarwin(ctx, m.cfg.User)
+	if err != nil {
+		return PurgeReport{}, err
+	}
+	if !userPresent {
+		report.UserAbsent = true
+	}
+
+	// Determine which directories currently exist for pre-deletion audit.
+	var dirsPresent []string
+	for _, d := range dirs {
+		if _, statErr := os.Stat(d); statErr == nil {
+			dirsPresent = append(dirsPresent, d)
+		}
+	}
+
+	// Step 10: emit PRELIMINARY audit record BEFORE physical deletion (SR-116, AC8).
+	emitPurgeAuditRecord(report, userPresent, dirsPresent)
+
+	// Step 11: delete OS user via dscl (SR-120).
+	if userPresent {
+		if err := deleteUserDarwin(ctx, m.cfg.User); err != nil {
+			return PurgeReport{}, err
+		}
+		report.UserRemoved = true
+	}
+
+	// Steps 12–14: remove directories (AC3: not-exist → DirsAbsent).
+	for _, d := range dirs {
+		if err := os.RemoveAll(d); err != nil {
+			return report, wrapErr(ErrManagerUnavailable, fmt.Sprintf("cannot remove %s", d))
+		}
+		wasPresent := false
+		for _, p := range dirsPresent {
+			if p == d {
+				wasPresent = true
+				break
+			}
+		}
+		if wasPresent {
+			report.DirsRemoved = append(report.DirsRemoved, d)
+		} else {
+			report.DirsAbsent = append(report.DirsAbsent, d)
+		}
+	}
+
+	return report, nil
+}
+
+// verifyTargetUserDarwin checks the macOS user via dscl . -read /Users/<name> UserShell.
+// Returns (present=false, nil) if the user does not exist.
+// Returns ErrUserMismatch if the user exists but has a login shell (SR-117, AC6).
+// SR-120: runCommandRaw — no shell interpolation.
+func verifyTargetUserDarwin(ctx context.Context, name string) (present bool, err error) {
+	cmd := runCommandRaw(ctx, dsclBin, ".", "-read", "/Users/"+name, "UserShell")
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+
+	runErr := cmd.Run()
+	if runErr != nil {
+		// Non-zero exit from dscl -read means user not found (AC3, SR-123).
+		var exitErr *exec.ExitError
+		if errors.As(runErr, &exitErr) {
+			// Any non-zero exit from dscl -read /Users/<name> means not found.
+			return false, nil
+		}
+		// Binary not found or other non-exit error.
+		return false, nil
+	}
+
+	return parseDsclShellOutput(stdout.String(), name)
+}
+
+// parseDsclShellOutput parses the output of "dscl . -read /Users/<name> UserShell".
+// Format: "UserShell: /usr/bin/false\n"
+// Returns ErrUserMismatch if the shell is a login shell (SR-117).
+func parseDsclShellOutput(output, _ string) (present bool, err error) {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "UserShell:") {
+			shell := strings.TrimSpace(strings.TrimPrefix(line, "UserShell:"))
+			if !noLoginShells[shell] {
+				return false, wrapErr(ErrUserMismatch, "user has a login shell — not a raxd system account")
+			}
+			return true, nil
+		}
+	}
+	// No UserShell line found.
+	return false, wrapErr(ErrManagerUnavailable, "dscl: unexpected output format")
+}
+
+// deleteUserDarwin deletes the macOS user via dscl . -delete /Users/<name>.
+// SR-120: runCommandRaw — no shell interpolation.
+// Maps exit/stderr per service-design.md §2.2.
+func deleteUserDarwin(ctx context.Context, name string) error {
+	cmd := runCommandRaw(ctx, dsclBin, ".", "-delete", "/Users/"+name)
+	var stderrBuf bytes.Buffer
+	cmd.Stderr = &stderrBuf
+
+	err := cmd.Run()
+	if err == nil {
+		return nil
+	}
+	return mapDsclDeleteError(stderrBuf.String())
+}
+
+// mapDsclDeleteError maps dscl . -delete stderr to a typed error (service-design.md §2.2, SR-123).
+// "not found" patterns → nil (idempotent, AC3).
+// "permission denied" patterns → ErrPermission (SR-121).
+// Other → ErrManagerUnavailable (neutral, SR-124).
+func mapDsclDeleteError(stderrStr string) error {
+	switch {
+	case strings.Contains(stderrStr, "eDSRecordNotFound"),
+		strings.Contains(stderrStr, "Unknown node"),
+		strings.Contains(stderrStr, "No such record"):
+		// User absent → idempotent success (AC3, SR-123).
+		return nil
+	case strings.Contains(stderrStr, "Permission denied"),
+		strings.Contains(stderrStr, "Operation not permitted"),
+		strings.Contains(stderrStr, "eDSPermissionError"):
+		return wrapErr(ErrPermission, "dscl delete: insufficient privileges")
+	default:
+		return wrapErr(ErrManagerUnavailable, "dscl delete failed")
+	}
 }
 
 // Status implements ServiceManager.Status for macOS.
