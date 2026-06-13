@@ -128,6 +128,11 @@ user **cannot** rewrite the definition of its own service. The state directory i
 wider systemd default), and `keys.db` and the TLS private key keep their `0600` — exactly as for the
 interactive layout above.
 
+> **Removing the service layout entirely.** `raxd service uninstall` removes the registration but, by
+> design, **keeps** the `raxd` user and the state/config directories. To erase them too, use
+> `raxd service uninstall --purge --yes` — see
+> [`service-management.md`](service-management.md#3-the-raxd-user-is-kept-after-uninstall).
+
 ### The listening port and privileged ports
 
 The service listens on the port from `config.yaml` (`port:`, default `7822`), the same value
@@ -197,7 +202,8 @@ keystore's constant-time `Verify`). Two consequences worth noting:
 > **Under the service, `keys.db` lives in the system state directory.** A daemon registered with
 > `raxd service` reads `keys.db` from `/var/lib/raxd/keys.db` (Linux) or `/usr/local/var/raxd/keys.db`
 > (macOS), owned by `raxd`, `0600`. Create keys as the operator with `raxd key create` against that
-> same state directory before starting the service.
+> same state directory before starting the service. A full `raxd service uninstall --purge --yes`
+> **deletes** this `keys.db` along with the state directory (irreversible).
 
 ### Behaviour and edge cases
 
@@ -435,6 +441,12 @@ upload:
   # max_body_bytes (see the validation note below), or serve fails at startup.
   max_file_bytes: 716800
 
+  # Total-size cap on the WHOLE upload root, in bytes.
+  # 0 = DISABLED (default). When > 0, an upload that would push the total bytes
+  # of all files under the upload root over this limit is denied (nothing written).
+  # A negative value is rejected at startup. Independent of max_file_bytes.
+  max_total_bytes: 0
+
   # Default file mode (octal string) used when the client omits `mode`.
   # Only 0777 permission bits are allowed; setuid/setgid/sticky and
   # world-writable (0002) are forbidden and rejected at startup.
@@ -453,6 +465,7 @@ upload:
 |-----|------|---------|---------|
 | `upload.root` | string | `""` → `<state directory>/uploads` | The directory all writes are confined to (via `os.Root`). When empty, `serve` resolves the **safe default** `<state directory>/uploads` (by default `~/.local/state/raxd/uploads`) and creates it with `0700`. A relative `path` from a client is always taken **relative to this root** |
 | `upload.max_file_bytes` | integer | `716800` (700 KiB) | Maximum **decoded** size of a single uploaded file. Exceeding it is denied (`isError: true`); the file is not written. Validated at startup against `max_body_bytes` — see the note below |
+| `upload.max_total_bytes` | integer | `0` (disabled) | Total-size cap, in **bytes**, on the **whole upload root**. `0` = no limit (default). When `> 0`, an upload that would push the total bytes of all files under the upload root over this value is denied (`isError: true`, `DENY` audit); nothing is written. A **negative** value is rejected at startup. Independent of `max_file_bytes` (both apply). See the note below |
 | `upload.default_mode` | string | `"0600"` | File mode used when the client omits `mode`. Octal string. Validated at startup against the mode policy (only `0777` bits; no setuid/setgid/sticky; no world-writable) |
 | `upload.overwrite_default` | boolean | `false` | The default overwrite policy. The `overwrite` field defaults to `false`, so an existing target is preserved unless the client sends `overwrite: true` |
 | `upload.deny_root` | boolean | `false` | `false` = when the daemon runs as root, log a `WARN` on every call but write the file anyway; `true` = refuse to write when the daemon is root (`isError: true`, `DENY` audit). **Separate** from `exec.deny_root` |
@@ -473,6 +486,15 @@ binds):
   Setting `max_file_bytes` near or above the ceiling would mean files at the top of the range are cut
   off by the transport body limit (an HTTP `400`, see [`mcp.md`](mcp.md#upload_file)) before the tool
   sees them — keeping it below the ceiling makes the tool itself return a clean "file too large" deny.
+- **`max_total_bytes` must be `≥ 0`.** A **negative** value is rejected at startup:
+
+  ```
+  upload.max_total_bytes=… is invalid: must be ≥ 0 (0 = disabled; SR-98/AC1)
+  ```
+
+  `0` is valid and means the cap is disabled (the default). It is **not** tied to `max_file_bytes`: a
+  value such as `0 < max_total_bytes < max_file_bytes` is accepted (an individual file may then be
+  refused by the total cap even though it would pass the per-file limit).
 - **`default_mode` must pass the mode policy.** It must be a parseable octal string with **only**
   `0777` permission bits — no setuid (`04000`), setgid (`02000`), sticky (`01000`), any higher bit, or
   world-writable (`0002`). An invalid value is rejected:
@@ -498,8 +520,14 @@ Notes on the values, with the security implications spelled out:
 - **The destination path is logged.** The relative path is written to the audit log (the file
   **content** is never logged). **Do not put secrets in `path`.** See
   [the security guide](file-upload-security.md#2-do-not-put-secrets-in-the-destination-path).
-- **No total-size / disk quota.** There is a per-file limit but no cap on the total bytes written.
-  Mitigate with a filesystem/container quota on the upload root.
+- **The total-size cap (`max_total_bytes`) bounds disk use.** When enabled (`> 0`), the tool sums the
+  size of all regular files under the upload root before each write and **denies** an upload that would
+  exceed the cap — closing the application-level disk-fill risk. The accounting includes files written
+  before the cap was enabled and files in sub-directories; symlinks are not followed. The denial is
+  neutral (no absolute path, no exact byte numbers). With the default `0` the cap is off and behaviour
+  is unchanged. There is still **no per-key quota** and **no content inspection** (see
+  [the security guide](file-upload-security.md#7-residual-risks-out-of-scope-for-this-version)). A
+  filesystem/container quota on the upload root remains a valid complementary measure.
 - **No environment variable overrides.** Like the `exec` section, the `upload` keys are read **only**
   from `config.yaml`; there is no env-var override.
 
@@ -514,8 +542,9 @@ For the tool's input/output contract, error mapping, and curl examples, see
 - **Malformed YAML is an error.** If the file exists but is not valid YAML, the config loader
   returns an explicit error (`config file is not valid YAML`). For `raxd serve` this is a startup
   error (exit `1`).
-- **Invalid `upload` values fail at startup.** An out-of-range `upload.max_file_bytes` or an invalid
-  `upload.default_mode` makes `serve` exit `1` with the messages shown above.
+- **Invalid `upload` values fail at startup.** An out-of-range `upload.max_file_bytes`, a negative
+  `upload.max_total_bytes`, or an invalid `upload.default_mode` makes `serve` exit `1` with the
+  messages shown above.
 - **`config port` does not write the file yet.** `raxd config port <PORT>` is still a stub. To
   change the port (or any other field, including `exec.*` / `upload.*`) today, edit `config.yaml`
   directly; `raxd serve` reads it on the next start. If you change `port` for a registered service,
@@ -526,8 +555,8 @@ For the tool's input/output contract, error mapping, and curl examples, see
 - [`commands.md`](commands.md) — full command reference, including `raxd status`, `raxd key`,
   `raxd service`, and `raxd serve`.
 - [`service-management.md`](service-management.md) — the system-service security and operations guide
-  (non-root execution, privileged-port capability, what `uninstall` keeps, audit-log rotation, the
-  macOS verification limitation).
+  (non-root execution, privileged-port capability, what `uninstall` keeps and what `uninstall --purge
+  --yes` removes, audit-log rotation, the macOS verification limitation).
 - [`mcp.md`](mcp.md) — the MCP integration guide, including the `execute_command` and `upload_file`
   tool references.
 - [`execute-command-security.md`](execute-command-security.md) — mandatory security warnings for

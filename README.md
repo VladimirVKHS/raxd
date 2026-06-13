@@ -9,15 +9,17 @@ once.
 > metadata and the product banner, **API key management** (`key create` / `key list` / `key delete`),
 > the **TLS 1.3 network server** (`raxd serve`), the **MCP server** on `/mcp` with the `ping`,
 > `server_info`, **`execute_command`** (runs a command on the host), and **`upload_file`** (writes a
-> file on the host) tools, the **system-service integration** (`raxd service install` / `start` /
-> `stop` / `status` / `uninstall`, systemd on Linux, launchd on macOS, running the daemon as the
-> unprivileged `raxd` user), and the **`curl | sh` installer** (`install.sh`) with a reproducible
-> release matrix (four `tar.gz` archives + `SHA256SUMS`).
+> file on the host, with a per-file and an optional total-size cap) tools, the **system-service
+> integration** (`raxd service install` / `start` / `stop` / `status` / `uninstall`, plus
+> `uninstall --purge --yes` for a full cleanup; systemd on Linux, launchd on macOS, running the daemon
+> as the unprivileged `raxd` user), and the **`curl | sh` installer** (`install.sh`) with a
+> reproducible release matrix (four `tar.gz` archives + `SHA256SUMS`) **published on GitHub Releases**.
+> A root **`LICENSE`** (MIT, Vladimir Kovalev / OEM TECH) is in place and shipped in the archives.
 >
-> **What is still pending before a public production release** (honest, not yet done): a public HTTPS
-> host that serves the artifacts (the default download URL is a placeholder), a **GPG/minisign
-> signature** of `SHA256SUMS`, **macOS Apple-Developer-ID notarization**, and a **`LICENSE`** file.
-> These and the other known limitations are listed in one place in
+> **What is still pending before a public production release** (honest, not yet done): a **GPG/minisign
+> signature** of `SHA256SUMS` — **deferred by an owner-level decision**, with v1 trust resting on TLS +
+> SHA256 — and **macOS Apple-Developer-ID notarization** (no Developer ID available yet). These and the
+> other known limitations are listed in one place in
 > [`docs/production-readiness.md`](docs/production-readiness.md) — **read it before deploying to a real
 > host.** The single stub command remaining is `raxd config port` (edit `config.yaml` by hand for
 > now). See [Installation](#installation) and [`docs/installation.md`](docs/installation.md).
@@ -58,6 +60,7 @@ on failure, and a graceful stop — running the daemon as the unprivileged `raxd
 | Secure key storage in `keys.db` (salted SHA-256 hash, `0600` file) | **Working** |
 | `raxd serve` — foreground TLS 1.3 server | **Working** |
 | `raxd service install` / `uninstall` / `start` / `stop` / `status` — manage raxd as a system service | **Working** |
+| `raxd service uninstall --purge --yes` — full cleanup (remove the `raxd` user and all data, irreversible) | **Working** |
 | Non-root daemon under the `raxd` user (systemd `User=raxd` / launchd `UserName=raxd`) | **Working** |
 | Autostart at boot, restart on failure, graceful stop via the service manager | **Working** |
 | journald drop-in that caps the audit-log size (`SystemMaxUse` / `SystemMaxFileSize`) | **Working** (Linux) |
@@ -68,22 +71,26 @@ on failure, and a graceful stop — running the daemon as the unprivileged `raxd
 | Authenticated health check (`GET /healthz` → `pong`) | **Working** |
 | **MCP server** on `/mcp` (Streamable HTTP, protocol `2025-11-25`) with `ping` + `server_info` tools | **Working** |
 | **MCP `execute_command`** — run a command on the host (no shell, timeout, optional allowlist, limits, audit) | **Working** |
-| **MCP `upload_file`** — write a file on the host (`os.Root`-confined, size limit, controlled mode, no-overwrite default, atomic, audit) | **Working** |
+| **MCP `upload_file`** — write a file on the host (`os.Root`-confined, per-file + optional total-size cap, controlled mode, no-overwrite default, atomic, audit) | **Working** |
+| Upload disk quota — optional total-size cap on the upload root (`upload.max_total_bytes`; `0` = disabled) | **Working** |
 | MCP audit (one line per tool call; for `execute_command`: command, args, exit code, duration; for `upload_file`: path, size) | **Working** |
 | `raxd --help` and the full command tree | **Working** |
 | XDG-based config/state path resolution (`~/.config/raxd`, `XDG_*` overrides; system paths under the service) | **Working** |
 | Directory creation with `0700` permissions | **Working** |
 | `config.yaml` loading via viper (networking, `exec`, and `upload` fields read by `serve`) | **Working** |
 | Cross-compilation to darwin/linux × amd64/arm64 (static `CGO_ENABLED=0` binaries) | **Working** |
-| **`curl \| sh` installer** (`install.sh`: platform detect, SHA256 verify, non-root install, macOS quarantine) | **Working** (verified in Docker; public artifact host pending) |
+| **`curl \| sh` installer** (`install.sh`: platform detect, SHA256 verify, non-root install, macOS quarantine) | **Working** (verified in Docker; published on GitHub Releases) |
 | **Reproducible release artifacts** (4 archives + `SHA256SUMS` via `make release-all`, offline in Docker) | **Working** |
-| Public release host serving the artifacts over HTTPS (real `RAXD_BASE_URL`) | **Not configured yet** (default URL is a placeholder) |
-| GPG/minisign signature of `SHA256SUMS`; macOS Apple-Developer-ID notarization | **Not implemented** (v1 trust = TLS + SHA256) |
+| Public release host serving the artifacts over HTTPS | **Working** (GitHub Releases, `vladimirvkhs/raxd`) |
+| `LICENSE` file (MIT, Vladimir Kovalev / OEM TECH), shipped in the release archives | **Present** |
+| GPG/minisign signature of `SHA256SUMS` | **Not implemented** (deferred by decision; v1 trust = TLS + SHA256) |
+| macOS Apple-Developer-ID notarization | **Not implemented** (no Developer ID available) |
 | Package managers (Homebrew/apt/rpm/AUR); self-update / uninstall script | **Not implemented** |
 | File **download** / host filesystem read / file deletion over MCP | **Not implemented** |
 | MCP tools beyond `ping` / `server_info` / `execute_command` / `upload_file`; MCP Resources / Prompts | **Not implemented** |
 | Interactive / PTY command sessions and real-time output streaming | **Not implemented** |
 | Chunked / streaming / resumable upload of large files | **Not implemented** (`upload_file` ships one whole file per request) |
+| Per-key upload quota; upload content inspection (antivirus / content-type) | **Not implemented** (only a total-size cap exists) |
 | Command sandboxing (cgroups/rlimits/seccomp/namespaces) | **Not implemented** (isolation via non-root + container) |
 | mTLS / client certificates | **Not implemented** (API-key auth only) |
 | `raxd config port` | **Stub** (`not implemented yet`) |
@@ -116,10 +123,10 @@ implemented yet**, and every pending production-release item is collected in
 
 ## Installation
 
-Once a public release host serves the artifacts over HTTPS, installation is a single command:
+Install the latest release with a single command — the artifacts are published on GitHub Releases:
 
 ```sh
-curl -fsSL https://<base-url>/install.sh | bash
+curl -fsSL https://github.com/vladimirvkhs/raxd/releases/latest/download/install.sh | bash
 ```
 
 `install.sh` detects your OS/architecture, downloads the matching archive, **verifies its SHA256
@@ -127,16 +134,23 @@ before placing anything**, installs the `raxd` binary to `/usr/local/bin` (or `~
 `sudo`), and on macOS clears the Gatekeeper quarantine attribute. It installs **only the binary** — to
 register the system service afterwards, run `raxd service install`.
 
-> **The public download host is not configured yet.** The default download URL baked into `install.sh`
-> is a placeholder (`https://releases.example.com/raxd`), so the command above will not fetch real
-> artifacts until a host is set up. Until then you can: point the installer at a source you control
-> with `RAXD_BASE_URL`, install manually from a release archive (with SHA256 verification), or build
-> the artifacts from source in Docker (`make release-all`). The trust model (v1 relies on TLS + SHA256
-> with **no** GPG signature yet) and every option are documented in full in
-> [`docs/installation.md`](docs/installation.md); the full pending-release checklist is in
+> **Version policy: `latest` vs pinned.** The command above always installs the newest published
+> release. For a reproducible install (production / CI), pin a tag with `RAXD_VERSION`:
+>
+> ```sh
+> RAXD_VERSION=v0.1.0 \
+>   curl -fsSL https://github.com/vladimirvkhs/raxd/releases/latest/download/install.sh | bash
+> ```
+>
+> The **v1 trust model** rests on TLS + SHA256 (there is **no** GPG signature yet — deferred by
+> decision); macOS is not Apple-notarized yet (the installer only strips the quarantine attribute).
+> Both options and the full trust model are documented in
+> [`docs/installation.md`](docs/installation.md); the pending-release checklist is in
 > [`docs/production-readiness.md`](docs/production-readiness.md).
 
-To build everything yourself and verify the install-flow locally, see
+You can also point the installer at your own HTTPS source with `RAXD_BASE_URL`, install manually from
+a release archive (with SHA256 verification), or build the artifacts from source in Docker
+(`make release-all`). To build everything yourself and verify the install-flow locally, see
 [`docs/installation.md`](docs/installation.md#building-release-artifacts-from-source) and
 [`docs/development.md`](docs/development.md).
 
@@ -190,13 +204,14 @@ raxd
 └── serve              start the raxd TLS server           (working)
 ```
 
-A full reference with usage strings, exit codes, and output examples is in
+`raxd service uninstall` also accepts `--purge --yes` for a full, irreversible cleanup (remove the
+`raxd` user and all data). A full reference with usage strings, exit codes, and output examples is in
 [`docs/commands.md`](docs/commands.md). The system-service security and operations model — non-root
-execution, the privileged-port capability, what `uninstall` keeps, and audit-log rotation — is in
-[`docs/service-management.md`](docs/service-management.md). The MCP server is not a CLI command — it
-is hosted by `raxd serve` on the `/mcp` route; see [`docs/mcp.md`](docs/mcp.md). Command execution and
-file upload are **not** CLI sub-commands either — they are the MCP `execute_command` and `upload_file`
-tools.
+execution, the privileged-port capability, what `uninstall` keeps and what `uninstall --purge --yes`
+removes, and audit-log rotation — is in [`docs/service-management.md`](docs/service-management.md). The
+MCP server is not a CLI command — it is hosted by `raxd serve` on the `/mcp` route; see
+[`docs/mcp.md`](docs/mcp.md). Command execution and file upload are **not** CLI sub-commands either —
+they are the MCP `execute_command` and `upload_file` tools.
 
 ### Example: API keys
 
@@ -323,14 +338,16 @@ raxd service status
 
 The non-zero `euid` (here `999`) confirms the daemon — and therefore every `execute_command` and
 `upload_file` it serves — runs as the unprivileged `raxd` user, not root. `raxd service uninstall`
-removes the registration but **intentionally keeps** the inert `raxd` user and the data directory.
+removes the registration but **intentionally keeps** the inert `raxd` user and the data directory; for
+a zero-footprint removal, `raxd service uninstall --purge --yes` also deletes the user and the
+state/config directories (irreversible — it erases `keys.db`).
 
 > **Read the [service guide](docs/service-management.md) before installing on a real host.** It covers
 > the non-root model, the privileged-port capability (the default port `7822` needs none; a port
-> `< 1024` grants only `CAP_NET_BIND_SERVICE`), what `uninstall` keeps, audit-log rotation via the
-> journald drop-in, and the fact that the macOS launchd path is verified on a real macOS host rather
-> than in Docker. The on-disk service paths and permissions are in
-> [`docs/configuration.md`](docs/configuration.md#service-layout-system-service).
+> `< 1024` grants only `CAP_NET_BIND_SERVICE`), what `uninstall` keeps and what `uninstall --purge
+> --yes` removes, audit-log rotation via the journald drop-in, and the fact that the macOS launchd path
+> is verified on a real macOS host rather than in Docker. The on-disk service paths and permissions are
+> in [`docs/configuration.md`](docs/configuration.md#service-layout-system-service).
 
 ### Example: connecting to the MCP server
 
@@ -391,8 +408,9 @@ see [`docs/mcp.md`](docs/mcp.md#execute_command).
 
 `upload_file` writes one regular file into the upload root, given a relative `path` and base64
 `content`. The write is confined to the upload root (no `..`-escape, no absolute path, no out-of-root
-symlink), size-limited, with a controlled file mode (default `0600`), atomic, and not overwriting an
-existing file unless `overwrite: true`. Call it as a JSON-RPC `tools/call` on `/mcp`:
+symlink), size-limited (per file, and — when configured — by a total-size cap on the whole upload
+root), with a controlled file mode (default `0600`), atomic, and not overwriting an existing file
+unless `overwrite: true`. Call it as a JSON-RPC `tools/call` on `/mcp`:
 
 ```sh
 curl -k https://127.0.0.1:7822/mcp \
@@ -404,17 +422,17 @@ curl -k https://127.0.0.1:7822/mcp \
 ```
 
 A successful write returns `path`, `size`, `overwritten`, and `mode` (no absolute path, no content);
-a rejected write (traversal, an existing file without `overwrite`, too-large, bad base64, a forbidden
-mode) comes back with `isError: true`. For the full response shapes and error mapping, see
-[`docs/mcp.md`](docs/mcp.md#upload_file).
+a rejected write (traversal, an existing file without `overwrite`, too-large, the total quota
+exceeded, bad base64, a forbidden mode) comes back with `isError: true`. For the full response shapes
+and error mapping, see [`docs/mcp.md`](docs/mcp.md#upload_file).
 
 > **Before you enable this against a real host:** read the
 > [`upload_file` security guide](docs/file-upload-security.md). Key points: keep the upload root a
 > dedicated directory **free of bind-mounts** (`os.Root` does not block mount points); the destination
 > **path is logged** (do not put secrets in `path` — the content is never logged); setuid/setgid/sticky
-> and world-writable file modes are **forbidden**; and you should run `raxd` as a **non-root** user.
-> The `upload.*` settings are documented in
-> [`docs/configuration.md`](docs/configuration.md#file-upload-upload-fields).
+> and world-writable file modes are **forbidden**; you can bound total disk use with
+> `upload.max_total_bytes`; and you should run `raxd` as a **non-root** user. The `upload.*` settings
+> are documented in [`docs/configuration.md`](docs/configuration.md#file-upload-upload-fields).
 
 ### Example: `raxd version`
 
@@ -491,24 +509,24 @@ and reused afterward. The upload root is created with `0700` on `raxd serve`.
 When `raxd` runs as a registered **system service**, the daemon uses **system** paths instead
 (`/etc/raxd`, `/var/lib/raxd` on Linux; `/usr/local/etc/raxd`, `/usr/local/var/raxd` on macOS), set
 through the unit/plist environment so no code change is needed. Full details, including the networking
-fields, the `exec` / `upload` fields that `serve` reads from `config.yaml`, and the service layout,
-are in [`docs/configuration.md`](docs/configuration.md).
+fields, the `exec` / `upload` fields that `serve` reads from `config.yaml` (including
+`upload.max_total_bytes`), and the service layout, are in
+[`docs/configuration.md`](docs/configuration.md).
 
 ## Coming next
 
 The following capabilities are **planned and not implemented yet**. They are listed so you know what
 the binary is being built toward; do not treat them as available today. The production-release gating
-items (host, signature, notarization, license) are tracked in
+items (the deferred GPG signature, macOS notarization) are tracked in
 [`docs/production-readiness.md`](docs/production-readiness.md).
 
-- **Public release host + signed artifacts** — the `install.sh` installer and the reproducible release
-  matrix (4 archives + `SHA256SUMS`) exist and are verified in Docker, but the artifacts are not yet
-  published to a public HTTPS host (the default download URL is a placeholder). Still to come before a
-  public release: a real download host (a concrete `RAXD_BASE_URL`), a **GPG/minisign signature** of
-  `SHA256SUMS` (v1 trust rests on TLS + SHA256 only), and **macOS Apple-Developer-ID notarization**
-  (v1 only strips the quarantine attribute). See [`docs/installation.md`](docs/installation.md).
-- **Package managers** — Homebrew/apt/rpm/AUR as install methods (out of scope for v1; gated on a
-  public host and a tap repo).
+- **Signed artifacts + macOS notarization** — the `install.sh` installer and the reproducible release
+  matrix (4 archives + `SHA256SUMS`) are published on GitHub Releases. Still to come for a fully
+  hardened release: a **GPG/minisign signature** of `SHA256SUMS` (deferred by an owner-level decision;
+  v1 trust rests on TLS + SHA256), and **macOS Apple-Developer-ID notarization** (v1 only strips the
+  quarantine attribute — no Developer ID yet). See [`docs/installation.md`](docs/installation.md).
+- **Package managers** — Homebrew/apt/rpm/AUR as install methods (out of scope for v1; gated on a tap
+  repo).
 - **Self-update / uninstall script / downgrade** — there is no auto-update or uninstall script yet;
   remove the binary by hand (see [`docs/installation.md`](docs/installation.md#uninstall)).
 - **File download / read / delete** — `upload_file` is upload-only; reading or deleting host files
@@ -518,6 +536,9 @@ items (host, signature, notarization, license) are tracked in
   `initialize` currently advertises the `tools` capability only.
 - **Chunked / streaming upload** — `upload_file` ships one whole file per request, bounded by
   `max_body_bytes`; uploading larger files would need a chunked/streaming channel.
+- **Per-key upload quota and content inspection** — the upload root has an optional total-size cap
+  (`upload.max_total_bytes`), but there is no per-key/per-fingerprint quota and no antivirus /
+  content-type check yet.
 - **Command sandboxing** — cgroups/rlimits/seccomp/namespaces for `execute_command`. Today isolation
   relies on running `raxd` as a non-root user inside a container (which the `raxd service` layout
   arranges); the tool already kills the whole process tree on timeout, caps output, and limits
@@ -529,15 +550,16 @@ items (host, signature, notarization, license) are tracked in
 
 ## Documentation
 
-- [`docs/installation.md`](docs/installation.md) — installation guide: `curl | sh` flow, pointing the
-  installer at an artifact source, the install path/privilege rules, SHA256 integrity verification, the
-  v1 trust model (TLS + SHA256, no GPG yet), manual install, macOS Gatekeeper/quarantine, building the
-  release artifacts from source, exit codes, and uninstall.
+- [`docs/installation.md`](docs/installation.md) — installation guide: `curl | sh` flow (GitHub
+  Releases), the version policy (`latest` vs pinned), the install path/privilege rules, SHA256
+  integrity verification, the v1 trust model (TLS + SHA256, no GPG yet), manual install, macOS
+  Gatekeeper/quarantine, building the release artifacts from source, exit codes, and uninstall.
 - [`docs/commands.md`](docs/commands.md) — full command reference (`version`, `status`, the `key`
-  group, the `service` group, `serve`, and the `config port` stub).
+  group, the `service` group including `uninstall --purge --yes`, `serve`, and the `config port` stub).
 - [`docs/service-management.md`](docs/service-management.md) — the system-service security and
-  operations guide: non-root execution, the privileged-port capability, what `uninstall` keeps,
-  audit-log rotation, the restart policy, and the macOS verification limitation.
+  operations guide: non-root execution, the privileged-port capability, what `uninstall` keeps and
+  what `uninstall --purge --yes` removes, audit-log rotation, the restart policy, and the macOS
+  verification limitation.
 - [`docs/mcp.md`](docs/mcp.md) — MCP integration guide: the `/mcp` endpoint, connection parameters,
   the `ping` / `server_info` / `execute_command` / `upload_file` tools, authentication, the curl
   smoke-test, MCP client config, and audit.
@@ -546,13 +568,15 @@ items (host, signature, notarization, license) are tracked in
   residual risks).
 - [`docs/file-upload-security.md`](docs/file-upload-security.md) — mandatory security warnings for
   `upload_file` (mount points in the upload root, secrets in the path, `deny_root`/root, the mode
-  policy, no disk quota, residual risks).
+  policy, the total-size cap `upload.max_total_bytes`, residual risks).
 - [`docs/configuration.md`](docs/configuration.md) — paths, the service layout, `keys.db`, the TLS
-  directory, and the `config.yaml` networking, `exec`, and `upload` fields.
+  directory, and the `config.yaml` networking, `exec`, and `upload` fields (including
+  `upload.max_total_bytes`).
 - [`docs/production-readiness.md`](docs/production-readiness.md) — the consolidated **production
-  readiness / known limitations** page: every pending pre-release item (host, signature, notarization,
-  license) and the residual risks (no disk quota, args/path logging, root-WARN default, UID-reuse on
-  uninstall, macOS-outside-Docker), with the escalation that closes each.
+  readiness / known limitations** page: the closed items (GitHub-Releases host, LICENSE, the upload
+  total-size cap, the `--purge` cleanup) and the remaining items (the deferred GPG signature, macOS
+  notarization / Gatekeeper-outside-Docker, args/path logging, root-WARN default, no per-key quota /
+  content inspection, no sandboxing / mTLS), each with the escalation or decision that governs it.
 - [`docs/troubleshooting.md`](docs/troubleshooting.md) — common problems with installation, `serve`,
   the service, the TLS certificate, keys, the config file, `execute_command`, and `upload_file`.
 - [`docs/development.md`](docs/development.md) — building and testing in Docker, project layout, and
@@ -565,5 +589,7 @@ of this README.
 
 ## License
 
-No license file is present in the repository yet; licensing terms are not defined at this stage. See
-[`docs/production-readiness.md`](docs/production-readiness.md) for the pending pre-release items.
+This project is licensed under the **MIT License** — see the [`LICENSE`](LICENSE) file
+(Copyright (c) 2026 Vladimir Kovalev, OEM TECH). The release archives include this `LICENSE` file
+alongside the binary and `README.md`. See [`docs/production-readiness.md`](docs/production-readiness.md)
+for the remaining pre-release items (the deferred artifact signature and macOS notarization).

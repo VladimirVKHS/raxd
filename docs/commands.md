@@ -116,6 +116,9 @@ stay on the terminal because they go to stderr.
 | `key delete` with an unknown id, an already-revoked id, or a missing id argument | `1` |
 | `service install` succeeds, or the service is **already installed** | `0` |
 | `service uninstall` succeeds, or the service is **not installed** | `0` |
+| `service uninstall --purge --yes` succeeds (including idempotent re-run) | `0` |
+| `service uninstall --purge` **without** `--yes` (irreversibility barrier — nothing removed) | `1` |
+| `service uninstall --purge --yes` refused (cannot stop daemon, no root, user mismatch, suspicious path) | `1` |
 | `service start` / `stop` succeed | `0` |
 | `service status` (any state, including not installed) | `0` |
 | `service install` / `uninstall` / `start` / `stop` without root, or the manager is unavailable/unsupported | `1` |
@@ -521,9 +524,10 @@ vs the plist) are hidden inside.
 > does not require root.
 
 > **Read the [service management guide](service-management.md) before installing on a real host.** It
-> covers the non-root model, the privileged-port capability, what `uninstall` keeps, log rotation,
-> the restart policy, and the macOS verification limitation. The on-disk layout (paths, permissions)
-> is in [`configuration.md`](configuration.md#service-layout-system-service).
+> covers the non-root model, the privileged-port capability, what `uninstall` keeps (and what
+> `uninstall --purge --yes` removes), log rotation, the restart policy, and the macOS verification
+> limitation. The on-disk layout (paths, permissions) is in
+> [`configuration.md`](configuration.md#service-layout-system-service).
 
 ### What `install` sets up
 
@@ -610,11 +614,17 @@ step, but it always follows the `error:` / `hint:` shape and exits `1`.
 
 ### `raxd service uninstall`
 
-Remove the service registration and disable autostart.
+Remove the service registration and disable autostart. By default the inert `raxd` user and the data
+directory are kept; the optional `--purge --yes` flags remove them too (see
+[Full cleanup with `--purge`](#full-cleanup-raxd-service-uninstall---purge---yes) below).
 
-- **Usage:** `sudo raxd service uninstall`
+- **Usage:** `sudo raxd service uninstall` (add `--purge --yes` for a full, irreversible cleanup)
+- **Flags:**
+  - `--purge` — also remove the system user `raxd` and all data (irreversible; **requires** `--yes`).
+  - `--yes` — confirm the irreversible purge (required together with `--purge`).
 - **Output channel:** stderr (success block or `error:` / `hint:`)
-- **Exit code:** `0` on success **or** when the service is not installed; `1` on error.
+- **Exit code:** `0` on success **or** when the service is not installed; `1` on error (including the
+  `--purge` barrier when `--yes` is missing).
 
 On success it stops and disables the service, removes the unit (and, on Linux, the journald drop-in),
 and prints (Linux):
@@ -641,13 +651,14 @@ the macOS state directory:
 
 The `kept` line is deliberate: the `raxd` user (no login shell, no home, no longer running) is
 **intentionally not deleted**, because removing a system user is riskier than keeping an inert one
-(UID-reuse). Remove it yourself only if you need a zero-footprint cleanup — see
+(UID-reuse). Remove it yourself only if you need a zero-footprint cleanup — by hand, or with
+`--purge --yes` below. See
 [`service-management.md`](service-management.md#3-the-raxd-user-is-kept-after-uninstall).
 
 > **The data hint shows the real, platform-specific state directory.** The `data in … is preserved`
 > hint prints the actual state directory for the current platform — `/var/lib/raxd` on Linux,
-> `/usr/local/var/raxd` on macOS. The state directory (and `keys.db` inside it) is **not** removed by
-> `uninstall` on either platform.
+> `/usr/local/var/raxd` on macOS. Without `--purge`, the state directory (and `keys.db` inside it) is
+> **not** removed on either platform.
 
 **Not installed (exit 0).** Uninstalling an absent service is a no-op success, not an error:
 
@@ -658,6 +669,115 @@ The `kept` line is deliberate: the `raxd` user (no login shell, no home, no long
 
 **Errors** (exit `1`). Without root, the same `insufficient privileges` error as `install`. If the
 manager is unavailable, the `service manager is not available` error.
+
+#### Full cleanup: `raxd service uninstall --purge --yes`
+
+A plain `uninstall` keeps the `raxd` user and the data directory by design (UID-reuse safety, and to
+avoid silently destroying `keys.db`). When you do want a **zero-footprint** removal, add `--purge`
+**and** `--yes`: in addition to everything a plain uninstall does, this removes the `raxd` system user
+**and** the state/config directories on both Linux and macOS. It is **irreversible** — it erases
+`keys.db` and the audit data — so it is gated behind both flags.
+
+- **Usage:** `sudo raxd service uninstall --purge --yes`
+- **Output channel:** stderr
+- **Exit code:** `0` on success (including an idempotent re-run); `1` on the barrier or any refusal.
+
+**The barrier — `--purge` without `--yes` (exit 1, nothing removed):**
+
+```
+warning: this operation is irreversible
+
+  The following will be permanently destroyed:
+
+    user      raxd  (system account, no login shell)
+    state     /var/lib/raxd
+    config    /etc/raxd
+    keys.db   all API keys and audit log — cannot be recovered
+
+  hint: to confirm, re-run with --yes:
+          sudo raxd service uninstall --purge --yes
+```
+
+The `state` / `config` lines show the real platform paths. Nothing is removed; this is purely the
+confirmation barrier. There is no interactive `y/n` prompt — the tool is driven by agents/scripts, so
+confirmation is the explicit `--yes` flag.
+
+**Success — `--purge --yes` (exit 0).** The step-by-step report (Linux), followed by an audit line:
+
+```
+  stopped        raxd service
+
+  uninstalled    raxd service
+  removed        unit file and autostart registration
+  removed        journal size limit drop-in
+
+  removed        user raxd
+  removed        /var/lib/raxd
+  removed        /etc/raxd
+
+  purge complete   raxd has been fully removed from this host
+```
+
+**Idempotent re-run (exit 0).** Run again when everything is already gone, and each line reports what
+was already absent; the final line confirms the no-op:
+
+```
+  not running    raxd service
+
+  not installed  raxd service  [already unregistered]
+
+  absent         user raxd  [already removed]
+  absent         /var/lib/raxd
+  absent         /etc/raxd
+
+  purge complete   nothing to remove — host is already clean
+```
+
+A partial state (some items present, some already gone) mixes `removed` and `absent` lines the same
+way. An intent audit record is written **before** the destructive steps (so it survives), and an
+outcome record after; both carry only metadata (`action=purge platform=… user_removed=… dirs_removed=…
+stopped=…`) — never `keys.db` contents or any secret.
+
+**Refusals** (exit `1`, nothing removed). Each is a neutral `error:` / `hint:` pair (no raw OS output,
+the suspicious path is not printed):
+
+- The daemon could not be stopped first:
+
+  ```
+  error: raxd service did not stop within the timeout
+    hint: check service status and stop it manually before purging:
+            sudo raxd service stop
+            sudo raxd service uninstall --purge --yes
+  ```
+
+- Insufficient privileges (need root/sudo for `userdel`/`dscl`/removing system directories):
+
+  ```
+  error: insufficient privileges to run purge
+    hint: run as root or with sudo:
+            sudo raxd service uninstall --purge --yes
+  ```
+
+- The OS user does not match the expected raxd service account:
+
+  ```
+  error: system user "raxd" does not match the expected raxd service account
+    hint: the account may have been modified; inspect it before removing:
+            id raxd
+            getent passwd raxd
+  ```
+
+- The resolved state/config path is suspicious (empty, `/`, `$HOME`, a blocked system root, or
+  outside the expected layout):
+
+  ```
+  error: resolved path for state/config directory is outside the expected layout
+    hint: inspect the raxd configuration for unexpected symlinks or path overrides:
+            raxd service status
+  ```
+
+See [`service-management.md`](service-management.md#full-cleanup-in-one-command-uninstall---purge---yes)
+for the full purge model and the manual fallback.
 
 ### `raxd service start`
 
@@ -832,8 +952,11 @@ the numeric fields are `0`:
   rewrite its own service definition.
 - The audit log is capped via a journald drop-in (`SystemMaxUse` / `SystemMaxFileSize`); the cap is
   per-host, with logrotate as a documented fallback.
-- `uninstall` removes the registration, autostart, capability, and drop-in, but **keeps** the inert
-  `raxd` user and the state directory.
+- A plain `uninstall` removes the registration, autostart, capability, and drop-in, but **keeps** the
+  inert `raxd` user and the state directory. `uninstall --purge --yes` additionally removes the user
+  and the state/config directories — irreversible, gated behind both `--purge` and `--yes`, with the
+  removal paths validated (it refuses `/`, `$HOME`, blocked system roots, or a path outside the
+  expected layout) and idempotent.
 - `status` never prints a secret — only the state, paths, PID, EUID, port, and user name.
 - Template inputs are validated before render and the manager is invoked without a shell; raw manager
   stderr is never shown to the user.
@@ -992,9 +1115,9 @@ response-codes note below).
 > **MCP protocol errors are JSON-RPC, not HTTP status codes.** Inside an authenticated `POST /mcp`,
 > a malformed body or an unknown tool name is reported as a JSON-RPC error (`-32700` / `-32600` /
 > `-32601` / `-32602`) with HTTP `200`, not as a `4xx`/`501`. An `execute_command` or `upload_file`
-> tool error (allowlist deny, missing binary, limits, `deny_root`, traversal, too-large, bad mode) is
-> reported as `isError: true` **inside** the JSON-RPC `result`, also with HTTP `200`. See
-> [`mcp.md`](mcp.md#behaviour-and-error-handling).
+> tool error (allowlist deny, missing binary, limits, `deny_root`, traversal, too-large, total quota
+> exceeded, bad mode) is reported as `isError: true` **inside** the JSON-RPC `result`, also with HTTP
+> `200`. See [`mcp.md`](mcp.md#behaviour-and-error-handling).
 
 > **The `413`/`400` from the body limit is not audited.** The body-size limit
 > (`bodyLimitMiddleware`) is the **outermost** layer in the chain — it runs before the auth and
@@ -1117,10 +1240,11 @@ time=<UTC ISO-8601> level=WARN msg=WARN fp=<fingerprint> remote=<IP:port> tool=u
   start (missing binary, bad `cwd`) is `msg=FAIL`; and an extra `msg=WARN reason=running-as-root`
   record is written on **every** call when the daemon is root.
 - For `upload_file`, a successful write is `msg=MCP result=ok path= size=`; a control rejection
-  (traversal, exists, is-a-directory, too-large, bad base64, bad mode, `deny_root`) is `msg=DENY`; an
-  I/O failure is `msg=FAIL`; and an extra `msg=WARN reason=running-as-root` record is written on
-  **every** call when the daemon is root. `size=` (a plain integer) appears only on the success
-  record; `path=` is the **relative** path, never an absolute host path.
+  (traversal, exists, is-a-directory, too-large, total quota exceeded, bad base64, bad mode,
+  `deny_root`) is `msg=DENY`; an I/O failure is `msg=FAIL`; and an extra `msg=WARN
+  reason=running-as-root` record is written on **every** call when the daemon is root. `size=` (a
+  plain integer) appears only on the success record; `path=` is the **relative** path, never an
+  absolute host path.
 - Same `fp` and `remote` as the `AUTH` line for the same request — the key body is never logged.
 
 > **`execute_command` arguments and the `upload_file` destination path are logged verbatim**
@@ -1330,9 +1454,10 @@ error: key store is corrupted or unreadable
 **Configuration load failure (invalid bind address, invalid `config.yaml`, or invalid `upload.*`).**
 The bind-address and YAML-syntax failures are handled by a **single** error path in `serve`, and that
 path prints **one generic hint** that references `bind_addr` / `config.yaml`. An invalid
-`upload.max_file_bytes` or `upload.default_mode` is also a config-load failure; the `error:` line
-names the upload field. The `error:` line always reports what actually went wrong (it carries the
-underlying message from `config.Load`), but the `hint:` line is **not specialised per cause**.
+`upload.max_file_bytes`, a negative `upload.max_total_bytes`, or an invalid `upload.default_mode` is
+also a config-load failure; the `error:` line names the upload field. The `error:` line always reports
+what actually went wrong (it carries the underlying message from `config.Load`), but the `hint:` line
+is **not specialised per cause**.
 
 For an invalid bind address the pair reads naturally, because the cause and the hint line up:
 
@@ -1374,11 +1499,11 @@ In this YAML case the `bind_addr` reference is incidental: the actionable part i
   `server_info`, `execute_command`, `upload_file`); everything else is `501`.
 - `execute_command` runs commands without a shell, with a mandatory timeout, an optional allowlist,
   output/argument limits, and a controlled `cwd`/environment. `upload_file` writes a single regular
-  file confined to the upload root (`os.Root`), size-limited, with a controlled mode (no
-  setuid/setgid/sticky/world-writable). Neither tool elevates privileges (they inherit the daemon's
-  UID/GID); run `raxd` as a non-root user — the [`raxd service`](#system-service-raxd-service) layout
-  does this for you by running the daemon as the `raxd` user. See
-  [`execute-command-security.md`](execute-command-security.md),
+  file confined to the upload root (`os.Root`), capped per-file and (optionally) by a total upload
+  quota, with a controlled mode (no setuid/setgid/sticky/world-writable). Neither tool elevates
+  privileges (they inherit the daemon's UID/GID); run `raxd` as a non-root user — the
+  [`raxd service`](#system-service-raxd-service) layout does this for you by running the daemon as the
+  `raxd` user. See [`execute-command-security.md`](execute-command-security.md),
   [`file-upload-security.md`](file-upload-security.md), and
   [`service-management.md`](service-management.md).
 
@@ -1430,6 +1555,7 @@ error: config port: not implemented yet
 | `raxd key delete` | stderr | yes | not found / already revoked / missing id | working |
 | `raxd service install` | stderr | yes (incl. already installed) | no root / manager unavailable / register failure | working |
 | `raxd service uninstall` | stderr | yes (incl. not installed) | no root / manager unavailable / removal failure | working |
+| `raxd service uninstall --purge --yes` | stderr | yes (incl. idempotent re-run) | barrier without `--yes` / can't stop / no root / user mismatch / suspicious path | working |
 | `raxd service start` | stderr | yes | not installed / no root / start failure | working |
 | `raxd service stop` | stderr | yes | not installed / no root / stop failure | working |
 | `raxd service status` | stdout | yes (any state) | manager error | working |

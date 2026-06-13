@@ -13,11 +13,14 @@ Problems running the `curl | sh` installer. The full installation guide is in
 [`installation.md`](installation.md); this section covers the failure modes and their exit codes. The
 installer prints lowercase `error:` / `hint:` lines and exits with a specific code per failure class.
 
-> **Reminder: there is no public download host yet.** The default `RAXD_BASE_URL` in `install.sh` is a
-> placeholder (`https://releases.example.com/raxd`), so the canonical `curl … | sh` against the default
-> URL will fail at the download step (exit `5`) until a real host is configured. Point the installer at
-> a source you control with `RAXD_BASE_URL`, or install manually — see
-> [`installation.md`](installation.md#quick-install-curl--sh).
+> **Note: artifacts are on GitHub Releases and the default installer resolves them automatically.**
+> The release archives and `SHA256SUMS` are published on GitHub Releases for `vladimirvkhs/raxd`, and
+> the canonical one-liner works as-is:
+> `curl -fsSL https://github.com/vladimirvkhs/raxd/releases/latest/download/install.sh | bash`.
+> You only need `RAXD_BASE_URL` (an alternative artifact source you control) or `RAXD_VERSION` (to
+> pin an exact tag instead of `latest`) for the non-default cases — see
+> [`installation.md`](installation.md#quick-install-curl--sh) and the version policy
+> (`latest` vs a pinned tag) in [`production-readiness.md`](production-readiness.md#1-public-release-host--closed-github-releases-ор-3--ор-5).
 
 ### `error: unsupported platform` / `unsupported architecture` (exit `2`)
 
@@ -119,11 +122,14 @@ error: download failed: <sums_url>
 
 Most common causes:
 
-- **You used the default `RAXD_BASE_URL`** — it is a placeholder host that does not serve artifacts.
-  Set `RAXD_BASE_URL` to a real source (see [`installation.md`](installation.md#pointing-the-installer-at-an-artifact-source)).
-- **Wrong `RAXD_VERSION`** — the archive name built from the version does not exist on the source.
-- **Network / host unreachable** — check connectivity and that `<base-url>/SHA256SUMS` and the archive
-  are actually served over HTTPS.
+- **Network / host unreachable** — check connectivity and that the release artifacts are actually
+  reachable over HTTPS. The default source is GitHub Releases (`vladimirvkhs/raxd`); a transient GitHub
+  outage or a blocked network can cause this.
+- **Wrong `RAXD_VERSION`** — the archive name built from the version does not exist on the source (no
+  release published under that tag).
+- **A custom `RAXD_BASE_URL` that does not serve the artifacts** — if you overrode `RAXD_BASE_URL` to
+  your own host, make sure `<base-url>/SHA256SUMS` and the archive are actually served there (see
+  [`installation.md`](installation.md#pointing-the-installer-at-an-artifact-source)).
 
 ### `error: no SHA256 utility found` (exit `1`)
 
@@ -309,9 +315,10 @@ per cause. So:
 - **Read the `hint:` line as "fix your `config.yaml`"** rather than literally "the problem is
   `bind_addr`". For a YAML-syntax error the `bind_addr` mention is incidental.
 
-The two concrete cases follow. (Note: an invalid `upload.max_file_bytes` or `upload.default_mode` is
-also a `config.Load` failure and surfaces through this same path — the `error:` line names the upload
-field; see [the `upload_file` section](#the-upload_file-tool) below.)
+The two concrete cases follow. (Note: an invalid `upload.max_file_bytes`, a negative
+`upload.max_total_bytes`, or an invalid `upload.default_mode` is also a `config.Load` failure and
+surfaces through this same path — the `error:` line names the upload field; see
+[the `upload_file` section](#the-upload_file-tool) below.)
 
 ### `error: invalid bind address "…": not a valid IP address`
 
@@ -575,8 +582,10 @@ you still need:
 
 The state directory is **not** removed by `uninstall` either, so `keys.db` and any data survive.
 (The uninstall hint names the real, platform-specific state directory: `/var/lib/raxd` on Linux,
-`/usr/local/var/raxd` on macOS.) See
-[`service-management.md`](service-management.md#3-the-raxd-user-is-kept-after-uninstall). This
+`/usr/local/var/raxd` on macOS.) Alternatively, `raxd service uninstall --purge --yes` removes the
+user **and** the state/config directories in one irreversible step — see
+[`service-management.md`](service-management.md#3-the-raxd-user-is-kept-after-uninstall) and
+[`commands.md`](commands.md#raxd-service-uninstall). This
 UID-reuse residual risk is also summarised in
 [`production-readiness.md`](production-readiness.md#6-service-uninstall-keeps-the-raxd-user-and-data-uid-reuse).
 
@@ -768,6 +777,7 @@ upload reports `isError`. The cases, the client text, and the matching audit lin
 | `file already exists (set overwrite to replace)` | the target exists and `overwrite` is `false` (the default) | `msg=DENY … reason="file already exists"` |
 | `target path is a directory` | the `path` points at an existing directory, not a file | `msg=DENY … reason="target is a directory"` |
 | `file too large: exceeds max_file_bytes` | the **decoded** content is larger than `upload.max_file_bytes` (default 700 KiB) | `msg=DENY … reason="file too large"` |
+| `upload denied: total upload quota exceeded` | the write would push the upload root over `upload.max_total_bytes` (when set `> 0`) | `msg=DENY … reason="total upload quota exceeded"` |
 | `invalid base64 content` | `content` is not valid standard base64 | `msg=DENY … reason="invalid base64 content"` |
 | `invalid file mode` | `mode` is unparseable, has a bit outside `0777` (setuid/setgid/sticky/higher), or is world-writable | `msg=DENY … reason="invalid file mode"` |
 | `upload as root is forbidden by policy` | `upload.deny_root: true` and the daemon is root | `msg=WARN reason=running-as-root` then `msg=DENY` |
@@ -792,6 +802,12 @@ How to act on each:
   — whereas this `isError: true` deny means the body was fine but the decoded file exceeded the
   per-file cap. Send a smaller file, or raise `upload.max_file_bytes` (it must stay below the ceiling
   derived from `max_body_bytes`; see [`configuration.md`](configuration.md#file-upload-upload-fields)).
+- **`upload denied: total upload quota exceeded`.** A **total-size** cap (`upload.max_total_bytes`, set
+  `> 0`) is configured and this write would push the combined size of all files in the upload root
+  over it. Nothing is written. Free space by removing files from the upload root, or raise
+  `upload.max_total_bytes` in `config.yaml` (`0` disables the cap). This is independent of the per-file
+  limit above. See [`configuration.md`](configuration.md#file-upload-upload-fields) and
+  [the security guide](file-upload-security.md#7-residual-risks-out-of-scope-for-this-version).
 - **`invalid base64 content`.** Encode the file as **standard** base64 with padding. A common mistake
   is sending URL-safe base64 (`-`/`_` instead of `+`/`/`) or stripping the `=` padding.
 - **`invalid file mode`.** Use an octal string with only `0777` permission bits, for example `"0600"`,
@@ -819,8 +835,9 @@ Check:
 
 - the upload root exists and is owned by the user running `raxd` (default `<state directory>/uploads`,
   permissions `0700`);
-- there is free disk space (there is **no** total-size quota — the per-file limit does not stop the
-  disk filling up; see [the security guide](file-upload-security.md#7-residual-risks-out-of-scope-for-this-version));
+- there is free disk space — and, if you have set `upload.max_total_bytes`, that the upload root is
+  below that total-size cap (otherwise the write is denied with `total upload quota exceeded`; see
+  [the security guide](file-upload-security.md#7-residual-risks-out-of-scope-for-this-version));
 - any custom `upload.root` you set is a writable absolute path.
 
 ### Reading the `upload_file` audit lines
@@ -838,7 +855,7 @@ What to look for:
 - `msg=MCP … result=ok path=<rel> size=<N>` — the file was written. `path=` is the relative path and
   `size=` is the byte count (plain integer).
 - `msg=DENY … reason=…` — the write was rejected by a control (traversal, exists, is-a-directory,
-  too-large, bad base64, bad mode, `deny_root`); nothing was written.
+  too-large, total quota exceeded, bad base64, bad mode, `deny_root`); nothing was written.
 - `msg=FAIL … reason="write failed"` — an I/O error during the write; nothing usable was written and
   the temp file was cleaned up.
 - `msg=WARN … reason=running-as-root` — an extra record written on **every** call when the daemon is
@@ -886,17 +903,18 @@ Revoke the lost key (`raxd key delete <id>`) and create a new one.
 
 Only `raxd serve` reads `config.yaml` today, and it reads the file **at startup**. Restart `serve`
 after editing the file. This includes the `exec.*` and `upload.*` keys — changing the allowlist,
-timeouts, limits, the upload root, the size limit, the default mode, or either `deny_root` requires a
-`serve` restart to take effect. When `raxd` runs as a service, restart it with `raxd service stop`
-then `raxd service start`. The other commands (`version`, `status`, the `key` group) do not act on the
-config values, except that `raxd service install` reads `port:` to decide on the privileged-port
-capability. `raxd config port` is a stub and does not write the file — edit `config.yaml` by hand.
+timeouts, limits, the upload root, the size limit, the total-size cap, the default mode, or either
+`deny_root` requires a `serve` restart to take effect. When `raxd` runs as a service, restart it with
+`raxd service stop` then `raxd service start`. The other commands (`version`, `status`, the `key`
+group) do not act on the config values, except that `raxd service install` reads `port:` to decide on
+the privileged-port capability. `raxd config port` is a stub and does not write the file — edit
+`config.yaml` by hand.
 
 > Cross-reference: the dedicated entries for the two config-load failures live under
 > [`raxd serve`](#configuration-load-errors-share-one-generic-hint) above, including the note that an
 > invalid `config.yaml` and an invalid `bind_addr` share one generic hint. An invalid
-> `upload.max_file_bytes` / `upload.default_mode` is also a startup failure — its `error:` line names
-> the upload field.
+> `upload.max_file_bytes`, a negative `upload.max_total_bytes`, or an invalid `upload.default_mode` is
+> also a startup failure — its `error:` line names the upload field.
 
 ## Paths and `$HOME`
 

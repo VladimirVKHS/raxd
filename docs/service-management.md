@@ -156,8 +156,8 @@ verified on real macOS** (AC13), and the default port `7822` makes the question 
 
 ## 3. The `raxd` user is kept after uninstall
 
-`raxd service uninstall` removes everything that carries autostart or privilege, but it
-**deliberately keeps the system user `raxd`**. On Linux it:
+`raxd service uninstall` (the default, no flags) removes everything that carries autostart or
+privilege, but it **deliberately keeps the system user `raxd`** and the data directory. On Linux it:
 
 - stops and disables the service (removes the boot autostart);
 - removes the unit `/etc/systemd/system/raxd.service` — and with it the `User=`, capability, and
@@ -188,25 +188,104 @@ the macOS state directory:
   hint: data in /usr/local/var/raxd is preserved — remove manually if no longer needed
 ```
 
-> **Why the user is kept (accepted deviation П-2).** Deleting a system user is more dangerous than
-> keeping it. The account may have been created or reused outside `raxd`, and removing it can orphan
-> files — a future user that reuses the same UID would inherit ownership of whatever state was left
-> behind. The `raxd` user has **no login shell** (`/usr/sbin/nologin`) and **no home**, and after
-> uninstall it carries **no** unit and therefore **no** autostart or capability. It is an inert,
-> unprivileged account.
+> **Why the user and data are kept by default (accepted deviation П-2).** Deleting a system user is
+> more dangerous than keeping it. The account may have been created or reused outside `raxd`, and
+> removing it can orphan files — a future user that reuses the same UID would inherit ownership of
+> whatever state was left behind. The `raxd` user has **no login shell** (`/usr/sbin/nologin`) and **no
+> home**, and after uninstall it carries **no** unit and therefore **no** autostart or capability. It is
+> an inert, unprivileged account. Keeping the data directory means an uninstall does not silently
+> destroy `keys.db` or the audit data. **This keep-by-default behaviour is unchanged.**
 
-### Removing the user manually (zero-footprint)
+### Full cleanup in one command: `uninstall --purge --yes`
 
-If you need a zero-footprint removal (for example for compliance), remove the user yourself **after**
-confirming it owns nothing you still need outside `raxd`:
+When you do want a zero-footprint removal, you no longer have to run `userdel`/`dscl` and delete the
+directories by hand. `raxd service uninstall --purge --yes` does everything a plain `uninstall` does
+**and additionally** removes the `raxd` system user **and** the state/config directories on both Linux
+and macOS.
 
-- **Linux:** `sudo userdel raxd`
-- **macOS:** `sudo dscl . -delete /Users/raxd`
+Because purge is **irreversible** (it erases `keys.db` and the audit data), it is gated behind an
+explicit double opt-in — `--purge` **and** `--yes`:
 
-The data directory is **not** removed by uninstall either. The `data in … is preserved` hint names
-the real, platform-specific state directory: `/var/lib/raxd` on Linux, `/usr/local/var/raxd` on
-macOS. Remove the state directory by hand only when you are sure you no longer need `keys.db`, the TLS
-material, or any audit data it holds. This UID-reuse residual risk is also listed in
+- **`--purge` without `--yes`** prints an irreversibility warning, **removes nothing**, and exits with
+  a **non-zero** code. It is the barrier, not the action:
+
+  ```
+  warning: this operation is irreversible
+
+    The following will be permanently destroyed:
+
+      user      raxd  (system account, no login shell)
+      state     /var/lib/raxd
+      config    /etc/raxd
+      keys.db   all API keys and audit log — cannot be recovered
+
+    hint: to confirm, re-run with --yes:
+            sudo raxd service uninstall --purge --yes
+  ```
+
+  The `state` / `config` lines show the real, platform-specific directories (from `DefaultConfigForGOOS`).
+
+- **`--purge --yes`** performs the removal **non-interactively** — there is no `y/n` prompt, because
+  the tool is driven by agents and scripts, not a human at a TTY. The success report is step-by-step
+  (Linux):
+
+  ```
+    stopped        raxd service
+
+    uninstalled    raxd service
+    removed        unit file and autostart registration
+    removed        journal size limit drop-in
+
+    removed        user raxd
+    removed        /var/lib/raxd
+    removed        /etc/raxd
+
+    purge complete   raxd has been fully removed from this host
+  ```
+
+  Before the destructive steps, an audit record of the intent is written; after completion an outcome
+  record follows (logfmt, INFO), for example:
+
+  ```
+  INFO purge complete action=purge platform=linux user_removed=true user_absent=false dirs_removed="[/var/lib/raxd /etc/raxd]" dirs_absent="[]" stopped=true
+  ```
+
+  The audit records carry **only** metadata (what was removed / what was already absent) — never the
+  contents of `keys.db` or any secret.
+
+**Idempotent.** Running `--purge --yes` again, when the user and directories are already gone, still
+exits `0` and reports what was already absent (those lines read `not installed` / `absent` /
+`nothing to remove — host is already clean`). A partial state (some things present, some already gone)
+is handled the same way — each line reports `removed` or `absent` for that item.
+
+**Guardrails — it removes nothing and exits non-zero if:**
+
+- the daemon is still running and **cannot be stopped** first (purge stops the service gracefully,
+  like `stop`, before touching the user/dirs);
+- it **lacks the privileges** for `userdel`/`dscl`/removing system directories (run with `sudo`);
+- the target OS user **does not match** the expected `raxd` service account (the account may have been
+  modified — inspect it with `id raxd` / `getent passwd raxd` before removing);
+- the resolved state/config path is **suspicious** — empty, `/`, `$HOME` (or an ancestor of it), a
+  blocked system root (`/etc`, `/var`, `/usr`, `/tmp`, …), or a path that resolves (after symlink
+  evaluation) outside the expected service layout.
+
+In each case the error is **neutral** (`error: <what> … / hint: <what to do>`) — no raw OS output, no
+stack trace, and the suspicious path itself is not printed. The exact texts and exit codes are in
+[`commands.md`](commands.md#raxd-service-uninstall).
+
+### Removing the user and data manually (when you do not use `--purge`)
+
+If you ran a plain `uninstall` and later decide on a zero-footprint cleanup, you can still do it by
+hand **after** confirming the account and data hold nothing you still need:
+
+- **Linux:** `sudo userdel raxd`, then remove the state directory `/var/lib/raxd` (and config `/etc/raxd`).
+- **macOS:** `sudo dscl . -delete /Users/raxd`, then remove `/usr/local/var/raxd` (and `/usr/local/etc/raxd`).
+
+The data directory is **not** removed by a plain uninstall. The `data in … is preserved` hint names
+the real, platform-specific state directory: `/var/lib/raxd` on Linux, `/usr/local/var/raxd` on macOS.
+Remove the state directory by hand only when you are sure you no longer need `keys.db`, the TLS
+material, or any audit data it holds. This UID-reuse residual risk, and the `--purge` mitigation, are
+also tracked in
 [`production-readiness.md`](production-readiness.md#6-service-uninstall-keeps-the-raxd-user-and-data-uid-reuse).
 
 ## 4. Audit-log rotation
@@ -262,13 +341,16 @@ What **is** verified for macOS without a real Mac:
   including the structure, `KeepAlive.SuccessfulExit=false`, `UserName=raxd`, the XDG environment
   variables, and the derived macOS paths (`/usr/local/etc`, `/usr/local/var`).
 - The platform-selection logic (`service.New` dispatching by `runtime.GOOS`) is unit-tested.
+- The purge path-safety and orchestration helpers (`validatePurgePath`, the platform Purge flow) are
+  unit-tested without invoking real system commands on the host (purge AC10).
 
 What **must** be verified on a real macOS host before a macOS release (escalation ОР-4):
 
 - the full lifecycle `install → status → start → stop → uninstall`;
 - that the running daemon's effective UID is **not** `0` (via `UserName=raxd`);
 - the directory permissions (`0700`, owned by `raxd`);
-- creating the `raxd` user (the exact `dscl` procedure is an open question for that environment);
+- creating the `raxd` user (the exact `dscl` procedure is an open question for that environment), and
+  its removal under `--purge` (the `dscl . -delete` procedure);
 - log rotation via `newsyslog`;
 - the privileged-port mechanics (see [§2](#macos)).
 
@@ -313,10 +395,12 @@ the file is written, so a crafted config value cannot inject a fake `ExecStart=`
 extra capability directive. The conditional capability/`NoNewPrivileges` block is driven by the typed
 `NeedNetBindCap` boolean, never by a raw string.
 
-The service manager itself (`systemctl` / `launchctl` / `useradd` / `chown`) is always invoked as a
-fixed binary with separate arguments — never through a shell — so there is no shell-interpolation
-vector. Raw stderr from the manager is **not** propagated to the user output (you get a neutral typed
-error, never a raw `systemctl` trace or any secret).
+The service manager itself (`systemctl` / `launchctl` / `useradd` / `userdel` / `dscl` / `chown`) is
+always invoked as a fixed binary with separate arguments — never through a shell — so there is no
+shell-interpolation vector. The `--purge` path additionally validates the state/config directory paths
+before any `os.RemoveAll` (rejecting `/`, `$HOME`, blocked system roots, and paths that resolve outside
+the expected layout). Raw stderr from the manager is **not** propagated to the user output (you get a
+neutral typed error, never a raw `systemctl` trace or any secret).
 
 ## Security summary
 
@@ -331,16 +415,18 @@ error, never a raw `systemctl` trace or any secret).
   `0600`.
 - The audit log goes to journald with a size cap (`SystemMaxUse=200M` / `SystemMaxFileSize=50M`);
   this cap is per-host (П-3), with logrotate as a documented per-`raxd` fallback.
-- `uninstall` removes the unit/plist, the autostart, the capability, and the journald drop-in; it
-  **keeps** the inert, shell-less `raxd` user (П-2) and the data directory.
+- A plain `uninstall` removes the unit/plist, the autostart, the capability, and the journald drop-in;
+  it **keeps** the inert, shell-less `raxd` user (П-2) and the data directory. `uninstall --purge --yes`
+  additionally removes the user and the state/config directories (irreversible; gated behind both
+  `--purge` and `--yes`, path-validated, idempotent).
 - The macOS launchd path is verified on a real macOS host, not in Docker (AC13).
-- Template inputs are validated before render; the manager is invoked without a shell; raw manager
-  stderr is never shown to the user.
+- Template inputs are validated before render; the manager is invoked without a shell; the purge paths
+  are validated before removal; raw manager stderr is never shown to the user.
 
 ## Related documents
 
 - [`commands.md`](commands.md#raxd-service) — the `raxd service` command reference (usage, output,
-  exit codes, error texts).
+  exit codes, error texts), including `uninstall --purge --yes`.
 - [`configuration.md`](configuration.md#service-layout-system-service) — the service on-disk layout
   (paths and permissions) and the port/capability summary.
 - [`troubleshooting.md`](troubleshooting.md#raxd-service) — diagnosing service install/start problems.
@@ -348,7 +434,8 @@ error, never a raw `systemctl` trace or any secret).
   [`file-upload-security.md`](file-upload-security.md) — the per-tool security guides whose root-level
   residual risks the non-root service layout closes.
 - [`production-readiness.md`](production-readiness.md) — known limitations and pending pre-release
-  items (the UID-reuse-on-uninstall and macOS-outside-Docker risks are summarised there).
+  items (the UID-reuse-on-uninstall risk and its `--purge` mitigation, and macOS-outside-Docker, are
+  summarised there).
 - [`development.md`](development.md) — building and testing in Docker.
 
 ## Author
