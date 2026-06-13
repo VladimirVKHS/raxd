@@ -232,6 +232,11 @@ func uploadHandler(cfg fileupload.Config, audit server.AuditFn) sdkmcp.ToolHandl
 			case errors.Is(writeErr, fileupload.ErrBadMode):
 				auditResult = "deny"
 				reason = "invalid file mode"
+			case errors.Is(writeErr, fileupload.ErrQuotaExceeded):
+				// AC5/SR-94: ровно одна deny-запись с reason про общий лимит.
+				// SR-91/SR-94: нейтральный reason без абсолютных путей/чисел/секретов.
+				auditResult = "deny"
+				reason = "total upload quota exceeded"
 			}
 
 			audit(server.AuditRecord{
